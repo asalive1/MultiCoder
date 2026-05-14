@@ -3507,28 +3507,42 @@ void Worker::listenMetaPort() {
         auto lastIdleLogAt = std::chrono::steady_clock::now() - std::chrono::seconds(20);
         auto expectedPullHostNorm = lowerCopy(trimCopy(expectedPullHost));
 
-        auto sourceConfigChanged = [&]() -> bool {
+        auto sourceConfigChangeReason = [&]() -> std::string {
             simplejson::Object rtNow = readRuntimeState(m_cfgDir);
-            if (!rtNow.getBool("metadataListenerRunning", false)) return true;
+            if (!rtNow.getBool("metadataListenerRunning", false)) {
+                return "metadataListenerRunning true -> false";
+            }
 
             simplejson::Object cfgNow = readJsonFile(m_cfgDir + "/metadata.json");
             std::string modeNow = lowerCopy(trimCopy(cfgNow.getString("mode", "listen")));
             if (modeNow != "pull") modeNow = "listen";
 
-            if (modeNow != expectedMode) return true;
+            if (modeNow != expectedMode) {
+                return "mode " + expectedMode + " -> " + modeNow;
+            }
             if (expectedMode == "listen") {
                 int lpNow = cfgNow.getInt("listenPort", 9000 + (m_idx - 1) * 10);
-                return lpNow != expectedListenPort;
+                if (lpNow != expectedListenPort) {
+                    return "listenPort " + std::to_string(expectedListenPort) + " -> " + std::to_string(lpNow);
+                }
+                return "";
             }
 
             std::string hostNow = lowerCopy(trimCopy(cfgNow.getString("dataConnectHost", "")));
             int portNow = cfgNow.getInt("dataConnectPort", 0);
-            return hostNow != expectedPullHostNorm || portNow != expectedPullPort;
+            if (hostNow != expectedPullHostNorm) {
+                return "dataConnectHost " + expectedPullHostNorm + " -> " + hostNow;
+            }
+            if (portNow != expectedPullPort) {
+                return "dataConnectPort " + std::to_string(expectedPullPort) + " -> " + std::to_string(portNow);
+            }
+            return "";
         };
 
         while (m_running) {
-            if (sourceConfigChanged()) {
-                log("Metadata source configuration changed; reconnecting metadata socket for new source settings");
+            std::string changeReason = sourceConfigChangeReason();
+            if (!changeReason.empty()) {
+                log("Metadata source configuration changed (" + changeReason + "); reconnecting metadata socket for new source settings");
                 break;
             }
 
