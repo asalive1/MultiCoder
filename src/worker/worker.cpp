@@ -620,7 +620,29 @@ static std::string hlsMetadataByParser(const std::string& xml, const simplejson:
             try { double v = std::stod(d); return v > 1000.0 ? v / 1000.0 : v; }
             catch (...) { return 0.0; }
         };
-        auto makeExtItem = [&](const std::string& block, double startSecs) -> std::string {
+        // Collect custom (non-built-in) tags from the current block only.
+        std::set<std::string> builtIns = {
+            "title", "artist", "category", "duration", "media_type", "trivia", "cart",
+            "station", "stationid", "sched_time", "stack_pos", "stack_position"
+        };
+        std::vector<std::pair<std::string, std::string>> customPairs;
+        for (const auto& rawTag : tags) {
+            std::string tag = trimCopy(rawTag);
+            if (tag.empty()) continue;
+            std::string tl = lowerCopy(tag);
+            if (builtIns.count(tl)) continue;
+            std::string val = fieldValueWithAliases(currentBlock, tag, stationId);
+            if (val.empty()) continue;
+            bool dup = false;
+            for (const auto& kv : customPairs) {
+                if (lowerCopy(kv.first) == tl) { dup = true; break; }
+            }
+            if (!dup) customPairs.push_back({tag, val});
+        }
+
+        // makeExtItem builds one item object. includeCustom appends custom tags
+        // (only used for the current item; upcoming items get standard fields only).
+        auto makeExtItem = [&](const std::string& block, double startSecs, bool includeCustom) -> std::string {
             double durSecs = durSecsFromBlock(block);
             std::string type  = xmlField(block, {"media_type"});
             std::string ttl   = xmlField(block, {"title", "song", "name"});
@@ -640,6 +662,12 @@ static std::string hlsMetadataByParser(const std::string& xml, const simplejson:
             o << ",\"id\":\""      << jsonEscapeCompact(cart)  << "\"";
             if (!cat.empty())
                 o << ",\"category\":\"" << jsonEscapeCompact(cat) << "\"";
+            if (includeCustom) {
+                for (const auto& kv : customPairs) {
+                    o << ",\"" << jsonEscapeCompact(kv.first) << "\":\""
+                      << jsonEscapeCompact(kv.second) << "\"";
+                }
+            }
             o << "}";
             return o.str();
         };
@@ -647,46 +675,16 @@ static std::string hlsMetadataByParser(const std::string& xml, const simplejson:
         double nowSecs = std::chrono::duration<double>(
             std::chrono::system_clock::now().time_since_epoch()).count();
         std::ostringstream out;
-        out << "{\"current\":" << makeExtItem(currentBlock, nowSecs);
+        out << "{\"current\":" << makeExtItem(currentBlock, nowSecs, true);
         if (includeFuture && !upcomingBlocks.empty()) {
             out << ",\"upcoming\":[";
             double nextStart = nowSecs + durSecsFromBlock(currentBlock);
             for (size_t i = 0; i < upcomingBlocks.size(); ++i) {
                 if (i) out << ",";
-                out << makeExtItem(upcomingBlocks[i], nextStart);
+                out << makeExtItem(upcomingBlocks[i], nextStart, false);
                 nextStart += durSecsFromBlock(upcomingBlocks[i]);
             }
             out << "]";
-        }
-
-        // Keep Orban-critical current/upcoming object schema unchanged.
-        // Export non-standard requested tags in a separate top-level custom object.
-        std::set<std::string> builtIns = {
-            "title", "artist", "category", "duration", "media_type", "trivia", "cart",
-            "station", "stationid", "sched_time", "stack_pos", "stack_position"
-        };
-        std::vector<std::pair<std::string, std::string>> customPairs;
-        for (const auto& rawTag : tags) {
-            std::string tag = trimCopy(rawTag);
-            if (tag.empty()) continue;
-            std::string tl = lowerCopy(tag);
-            if (builtIns.count(tl)) continue;
-            std::string val = fieldValueWithAliases(currentBlock, tag, stationId);
-            if (val.empty()) continue;
-            bool dup = false;
-            for (const auto& kv : customPairs) {
-                if (lowerCopy(kv.first) == tl) { dup = true; break; }
-            }
-            if (!dup) customPairs.push_back({tag, val});
-        }
-        if (!customPairs.empty()) {
-            out << ",\"custom\":{";
-            for (size_t i = 0; i < customPairs.size(); ++i) {
-                if (i) out << ",";
-                out << "\"" << jsonEscapeCompact(customPairs[i].first) << "\":\""
-                    << jsonEscapeCompact(customPairs[i].second) << "\"";
-            }
-            out << "}";
         }
 
         out << "}";
