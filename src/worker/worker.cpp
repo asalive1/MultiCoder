@@ -1674,17 +1674,26 @@ std::vector<std::string> Worker::buildFfmpegInputArgs() {
     std::string type = rt.getString("sessionInputType", inp.getString("inputType", "rtp"));
     std::vector<std::string> args;
 
-    // Helper: given an interface spec (IP or Windows GUID), return the IP for FFmpeg localaddr
+    // Helper: given an interface spec (IP, Linux ifname, or Windows GUID),
+    // return a usable IPv4 string for FFmpeg localaddr.
     auto resolveLocalIp = [](const std::string& iface) -> std::string {
         if (iface.empty()) return "";
+
+        in_addr resolved{};
+        if (resolveInterfaceIPv4(iface, resolved)) {
+            char ipStr[INET_ADDRSTRLEN] = {};
+            if (inet_ntop(AF_INET, &resolved, ipStr, sizeof(ipStr))) {
+                return std::string(ipStr);
+            }
+        }
+
+        // Compatibility fallback for GUID token handling if interface lookup fails.
 #ifdef _WIN32
-        // If it looks like a GUID ({xxxxxxxx-...}), resolve to IP
-        if (!iface.empty() && iface[0] == '{') {
-            std::string ip = resolveAdapterGuidToIp(iface);
-            return ip.empty() ? iface : ip;
+        if (iface[0] == '{') {
+            return resolveAdapterGuidToIp(iface);
         }
 #endif
-        return iface; // already an IP
+        return "";
     };
 
     // Helper: write an SDP file for L16/L24 RTP multicast and return FFmpeg input args.
@@ -1717,6 +1726,11 @@ std::vector<std::string> Worker::buildFfmpegInputArgs() {
         std::vector<std::string> a;
         a.push_back("-protocol_whitelist"); a.push_back("file,rtp,udp");
         std::string localIp = resolveLocalIp(iface);
+        if (!iface.empty() && localIp.empty()) {
+            log("FFmpeg RTP input: interface '" + iface + "' could not be resolved to IPv4; omitting -localaddr");
+        } else if (!iface.empty() && localIp != iface) {
+            log("FFmpeg RTP input: interface '" + iface + "' resolved to localaddr=" + localIp);
+        }
         if (!localIp.empty()) {
             a.push_back("-localaddr"); a.push_back(localIp);
         }
