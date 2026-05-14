@@ -542,7 +542,7 @@ async function refreshInputStatusLine() {
 async function renderControlSection(cl, cr) {
     const cfg = await loadEncoderConfig(selectedEncoder);
     const ctl = cfg.control || {};
-    const port    = ctl.controlPort    || (9010 + (selectedEncoder - 1) * 10);
+    const port    = ctl.controlPort    || (9100 + (selectedEncoder - 1) * 10);
     const cmds    = ctl.commands || {};
 
     cl.innerHTML = `

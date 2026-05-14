@@ -1301,30 +1301,46 @@ static std::string handleReq(const std::string& raw) {
                 
                 simplejson::Object cfg = readJsonFile("/etc/encoder" + std::to_string(idx + 1) + "/input.json");
                 simplejson::Object rt = readRuntimeState(idx + 1);
-                rt.setBool("inputConnected", true);
 
                 std::string inputType = req.getString("inputType", cfg.getString("inputType", "rtp"));
-                rt.setString("sessionInputType", inputType);
-
                 std::string rtpAddress = req.getString("rtpAddress", cfg.getString("rtpAddress", ""));
-                rt.setString("sessionRtpAddress", rtpAddress);
-                
-                appendEncoderLog(idx + 1, "Input config: type=" + inputType + " rtpAddress=" + rtpAddress);
-
                 int rtpPort = req.getInt("rtpPort", cfg.getInt("rtpPort", 5004));
-                rt.setInt("sessionRtpPort", rtpPort);
-
                 std::string iface = req.getString("rtpInterface", cfg.getString("rtpInterface", ""));
-                rt.setString("sessionRtpInterface", iface);
-
                 std::string audioDevice = req.getString("audioDevice", cfg.getString("audioDevice", ""));
-                rt.setString("sessionAudioDevice", audioDevice);
-
                 int sampleRate = req.getInt("sampleRate", cfg.getInt("sampleRate", 48000));
-                rt.setInt("sessionSampleRate", sampleRate);
-
                 double gainDb = req.getDouble("rtpGain", cfg.getDouble("rtpGain", 0.0));
+
+                // Validate parameters
+                std::string validationError;
+                if (inputType == "rtp" || inputType == "axia") {
+                    if (rtpAddress.empty()) {
+                        validationError = "RTP/Axia input: multicast address is required";
+                    } else if (rtpPort <= 0 || rtpPort > 65535) {
+                        validationError = "RTP/Axia input: port must be 1-65535, got " + std::to_string(rtpPort);
+                    }
+                } else if (inputType != "audio" && inputType != "srt") {
+                    validationError = "Unknown input type: " + inputType;
+                }
+
+                if (!validationError.empty()) {
+                    appendEncoderLog(idx + 1, "Input connect FAILED: " + validationError);
+                    return httpResp(400, "application/json", 
+                        "{\"ok\":false,\"error\":\"" + jsonEscape(validationError) + "\"}");
+                }
+
+                rt.setBool("inputConnected", true);
+                rt.setString("sessionInputType", inputType);
+                rt.setString("sessionRtpAddress", rtpAddress);
+                rt.setInt("sessionRtpPort", rtpPort);
+                rt.setString("sessionRtpInterface", iface);
+                rt.setString("sessionAudioDevice", audioDevice);
+                rt.setInt("sessionSampleRate", sampleRate);
                 rt.setRaw("sessionGainDb", std::to_string(gainDb));
+
+                appendEncoderLog(idx + 1, "Input connect confirmed: type=" + inputType + 
+                                 (inputType != "audio" ? " addr=" + rtpAddress + ":" + std::to_string(rtpPort) +
+                                  (iface.empty() ? "" : " iface=" + iface) : " device=" + (audioDevice.empty() ? "default" : audioDevice)) +
+                                 " gain=" + std::to_string(gainDb) + "dB");
 
                 std::string dir = "/etc/encoder" + std::to_string(idx + 1);
                 fs::create_directories(dir);
