@@ -657,7 +657,6 @@ static std::string hlsMetadataByParser(const std::string& xml, const simplejson:
                 if (tag.empty()) continue;
 
                 std::string outKey = tag;
-                if (outKey == "stack_position") outKey = "stack_pos";
                 if (outKey == "media_type") outKey = "type";
                 else if (outKey == "trivia") outKey = "album";
                 else if (outKey == "cart") outKey = "id";
@@ -668,7 +667,24 @@ static std::string hlsMetadataByParser(const std::string& xml, const simplejson:
                 if (val.empty() && tag == "stationId") val = stationId;
                 if (val.empty()) continue;
 
-                o << ",\"" << jsonEscapeCompact(outKey) << "\":\"" << jsonEscapeCompact(val) << "\"";
+                // Preserve numeric semantics for stack position fields so downstream
+                // parsers (e.g. Orban) don't receive them as quoted strings.
+                if (outKey == "stack_pos" || outKey == "stack_position") {
+                    std::string vtrim = trimCopy(val);
+                    bool isInt = !vtrim.empty();
+                    size_t p = 0;
+                    if (isInt && (vtrim[0] == '+' || vtrim[0] == '-')) p = 1;
+                    for (; isInt && p < vtrim.size(); ++p) {
+                        if (!std::isdigit(static_cast<unsigned char>(vtrim[p]))) isInt = false;
+                    }
+                    if (isInt) {
+                        o << ",\"" << jsonEscapeCompact(outKey) << "\":" << vtrim;
+                    } else {
+                        o << ",\"" << jsonEscapeCompact(outKey) << "\":\"" << jsonEscapeCompact(val) << "\"";
+                    }
+                } else {
+                    o << ",\"" << jsonEscapeCompact(outKey) << "\":\"" << jsonEscapeCompact(val) << "\"";
+                }
                 emittedKeys.insert(outKey);
             }
             o << "}";
