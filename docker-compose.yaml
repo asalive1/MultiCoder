@@ -16,7 +16,6 @@ services:
       - /opt/multicoder/encoder3:/etc/encoder3  # encoder 3 config/logs/HLS
       - /opt/multicoder/encoder4:/etc/encoder4  # encoder 4 config/logs/HLS
       - /opt/multicoder/encoder5:/etc/encoder5  # encoder 5 config/logs/HLS
-      - /opt/multicoder/www:/opt/multicoder/www # optional web asset override
     environment:
       - UI_PORT=8050
       - ENCODER_COUNT=5
