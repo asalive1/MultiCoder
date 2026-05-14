@@ -629,17 +629,48 @@ static std::string hlsMetadataByParser(const std::string& xml, const simplejson:
             std::string cart  = xmlField(block, {"cart"});
             std::string cat   = xmlField(block, {"category"});
             std::ostringstream o;
+            std::set<std::string> emittedKeys;
             o << std::fixed << std::setprecision(3);
             o << "{\"type\":\""    << jsonEscapeCompact(type)  << "\"";
+            emittedKeys.insert("type");
             o << ",\"title\":\""   << jsonEscapeCompact(ttl)   << "\"";
+            emittedKeys.insert("title");
             o << ",\"album\":\""   << jsonEscapeCompact(album) << "\"";
+            emittedKeys.insert("album");
             o << ",\"artist\":\""  << jsonEscapeCompact(art)   << "\"";
+            emittedKeys.insert("artist");
             o << ",\"image\":\"\"";
+            emittedKeys.insert("image");
             o << ",\"duration\":"  << durSecs;
+            emittedKeys.insert("duration");
             o << ",\"start\":"    << startSecs;
+            emittedKeys.insert("start");
             o << ",\"id\":\""      << jsonEscapeCompact(cart)  << "\"";
+            emittedKeys.insert("id");
             if (!cat.empty())
                 o << ",\"category\":\"" << jsonEscapeCompact(cat) << "\"";
+            if (!cat.empty()) emittedKeys.insert("category");
+
+            // Include additional configured/custom tags when present in XML.
+            for (const auto& rawTag : tags) {
+                std::string tag = trimCopy(rawTag);
+                if (tag.empty()) continue;
+
+                std::string outKey = tag;
+                if (outKey == "stack_position") outKey = "stack_pos";
+                if (outKey == "media_type") outKey = "type";
+                else if (outKey == "trivia") outKey = "album";
+                else if (outKey == "cart") outKey = "id";
+
+                if (emittedKeys.count(outKey)) continue;
+
+                std::string val = fieldValueWithAliases(block, tag, stationId);
+                if (val.empty() && tag == "stationId") val = stationId;
+                if (val.empty()) continue;
+
+                o << ",\"" << jsonEscapeCompact(outKey) << "\":\"" << jsonEscapeCompact(val) << "\"";
+                emittedKeys.insert(outKey);
+            }
             o << "}";
             return o.str();
         };
@@ -3464,12 +3495,43 @@ void Worker::listenMetaPort() {
         log(srtLine); logSys(srtLine);
     };
 
-    auto processSocketUntilClose = [this, &emitMetadata](int cfd, const std::string& peer) {
+    auto processSocketUntilClose = [this, &emitMetadata](int cfd,
+                                                         const std::string& peer,
+                                                         const std::string& expectedMode,
+                                                         int expectedListenPort,
+                                                         const std::string& expectedPullHost,
+                                                         int expectedPullPort) {
         std::string xmlData;
         char chunk[4096];
         bool sawPayload = false;
         auto lastIdleLogAt = std::chrono::steady_clock::now() - std::chrono::seconds(20);
+        auto expectedPullHostNorm = lowerCopy(trimCopy(expectedPullHost));
+
+        auto sourceConfigChanged = [&]() -> bool {
+            simplejson::Object rtNow = readRuntimeState(m_cfgDir);
+            if (!rtNow.getBool("metadataListenerRunning", false)) return true;
+
+            simplejson::Object cfgNow = readJsonFile(m_cfgDir + "/metadata.json");
+            std::string modeNow = lowerCopy(trimCopy(cfgNow.getString("mode", "listen")));
+            if (modeNow != "pull") modeNow = "listen";
+
+            if (modeNow != expectedMode) return true;
+            if (expectedMode == "listen") {
+                int lpNow = cfgNow.getInt("listenPort", 9000 + (m_idx - 1) * 10);
+                return lpNow != expectedListenPort;
+            }
+
+            std::string hostNow = lowerCopy(trimCopy(cfgNow.getString("dataConnectHost", "")));
+            int portNow = cfgNow.getInt("dataConnectPort", 0);
+            return hostNow != expectedPullHostNorm || portNow != expectedPullPort;
+        };
+
         while (m_running) {
+            if (sourceConfigChanged()) {
+                log("Metadata source configuration changed; reconnecting metadata socket for new source settings");
+                break;
+            }
+
             fd_set rfds;
             FD_ZERO(&rfds);
             FD_SET(cfd, &rfds);
@@ -3604,7 +3666,7 @@ void Worker::listenMetaPort() {
             std::string peer = std::string(ipTxt ? ipTxt : "unknown") + ":" + std::to_string(ntohs(cli.sin_port));
             log("Metadata client connected (listen mode): " + peer);
             logSys("Metadata client connected (listen mode): " + peer);
-            processSocketUntilClose(cfd, peer);
+            processSocketUntilClose(cfd, peer, "listen", listenPort, "", 0);
             continue;
         }
 
@@ -3635,7 +3697,7 @@ void Worker::listenMetaPort() {
 
         log("Metadata pull connected to " + pullHost + ":" + std::to_string(pullPort));
         logSys("Metadata pull connected to " + pullHost + ":" + std::to_string(pullPort));
-        processSocketUntilClose(cfd, pullHost + ":" + std::to_string(pullPort));
+        processSocketUntilClose(cfd, pullHost + ":" + std::to_string(pullPort), "pull", 0, pullHost, pullPort);
         log("Metadata pull socket closed; reconnecting");
     }
 
