@@ -629,64 +629,17 @@ static std::string hlsMetadataByParser(const std::string& xml, const simplejson:
             std::string cart  = xmlField(block, {"cart"});
             std::string cat   = xmlField(block, {"category"});
             std::ostringstream o;
-            std::set<std::string> emittedKeys;
             o << std::fixed << std::setprecision(3);
             o << "{\"type\":\""    << jsonEscapeCompact(type)  << "\"";
-            emittedKeys.insert("type");
             o << ",\"title\":\""   << jsonEscapeCompact(ttl)   << "\"";
-            emittedKeys.insert("title");
             o << ",\"album\":\""   << jsonEscapeCompact(album) << "\"";
-            emittedKeys.insert("album");
             o << ",\"artist\":\""  << jsonEscapeCompact(art)   << "\"";
-            emittedKeys.insert("artist");
             o << ",\"image\":\"\"";
-            emittedKeys.insert("image");
             o << ",\"duration\":"  << durSecs;
-            emittedKeys.insert("duration");
             o << ",\"start\":"    << startSecs;
-            emittedKeys.insert("start");
             o << ",\"id\":\""      << jsonEscapeCompact(cart)  << "\"";
-            emittedKeys.insert("id");
             if (!cat.empty())
                 o << ",\"category\":\"" << jsonEscapeCompact(cat) << "\"";
-            if (!cat.empty()) emittedKeys.insert("category");
-
-            // Include additional configured/custom tags when present in XML.
-            for (const auto& rawTag : tags) {
-                std::string tag = trimCopy(rawTag);
-                if (tag.empty()) continue;
-
-                std::string outKey = tag;
-                if (outKey == "media_type") outKey = "type";
-                else if (outKey == "trivia") outKey = "album";
-                else if (outKey == "cart") outKey = "id";
-
-                if (emittedKeys.count(outKey)) continue;
-
-                std::string val = fieldValueWithAliases(block, tag, stationId);
-                if (val.empty() && tag == "stationId") val = stationId;
-                if (val.empty()) continue;
-
-                // Preserve numeric semantics for stack position fields so downstream
-                // parsers (e.g. Orban) don't receive them as quoted strings.
-                if (outKey == "stack_pos" || outKey == "stack_position") {
-                    std::string vtrim = trimCopy(val);
-                    bool isInt = !vtrim.empty();
-                    size_t p = 0;
-                    if (isInt && (vtrim[0] == '+' || vtrim[0] == '-')) p = 1;
-                    for (; isInt && p < vtrim.size(); ++p) {
-                        if (!std::isdigit(static_cast<unsigned char>(vtrim[p]))) isInt = false;
-                    }
-                    if (isInt) {
-                        o << ",\"" << jsonEscapeCompact(outKey) << "\":" << vtrim;
-                    } else {
-                        o << ",\"" << jsonEscapeCompact(outKey) << "\":\"" << jsonEscapeCompact(val) << "\"";
-                    }
-                } else {
-                    o << ",\"" << jsonEscapeCompact(outKey) << "\":\"" << jsonEscapeCompact(val) << "\"";
-                }
-                emittedKeys.insert(outKey);
-            }
             o << "}";
             return o.str();
         };
@@ -705,6 +658,37 @@ static std::string hlsMetadataByParser(const std::string& xml, const simplejson:
             }
             out << "]";
         }
+
+        // Keep Orban-critical current/upcoming object schema unchanged.
+        // Export non-standard requested tags in a separate top-level custom object.
+        std::set<std::string> builtIns = {
+            "title", "artist", "category", "duration", "media_type", "trivia", "cart",
+            "station", "stationid", "sched_time", "stack_pos", "stack_position"
+        };
+        std::vector<std::pair<std::string, std::string>> customPairs;
+        for (const auto& rawTag : tags) {
+            std::string tag = trimCopy(rawTag);
+            if (tag.empty()) continue;
+            std::string tl = lowerCopy(tag);
+            if (builtIns.count(tl)) continue;
+            std::string val = fieldValueWithAliases(currentBlock, tag, stationId);
+            if (val.empty()) continue;
+            bool dup = false;
+            for (const auto& kv : customPairs) {
+                if (lowerCopy(kv.first) == tl) { dup = true; break; }
+            }
+            if (!dup) customPairs.push_back({tag, val});
+        }
+        if (!customPairs.empty()) {
+            out << ",\"custom\":{";
+            for (size_t i = 0; i < customPairs.size(); ++i) {
+                if (i) out << ",";
+                out << "\"" << jsonEscapeCompact(customPairs[i].first) << "\":\""
+                    << jsonEscapeCompact(customPairs[i].second) << "\"";
+            }
+            out << "}";
+        }
+
         out << "}";
         return out.str();
     }
