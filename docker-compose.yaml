@@ -10,13 +10,13 @@ services:
     #   Metadata:    server:<listenPort> per encoder
     #   RTP audio:   multicast via configured interface/channel
     volumes:
-      - ./system:/etc/MC             # system.json + global logs
-      - ./encoder1:/etc/encoder1     # encoder 1 config/logs/HLS
-      - ./encoder2:/etc/encoder2     # encoder 2 config/logs/HLS
-      - ./encoder3:/etc/encoder3     # encoder 3 config/logs/HLS
-      - ./encoder4:/etc/encoder4     # encoder 4 config/logs/HLS
-      - ./encoder5:/etc/encoder5     # encoder 5 config/logs/HLS
-      - ./www:/opt/multicoder/www    # optional web asset override
+      - /opt/multicoder/system:/etc/MC          # system.json + global logs
+      - /opt/multicoder/encoder1:/etc/encoder1  # encoder 1 config/logs/HLS
+      - /opt/multicoder/encoder2:/etc/encoder2  # encoder 2 config/logs/HLS
+      - /opt/multicoder/encoder3:/etc/encoder3  # encoder 3 config/logs/HLS
+      - /opt/multicoder/encoder4:/etc/encoder4  # encoder 4 config/logs/HLS
+      - /opt/multicoder/encoder5:/etc/encoder5  # encoder 5 config/logs/HLS
+      - /opt/multicoder/www:/opt/multicoder/www # optional web asset override
     environment:
       - UI_PORT=8050
       - ENCODER_COUNT=5
