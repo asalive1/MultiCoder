@@ -1295,7 +1295,10 @@ static std::string handleReq(const std::string& raw) {
             bool connected = (sub == "input/connect");
             if (connected) {
                 simplejson::Object req;
-                req.parse(body);
+                bool parseOk = req.parse(body);
+                appendEncoderLog(idx + 1, "Input connect request: body size=" + std::to_string(body.size()) + 
+                                 " parseOk=" + (parseOk ? "true" : "false"));
+                
                 simplejson::Object cfg = readJsonFile("/etc/encoder" + std::to_string(idx + 1) + "/input.json");
                 simplejson::Object rt = readRuntimeState(idx + 1);
                 rt.setBool("inputConnected", true);
@@ -1305,6 +1308,8 @@ static std::string handleReq(const std::string& raw) {
 
                 std::string rtpAddress = req.getString("rtpAddress", cfg.getString("rtpAddress", ""));
                 rt.setString("sessionRtpAddress", rtpAddress);
+                
+                appendEncoderLog(idx + 1, "Input config: type=" + inputType + " rtpAddress=" + rtpAddress);
 
                 int rtpPort = req.getInt("rtpPort", cfg.getInt("rtpPort", 5004));
                 rt.setInt("sessionRtpPort", rtpPort);
