@@ -1,0 +1,45 @@
+name: Docker Build + Smoke Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  docker:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        run: |
+          docker compose build
+
+      - name: Start services
+        run: |
+          docker compose up -d
+          sleep 10  # give time for supervisor to start
+
+      - name: Health check
+        run: |
+          curl -f http://localhost:8050/health || (docker compose logs && exit 1)
+
+      - name: Run smoke tests
+        run: |
+          chmod +x scripts/smoke-test.sh
+          ./scripts/smoke-test.sh localhost 8050
+
+      - name: Collect container logs on failure
+        if: failure()
+        run: docker compose logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

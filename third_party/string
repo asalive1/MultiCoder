@@ -1,0 +1,16 @@
+#pragma once
+
+namespace std {
+class string {
+public:
+    string() = default;
+    string(const char*) {}
+    string(const string&) = default;
+    string& operator=(const string&) = default;
+    string operator+(const char*) const { return string(); }
+};
+
+inline int stoi(const char*) { return 0; }
+inline int stoi(const string&) { return 0; }
+inline string to_string(int) { return string(); }
+}  // namespace std

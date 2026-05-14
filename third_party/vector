@@ -1,0 +1,13 @@
+#pragma once
+
+namespace std {
+template <typename T>
+class vector {
+public:
+    vector() = default;
+    void push_back(const T&) {}
+    unsigned long size() const { return 0; }
+    T& operator[](unsigned long) { static T t{}; return t; }
+    const T& operator[](unsigned long) const { static T t{}; return t; }
+};
+}  // namespace std

@@ -1,0 +1,11 @@
+#pragma once
+
+namespace std {
+class mutex {};
+
+template <typename T>
+class lock_guard {
+public:
+    explicit lock_guard(T&) {}
+};
+}  // namespace std

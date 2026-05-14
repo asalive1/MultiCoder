@@ -1,0 +1,14 @@
+{
+    "transport": "mpeg-ts",
+    "mode": "caller",
+    "host": "",
+    "port": 9150,
+    "streamId": "Encoder-1",
+    "timestamp": true,
+    "latency": 120,
+    "buffer": 1024,
+    "encryption": "none",
+    "passphrase": "",
+    "pbkeylen": 16,
+    "_note": "metadata: Now Playing embedded in MPEG-TS KLV/ID3 block (PID 0x0011). For RTP mode, best-effort RTCP APP packet. Receiving end must support the same convention."
+}

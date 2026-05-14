@@ -1,0 +1,16 @@
+{
+    "url": "http://localhost:8000/stream1-mp3",
+    "user": "source",
+    "pass": "hackme",
+    "bitrate": 128000,
+    "sampleRate": 48000,
+    "mode": "legacy",
+    "vbrQuality": 4,
+    "icyMetaInt": 8192,
+    "stationId": "Encoder-1",
+    "metaEnabled": true,
+    "iface": "",
+    "metaParser": {
+        "template": "artist={artist} | title={title}"
+    }
+}

@@ -1,0 +1,14 @@
+{
+    "uiPort": 8050,
+    "logLevel": "info",
+    "logRotSize": 10,
+    "logRetention": 14,
+    "encoderCount": 5,
+    "adminUser": "Admin",
+    "adminPass": "change-me",
+    "firstLoginRequired": true,
+    "iceURL": "http://localhost:8000",
+    "iceMountAAC": "/stream-aac",
+    "iceMountMP3": "/stream-mp3",
+    "interfaces": {}
+}

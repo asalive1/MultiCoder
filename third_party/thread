@@ -1,0 +1,16 @@
+#pragma once
+#include "chrono"
+
+namespace std {
+class thread {
+public:
+    thread() = default;
+    template <typename F>
+    explicit thread(F) {}
+    bool joinable() const { return false; }
+    void join() {}
+    void detach() {}
+
+    static void sleep_for(chrono::seconds) {}
+};
+}  // namespace std

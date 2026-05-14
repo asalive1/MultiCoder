@@ -1,0 +1,8 @@
+#pragma once
+#include "string"
+
+namespace std {
+namespace filesystem {
+inline bool create_directories(const std::string&) { return true; }
+}  // namespace filesystem
+}  // namespace std

@@ -1,0 +1,5 @@
+{
+    "listenPort": 9000,
+    "dataConnectPort": null,
+    "_note": "listenPort: TCP port to accept incoming XML metadata. dataConnectPort: if set, worker connects to this port as a client to pull metadata."
+}

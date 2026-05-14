@@ -1,0 +1,58 @@
+version: "3.9"
+
+services:
+  # ---- MultiCoder Supervisor + Worker Manager ----
+  multicoder:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: multicoder
+    restart: unless-stopped
+    ports:
+      # Host publish port is independent from the supervisor bind port inside container.
+      - "${UI_HOST_PORT:-8050}:${UI_CONTAINER_PORT:-8050}"
+    volumes:
+      - mc_system:/etc/MC
+      - mc_enc1:/etc/encoder1
+      - mc_enc2:/etc/encoder2
+      - mc_enc3:/etc/encoder3
+      - mc_enc4:/etc/encoder4
+      - mc_enc5:/etc/encoder5
+    environment:
+      # Supervisor bind/listen port inside container.
+      - UI_PORT=${UI_CONTAINER_PORT:-8050}
+      - ENCODER_COUNT=${ENCODER_COUNT:-5}
+    depends_on:
+      - icecast
+    networks:
+      - mcnet
+
+  # ---- Self-hosted Icecast 2 ----
+  icecast:
+    image: moul/icecast
+    container_name: icecast
+    restart: unless-stopped
+    ports:
+      - "${ICECAST_PORT:-8000}:8000"
+    volumes:
+      - icecast_config:/etc/icecast2
+    environment:
+      - ICECAST_SOURCE_PASSWORD=${ICECAST_SOURCE_PASSWORD:-hackme}
+      - ICECAST_ADMIN_PASSWORD=${ICECAST_ADMIN_PASSWORD:-secureadmin}
+      - ICECAST_RELAY_PASSWORD=${ICECAST_RELAY_PASSWORD:-relaypass}
+      - ICECAST_HOSTNAME=${ICECAST_HOSTNAME:-localhost}
+    networks:
+      - mcnet
+
+volumes:
+  mc_system:
+  mc_enc1:
+  mc_enc2:
+  mc_enc3:
+  mc_enc4:
+  mc_enc5:
+  icecast_config:
+
+networks:
+  mcnet:
+    driver: bridge

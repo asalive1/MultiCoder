@@ -1,0 +1,12 @@
+#pragma once
+
+namespace std {
+namespace chrono {
+class seconds {
+public:
+    explicit seconds(int) {}
+};
+
+class steady_clock {};
+}  // namespace chrono
+}  // namespace std

@@ -1,0 +1,23 @@
+services:
+  multicoder:
+    image: ghcr.io/asalive1/multicoder:latest
+    pull_policy: always   # always pull the latest image on every 'docker compose up'
+    network_mode: host    # required for RTP multicast — bridge networking blocks IGMP/multicast
+    # With host networking, ports are exposed directly on the host (no mapping needed):
+    #   Web UI:      http://server:<UI_PORT>
+    #   Icecast:     http://server:<ICECAST_PORT> (if enabled in your config)
+    #   Control:     server:<controlPort> per encoder
+    #   Metadata:    server:<listenPort> per encoder
+    #   RTP audio:   multicast via configured interface/channel
+    volumes:
+      - ./system:/etc/MC             # system.json + global logs
+      - ./encoder1:/etc/encoder1     # encoder 1 config/logs/HLS
+      - ./encoder2:/etc/encoder2     # encoder 2 config/logs/HLS
+      - ./encoder3:/etc/encoder3     # encoder 3 config/logs/HLS
+      - ./encoder4:/etc/encoder4     # encoder 4 config/logs/HLS
+      - ./encoder5:/etc/encoder5     # encoder 5 config/logs/HLS
+      - ./www:/opt/multicoder/www    # optional web asset override
+    environment:
+      - UI_PORT=8050
+      - ENCODER_COUNT=5
+    restart: unless-stopped

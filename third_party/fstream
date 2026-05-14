@@ -1,0 +1,22 @@
+#pragma once
+#include "string"
+
+namespace std {
+class ofstream {
+public:
+    ofstream() = default;
+    explicit ofstream(const string&) {}
+    bool is_open() const { return true; }
+    template <typename T>
+    ofstream& operator<<(const T&) { return *this; }
+    void flush() {}
+    void close() {}
+};
+
+class ifstream {
+public:
+    ifstream() = default;
+    explicit ifstream(const string&) {}
+    bool is_open() const { return true; }
+};
+}  // namespace std

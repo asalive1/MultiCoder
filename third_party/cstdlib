@@ -1,0 +1,5 @@
+#pragma once
+
+namespace std {
+inline int atoi(const char*) { return 0; }
+}

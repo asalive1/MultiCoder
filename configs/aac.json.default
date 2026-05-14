@@ -1,0 +1,16 @@
+{
+    "url": "http://localhost:8000/stream1-aac",
+    "user": "source",
+    "pass": "hackme",
+    "mode": "legacy",
+    "bitrate": 128000,
+    "sampleRate": 48000,
+    "profile": "aac_low",
+    "icyMetaInt": 8192,
+    "stationId": "Encoder-1",
+    "metaEnabled": true,
+    "iface": "",
+    "metaParser": {
+        "template": "artist={artist} | title={title}"
+    }
+}

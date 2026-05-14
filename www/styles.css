@@ -1,0 +1,277 @@
+/* MultiCoder — styles.css
+   Based on reference/styles.css.txt design guide
+   Dark navy header, white body, status colors, terminal log window.
+*/
+
+:root {
+  --navy: #0d2b45;
+  --accent: #3fa6e0;
+  --success: #28a745;
+  --danger: #dc3545;
+  --warning: #ffc107;
+  --muted: #6c757d;
+  --panel-bg: #f8f9fa;
+  --border: #d0d0d0;
+  --terminal-bg: #0a0a0a;
+  --terminal-fg: #39ff14;
+  --font: 'Segoe UI', Arial, sans-serif;
+  --font-mono: 'Courier New', Courier, monospace;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: var(--font);
+  font-size: 13px;
+  background: #fff;
+  color: #222;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ---- Header / banner ---- */
+header {
+  background: var(--navy);
+  color: #fff;
+  padding: 0 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 52px;
+  flex-shrink: 0;
+}
+
+.banner-top { display: flex; flex-direction: column; }
+.banner-top h1 { font-size: 18px; font-weight: 700; letter-spacing: 1px; }
+.banner-top .version { font-size: 11px; opacity: 0.75; }
+
+.banner-msg {
+  font-size: 12px;
+  color: var(--warning);
+  margin-left: 24px;
+}
+
+.banner-top nav { display: flex; gap: 16px; margin-top: 2px; }
+.banner-top nav a {
+  color: #fff;
+  text-decoration: none;
+  font-size: 12px;
+  opacity: 0.85;
+}
+.banner-top nav a:hover { opacity: 1; text-decoration: underline; }
+
+header .top-links { display: flex; gap: 12px; align-items: center; }
+header .top-links a { color: #cce; font-size: 12px; text-decoration: none; }
+header .top-links a:hover { color: #fff; }
+
+/* ---- Status bar (encoder strip) ---- */
+#status-bar {
+  background: #f0f4f8;
+  border-bottom: 1px solid var(--border);
+  padding: 6px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.status-bar-row { display: flex; gap: 32px; align-items: flex-start; flex-wrap: wrap; }
+.status-bar-row h2 { font-size: 14px; font-weight: 700; text-decoration: underline; margin-right: 8px; }
+#status-bar .add-encoder-btn { font-size: 11px; margin-left: 8px; }
+
+.encoder-card {
+  cursor: pointer;
+  min-width: 110px;
+}
+.encoder-card.selected .encoder-title { text-decoration: underline; color: var(--accent); }
+.encoder-title { font-weight: 700; font-size: 13px; text-decoration: underline; color: var(--navy); }
+.stream-statuses { font-size: 11px; line-height: 1.6; margin-top: 2px; }
+.s-live  { color: var(--success); font-weight: 600; }
+.s-stop  { color: var(--danger); }
+
+/* ---- Main content area ---- */
+main {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 190px 1fr 1fr 1fr;
+  overflow: hidden;
+  border-top: 2px solid var(--border);
+}
+
+main.log-expanded {
+  grid-template-columns: 190px 1fr 0 0;
+}
+
+/* Panels */
+.panel {
+  border-right: 1px solid var(--border);
+  padding: 16px 12px;
+  overflow-y: auto;
+  height: 100%;
+}
+.panel:last-child { border-right: none; }
+
+main.log-expanded #centerLeft {
+  grid-column: 2 / 5;
+}
+
+main.log-expanded #centerRight,
+main.log-expanded #rightPanel {
+  display: none !important;
+}
+
+/* ---- Left nav panel ---- */
+#left-panel { background: #fff; }
+#left-panel h2 { font-size: 15px; font-weight: 700; margin-bottom: 12px; }
+.encoder-nav { list-style: none; }
+.encoder-nav li { margin-bottom: 5px; }
+.encoder-nav a {
+  color: var(--accent);
+  text-decoration: none;
+  font-size: 13px;
+  display: block;
+  padding: 2px 0;
+}
+.encoder-nav a:hover { text-decoration: underline; }
+.encoder-nav a.active {
+  font-weight: 700;
+  background: #e8f4fb;
+  padding: 2px 6px;
+  border-radius: 3px;
+}
+
+/* ---- Config panels ---- */
+.config-panel { background: var(--panel-bg); }
+
+.config-panel h2 { font-size: 16px; font-weight: 700; margin-bottom: 14px; }
+.config-panel h3 { font-size: 13px; font-weight: 600; margin: 10px 0 6px; }
+
+.form-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+.form-row label { min-width: 160px; font-weight: 500; }
+.form-row input[type=text],
+.form-row input[type=number],
+.form-row input[type=password],
+.form-row select {
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 3px 6px;
+  font-size: 12px;
+  min-width: 120px;
+}
+.form-row input[type=range] { width: 180px; }
+
+.form-row .unit { font-size: 11px; opacity: 0.7; }
+
+.btn {
+  padding: 4px 14px;
+  font-size: 12px;
+  border: 1px solid #888;
+  border-radius: 3px;
+  background: #e8e8e8;
+  cursor: pointer;
+}
+.btn:hover { background: #d4d4d4; }
+.btn-primary { background: var(--navy); color: #fff; border-color: var(--navy); }
+.btn-primary:hover { background: #1a4a6e; }
+.btn-danger { background: var(--danger); color: #fff; border-color: var(--danger); }
+.btn-danger:hover { background: #b02a37; }
+.btn-success { background: var(--success); color: #fff; border-color: var(--success); }
+
+.action-row { display: flex; gap: 8px; margin-top: 16px; }
+
+/* ---- VU Meter ---- */
+.vu-container {
+  background: #000;
+  border-radius: 3px;
+  padding: 6px 8px;
+  margin-bottom: 10px;
+  font-size: 11px;
+  color: #aaa;
+  min-height: 48px;
+  position: relative;
+}
+.vu-bar-wrap { display: flex; flex-direction: column; gap: 3px; }
+.vu-channel  { display: flex; align-items: center; gap: 4px; }
+.vu-track    { flex: 1; height: 10px; background: #111; border-radius: 2px; overflow: hidden; position: relative; }
+.vu-fill     { height: 100%; width: 0%; background: linear-gradient(to right, #00c84a, #ffd600, #ff2200); transition: width 0.08s; border-radius: 2px; }
+.vu-label    { width: 14px; text-align: right; font-size: 10px; color: #888; }
+.vu-title    { font-size: 10px; color: #888; text-align: center; margin-bottom: 3px; }
+
+/* ---- Terminal log window ---- */
+#log-window {
+  background: var(--terminal-bg);
+  color: var(--terminal-fg);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 12px;
+  overflow-y: auto;
+  height: calc(100vh - 190px);
+  white-space: pre-wrap;
+  word-break: break-all;
+  border-radius: 3px;
+}
+
+/* ---- Metadata viewer panel ---- */
+.meta-panel h2 { font-size: 16px; font-weight: 700; margin-bottom: 12px; text-align: center; }
+.meta-section { margin-bottom: 10px; }
+.meta-section h3 { font-size: 12px; margin-bottom: 4px; }
+.meta-box {
+  background: var(--terminal-bg);
+  color: var(--terminal-fg);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 8px;
+  border-radius: 3px;
+  min-height: 60px;
+  white-space: pre-wrap;
+  overflow-y: auto;
+  max-height: 120px;
+}
+.prev-events { list-style: none; margin-top: 4px; }
+.prev-events li { font-size: 11px; border-bottom: 1px solid #eee; padding: 2px 0; }
+
+/* ---- Modal / overlay ---- */
+.modal-overlay {
+  position: fixed; inset: 0;
+  background: rgba(0,0,0,0.5);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 999;
+}
+.modal {
+  background: #fff;
+  border-radius: 5px;
+  padding: 24px;
+  min-width: 340px;
+  max-width: 600px;
+  position: relative;
+}
+.modal h2 { margin-bottom: 16px; font-size: 16px; }
+.modal .close-btn { position: absolute; top: 12px; right: 14px; cursor: pointer; font-size: 18px; }
+
+/* ---- Admin panel ---- */
+.admin-section { margin-bottom: 20px; }
+.admin-section h3 { font-size: 14px; font-weight: 700; border-bottom: 1px solid #ddd; padding-bottom: 4px; margin-bottom: 10px; }
+
+/* ---- Icecast status badge ---- */
+.badge {
+  display: inline-block;
+  padding: 2px 7px;
+  border-radius: 9px;
+  font-size: 10px;
+  font-weight: 700;
+}
+.badge-live { background: #d4edda; color: #155724; }
+.badge-stop { background: #f8d7da; color: #721c24; }
+
+/* ---- Responsive: single column on small screens ---- */
+@media (max-width: 900px) {
+  main { grid-template-columns: 1fr; grid-template-rows: auto; }
+  .panel { border-right: none; border-bottom: 1px solid var(--border); }
+}

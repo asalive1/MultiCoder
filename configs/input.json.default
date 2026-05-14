@@ -1,0 +1,13 @@
+{
+    "inputType": "rtp",
+    "rtpAddress": "239.192.0.0",
+    "rtpPort": 5004,
+    "rtpInterface": "eth0",
+    "rtpGain": 0.0,
+    "bitrate": 128000,
+    "channels": 2,
+    "sampleRate": 48000,
+    "bitDepth": 24,
+    "deviceIndex": 0,
+    "_comment": "inputType: axia | rtp | audio | srt. bitDepth: 24 for Axia LiveWire/AES67 (L24), 16 for legacy L16 RTP"
+}

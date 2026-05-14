@@ -1,0 +1,14 @@
+{
+    "segmentSeconds": 5,
+    "window": 5,
+    "startTimeOffset": -25,
+    "lowLatency": false,
+    "metaEnabled": true,
+    "iface": "",
+    "metaParser": {
+        "method": "id3",
+        "scope": "current",
+        "tags": ["title", "artist", "category", "duration"]
+    },
+    "_note": "startTimeOffset: negative value means segments start before real-time wall clock (buffer delay). -25 means data lags 25s. Use 0 for live with no delay buffer."
+}

@@ -1,0 +1,14 @@
+{
+    "controlPort": 9010,
+    "controlEnabled": true,
+    "commands": {
+        "startAAC": "StartAAC",
+        "stopAAC":  "StopAAC",
+        "startMP3": "StartMP3",
+        "stopMP3":  "StopMP3",
+        "startHLS": "StartHLS",
+        "stopHLS":  "StopHLS",
+        "startSRT": "StartSRT",
+        "stopSRT":  "StopSRT"
+    }
+}

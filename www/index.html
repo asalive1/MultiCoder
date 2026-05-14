@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>MultiCoder v2.0</title>
+  <link rel="stylesheet" href="/styles.css"/>
+</head>
+<body>
+
+<!-- ======================== HEADER ======================== -->
+<header>
+  <div class="banner-top">
+    <h1>Multi&#8209;Coder</h1>
+    <span class="version" id="versionBadge">v2.0</span>
+    <nav id="sysMsg"><span class="banner-msg" id="bannerMsg"></span></nav>
+  </div>
+  <div class="top-links">
+    <a href="#" id="adminLink">Admin Settings</a>
+    <a href="#" id="manualLink">Manual</a>
+    <a href="#" id="signOutLink">Sign Out</a>
+  </div>
+</header>
+
+<!-- ======================== ENCODER STATUS BAR ======================== -->
+<div id="status-bar">
+  <div class="status-bar-row">
+    <h2>Available Streams</h2>
+    <button class="btn add-encoder-btn" id="addEncoderBtn" style="display:none">+ Add New Encoder</button>
+  </div>
+  <div class="status-bar-row" id="encoderCards">
+    <!-- Encoder cards injected by JS -->
+  </div>
+</div>
+
+<!-- ======================== MAIN CONTENT ======================== -->
+<main>
+  <!-- Left nav panel -->
+  <div class="panel" id="left-panel">
+    <h2 id="leftPanelTitle">Select an Encoder</h2>
+    <ul class="encoder-nav" id="encoderNav">
+      <!-- links injected by JS -->
+    </ul>
+  </div>
+
+  <!-- Centre-left: config/control panel -->
+  <div class="panel config-panel" id="centerLeft">
+    <div id="centerLeftContent">
+      <p style="color:var(--muted); margin-top:24px; text-align:center;">Select an encoder to begin.</p>
+    </div>
+  </div>
+
+  <!-- Centre-right: secondary config or log panel -->
+  <div class="panel config-panel" id="centerRight">
+    <div id="centerRightContent"></div>
+  </div>
+
+  <!-- Right panel: metadata viewer -->
+  <!-- Right panel: metadata viewer — only visible when a stream section (AAC/MP3/HLS/SRT) is selected -->
+  <div class="panel meta-panel" id="rightPanel" style="display:none">
+    <h2 id="metaPanelTitle">Metadata Viewer</h2>
+    <div class="meta-section">
+      <h3>Incoming Data</h3>
+      <div class="meta-box" id="metaIncoming">Waiting for data...</div>
+    </div>
+    <div class="meta-section">
+      <h3>Data Sent</h3>
+      <div class="meta-box" id="metaSent">—</div>
+    </div>
+    <div class="meta-section">
+      <h3>Previous Events</h3>
+      <ol class="prev-events" id="prevEvents"></ol>
+    </div>
+  </div>
+</main>
+
+<!-- ======================== ADMIN LOGIN MODAL ======================== -->
+<div class="modal-overlay" id="adminModal" style="display:none">
+  <div class="modal">
+    <span class="close-btn" id="adminClose">&times;</span>
+    <h2>Admin Login</h2>
+    <div id="adminLoginForm">
+      <div class="form-row">
+        <label>Username:</label>
+        <input type="text" id="adminUser" value="Admin"/>
+      </div>
+      <div class="form-row">
+        <label>Password:</label>
+        <input type="password" id="adminPass"/>
+      </div>
+      <button class="btn btn-primary" id="adminLoginBtn">Login</button>
+      <p id="adminLoginErr" style="color:red;margin-top:8px;"></p>
+    </div>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>
