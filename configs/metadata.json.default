@@ -1,5 +1,7 @@
 {
+    "mode": "listen",
     "listenPort": 9000,
+    "dataConnectHost": "",
     "dataConnectPort": null,
-    "_note": "listenPort: TCP port to accept incoming XML metadata. dataConnectPort: if set, worker connects to this port as a client to pull metadata."
+    "_note": "mode: listen or pull. listen uses listenPort for inbound push. pull connects outbound to dataConnectHost:dataConnectPort and ingests metadata from that socket."
 }

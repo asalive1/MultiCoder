@@ -1418,51 +1418,106 @@ static std::string handleReq(const std::string& raw) {
             return httpResp(200, "application/json", bodyResp);
         }
 
-        // UI metadata listeners: acknowledge command without restarting whole app.
+        // Metadata ingestion mode control: exactly one mode active at a time.
         if (method == "POST" && (sub == "metadata/start" || sub == "metadata/stop")) {
             bool start = (sub == "metadata/start");
-            simplejson::Object runtime = readRuntimeState(idx + 1);
-            bool ctlState = runtime.getBool("controlListenerRunning", false);
-            writeRuntimeState(idx + 1, ctlState, start);
+            const int enc = idx + 1;
+            const std::string metaPath = "/etc/encoder" + std::to_string(enc) + "/metadata.json";
+            simplejson::Object metaCfg = readJsonFile(metaPath);
+            simplejson::Object req;
+            req.parse(body);
+
+            std::string mode = req.getString("mode", metaCfg.getString("mode", "listen"));
+            for (char& c : mode) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (mode != "listen" && mode != "pull") mode = "listen";
+
+            int listenPort = req.getInt("listenPort", metaCfg.getInt("listenPort", 9000 + idx * 10));
+            std::string pullHost = req.getString("dataConnectHost", metaCfg.getString("dataConnectHost", ""));
+            int pullPort = req.getInt("dataConnectPort", metaCfg.getInt("dataConnectPort", 0));
+
             if (start) {
-                simplejson::Object metaCfg = readJsonFile("/etc/encoder" + std::to_string(idx + 1) + "/metadata.json");
-                int lp = metaCfg.getInt("listenPort", 9000 + idx * 10);
-                appendEncoderLog(idx + 1, "Metadata listener start requested on port " + std::to_string(lp));
-                appendSysLog(idx + 1, "Metadata listener start requested on port " + std::to_string(lp));
-            } else {
-                appendEncoderLog(idx + 1, "Metadata listener stop requested");
-                appendSysLog(idx + 1, "Metadata listener stop requested");
+                std::string validationError;
+                if (mode == "listen") {
+                    if (listenPort <= 0 || listenPort > 65535) {
+                        validationError = "Listen mode requires a valid listen port (1-65535)";
+                    }
+                } else {
+                    if (pullHost.empty()) {
+                        validationError = "Pull mode requires Data Connect Host/IP";
+                    } else if (pullPort <= 0 || pullPort > 65535) {
+                        validationError = "Pull mode requires Data Connect Port (1-65535)";
+                    }
+                }
+                if (!validationError.empty()) {
+                    appendEncoderLog(enc, "Metadata start FAILED: " + validationError);
+                    appendSysLog(enc, "Metadata start FAILED: " + validationError);
+                    return httpResp(400, "application/json",
+                        "{\"ok\":false,\"error\":\"" + jsonEscape(validationError) + "\"}");
+                }
             }
+
+            metaCfg.setString("mode", mode);
+            metaCfg.setInt("listenPort", listenPort);
+            metaCfg.setString("dataConnectHost", pullHost);
+            metaCfg.setInt("dataConnectPort", pullPort);
+            {
+                std::ofstream mf(metaPath, std::ios::trunc);
+                mf << metaCfg.serialize();
+            }
+
+            simplejson::Object runtime = readRuntimeState(enc);
+            bool ctlState = runtime.getBool("controlListenerRunning", false);
+            writeRuntimeState(enc, ctlState, start);
+
+            if (start) {
+                if (mode == "listen") {
+                    appendEncoderLog(enc, "Metadata start requested in LISTEN mode on port " + std::to_string(listenPort));
+                    appendSysLog(enc, "Metadata start requested in LISTEN mode on port " + std::to_string(listenPort));
+                } else {
+                    appendEncoderLog(enc, "Metadata start requested in PULL mode from " + pullHost + ":" + std::to_string(pullPort));
+                    appendSysLog(enc, "Metadata start requested in PULL mode from " + pullHost + ":" + std::to_string(pullPort));
+                }
+            } else {
+                appendEncoderLog(enc, "Metadata stop requested");
+                appendSysLog(enc, "Metadata stop requested");
+            }
+
             std::string bodyResp = std::string("{\"ok\":true,\"listener\":\"metadata\",\"state\":\"") +
-                                   (start ? "running" : "stopped") + "\"}";
+                                   (start ? "running" : "stopped") + "\",\"mode\":\"" + mode + "\"}";
             return httpResp(200, "application/json", bodyResp);
         }
 
         if (method == "POST" && sub == "metadata/connect") {
+            // Explicit test-connect endpoint only. Start/Stop controls the actual runtime mode.
             simplejson::Object req;
             req.parse(body);
             std::string host = req.getString("host", "");
             int port = req.getInt("port", 0);
-            appendEncoderLog(idx + 1, "Metadata outbound connect requested to " + host + ":" + std::to_string(port));
-            appendSysLog(idx + 1, "Metadata outbound connect requested to " + host + ":" + std::to_string(port));
+            appendEncoderLog(idx + 1, "Metadata test connect requested to " + host + ":" + std::to_string(port));
+            appendSysLog(idx + 1, "Metadata test connect requested to " + host + ":" + std::to_string(port));
 
             std::string err;
             bool ok = testTcpConnect(host, port, err);
             if (ok) {
-                appendEncoderLog(idx + 1, "Metadata outbound connect SUCCESS to " + host + ":" + std::to_string(port));
-                appendSysLog(idx + 1, "Metadata outbound connect SUCCESS to " + host + ":" + std::to_string(port));
+                appendEncoderLog(idx + 1, "Metadata test connect SUCCESS to " + host + ":" + std::to_string(port));
+                appendSysLog(idx + 1, "Metadata test connect SUCCESS to " + host + ":" + std::to_string(port));
                 return httpResp(200, "application/json", "{\"ok\":true,\"status\":\"success\"}");
             }
 
-            appendEncoderLog(idx + 1, "Metadata outbound connect FAILED to " + host + ":" + std::to_string(port) + " (" + err + ")");
-            appendSysLog(idx + 1, "Metadata outbound connect FAILED to " + host + ":" + std::to_string(port) + " (" + err + ")");
+            appendEncoderLog(idx + 1, "Metadata test connect FAILED to " + host + ":" + std::to_string(port) + " (" + err + ")");
+            appendSysLog(idx + 1, "Metadata test connect FAILED to " + host + ":" + std::to_string(port) + " (" + err + ")");
             return httpResp(200, "application/json", "{\"ok\":false,\"status\":\"failed\",\"error\":\"" + jsonEscape(err) + "\"}");
         }
 
         if (method == "GET" && sub == "metadata/status") {
             simplejson::Object runtime = readRuntimeState(idx + 1);
+            simplejson::Object metaCfg = readJsonFile("/etc/encoder" + std::to_string(idx + 1) + "/metadata.json");
             simplejson::Object metaRt = readJsonFile("/etc/encoder" + std::to_string(idx + 1) + "/metadata_runtime.json");
             bool listenerRunning = runtime.getBool("metadataListenerRunning", false);
+            std::string mode = metaCfg.getString("mode", "listen");
+            int listenPort = metaCfg.getInt("listenPort", 9000 + idx * 10);
+            std::string pullHost = metaCfg.getString("dataConnectHost", "");
+            int pullPort = metaCfg.getInt("dataConnectPort", 0);
             int eventCount = metaRt.getInt("eventCount", 0);
             std::string lastPayloadUtc = metaRt.getString("lastPayloadUtc", "");
             std::string lastRawXml       = metaRt.getString("lastRawXml", "");
@@ -1471,6 +1526,10 @@ static std::string handleReq(const std::string& raw) {
             std::string lastFmtHLS       = metaRt.getString("lastFormattedHLS", "");
             std::string lastFmtSRT       = metaRt.getString("lastFormattedSRT", "");
             std::string bodyResp = std::string("{\"listenerRunning\":") + (listenerRunning ? "true" : "false") +
+                                   ",\"mode\":\"" + jsonEscape(mode) + "\"" +
+                                   ",\"listenPort\":" + std::to_string(listenPort) +
+                                   ",\"dataConnectHost\":\"" + jsonEscape(pullHost) + "\"" +
+                                   ",\"dataConnectPort\":" + std::to_string(pullPort) +
                                    ",\"eventCount\":" + std::to_string(eventCount) +
                                    ",\"lastPayloadUtc\":\"" + jsonEscape(lastPayloadUtc) + "\"" +
                                    ",\"lastRawXml\":\"" + jsonEscape(lastRawXml) + "\"" +

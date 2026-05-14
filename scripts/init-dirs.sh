@@ -97,7 +97,9 @@ EOF
     if [ ! -f "/etc/encoder${i}/metadata.json" ]; then
         cat > "/etc/encoder${i}/metadata.json" <<EOF
 {
+    "mode": "listen",
     "listenPort": $((9000 + (i - 1) * 10)),
+    "dataConnectHost": "",
     "dataConnectPort": null
 }
 EOF

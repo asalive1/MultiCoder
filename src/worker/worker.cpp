@@ -3365,197 +3365,279 @@ void Worker::monitorInputLevels() {
 // ---------- metadata port listener ----------
 
 void Worker::listenMetaPort() {
-    // Default metadata listen port: 9000 + (encoderIdx - 1) * 10
-    int metaPort = 9000 + (m_idx - 1) * 10;
-    {
-        std::ifstream cf(m_cfgDir + "/metadata.json");
-        if (cf.is_open()) {
-            std::string s((std::istreambuf_iterator<char>(cf)), {});
-            simplejson::Object o;
-            if (o.parse(s)) {
-                metaPort = o.getInt("listenPort", metaPort);
+    int listenSfd = -1;
+    int activeListenPort = 0;
+
+    auto closeListenSocket = [&]() {
+        if (listenSfd >= 0) {
+            close_socket(listenSfd);
+            listenSfd = -1;
+            activeListenPort = 0;
+        }
+    };
+
+    auto emitMetadata = [this](const std::string& xmlData) {
+        if (xmlData.empty()) return;
+        log("Metadata received (" + std::to_string(xmlData.size()) + " bytes)");
+        log("META_RAW: " + singleLine(xmlData));
+        logSys("META_RAW: " + singleLine(xmlData));
+
+        std::string metaRtPath = m_cfgDir + "/metadata_runtime.json";
+        simplejson::Object metaRt = readJsonFile(metaRtPath);
+        int count = metaRt.getInt("eventCount", 0);
+        metaRt.setInt("eventCount", count + 1);
+        metaRt.setString("lastPayloadUtc", timestamp());
+
+        std::string xmlSnippet = singleLine(xmlData);
+        if (xmlSnippet.size() > 500) xmlSnippet = xmlSnippet.substr(0, 500) + "...";
+        metaRt.setString("lastRawXml", xmlSnippet);
+
+        std::string cachePath = m_cfgDir + "/meta_current.xml";
+        std::ofstream mf(cachePath);
+        mf << xmlData;
+
+        simplejson::Object aacCfg = readJsonFile(m_cfgDir + "/aac.json");
+        simplejson::Object mp3Cfg = readJsonFile(m_cfgDir + "/mp3.json");
+        simplejson::Object hlsCfg = readJsonFile(m_cfgDir + "/hls.json");
+        simplejson::Object srtCfg = readJsonFile(m_cfgDir + "/srt.json");
+
+        std::string aacFormatted = formattedMetadataForStream("AAC", xmlData, aacCfg);
+        std::string mp3Formatted = formattedMetadataForStream("MP3", xmlData, mp3Cfg);
+        std::string hlsFormatted = formattedMetadataForStream("HLS", xmlData, hlsCfg);
+        std::string srtFormatted = formattedMetadataForStream("SRT", xmlData, srtCfg);
+
+        {
+            std::lock_guard<std::mutex> lk(m_hlsMetaMutex);
+            m_hlsLastMetaPayload = hlsFormatted;
+        }
+
+        if (m_hlsRunning) {
+            std::string injectErr;
+            bool injected = injectHlsMetadataIntoPlaylist(m_cfgDir, hlsCfg, hlsFormatted, injectErr);
+            if (injected) {
+                simplejson::Object parser = hlsCfg.getSubObject("metaParser");
+                std::string scope = parser.getString("scope", "current");
+                log("HLS playlist metadata injected (scope=" + scope + ")");
+            } else if (injectErr != "playlist not found" && injectErr != "playlist empty") {
+                log("HLS playlist metadata injection skipped: " + injectErr);
             }
         }
-    }
 
-    int sfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sfd < 0) { log("meta socket() failed"); return; }
-    int opt = 1;
-#ifdef _WIN32
-    setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
-#else
-    setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-#endif
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(static_cast<uint16_t>(metaPort));
-    if (bind(sfd, (sockaddr*)&addr, sizeof(addr)) < 0) {
-        log("meta bind() failed on port " + std::to_string(metaPort));
-        close_socket(sfd);
-        return;
-    }
-    listen(sfd, 8);
-    log("Metadata listener on port " + std::to_string(metaPort));
+        metaRt.setString("lastFormattedAAC", aacFormatted);
+        metaRt.setString("lastFormattedMP3", mp3Formatted);
+        metaRt.setString("lastFormattedHLS", hlsFormatted);
+        metaRt.setString("lastFormattedSRT", srtFormatted);
+        std::ofstream metaRtFile(metaRtPath);
+        metaRtFile << metaRt.serialize();
 
-    while (m_running) {
-        fd_set fds; FD_ZERO(&fds); FD_SET(sfd, &fds);
-        timeval tv{1, 0};
-        if (select(sfd+1, &fds, nullptr, nullptr, &tv) <= 0) continue;
-        sockaddr_in cli{}; socklen_t len = sizeof(cli);
-        int cfd = accept(sfd, (sockaddr*)&cli, &len);
-        if (cfd < 0) continue;
-        char peerIp[INET_ADDRSTRLEN] = {0};
-        const char* ipTxt = inet_ntop(AF_INET, &cli.sin_addr, peerIp, sizeof(peerIp));
-        std::string peer = std::string(ipTxt ? ipTxt : "unknown") + ":" + std::to_string(ntohs(cli.sin_port));
-        log("Metadata client connected: " + peer);
-        logSys("Metadata client connected: " + peer);
-        // Handle each connection on its own detached thread so accept() stays
-        // responsive while long-lived or slow senders hold the socket open.
-        std::thread([this, cfd, peer]() {
-            auto emitMetadata = [this](const std::string& xmlData) {
-                if (xmlData.empty()) return;
-                log("Metadata received (" + std::to_string(xmlData.size()) + " bytes)");
-                log("META_RAW: " + singleLine(xmlData));
-                logSys("META_RAW: " + singleLine(xmlData));
+        if (m_aacRunning && aacCfg.getBool("metaEnabled", true)) {
+            std::string u = aacCfg.getString("url", "");
+            std::string user = aacCfg.getString("user", "source");
+            std::string pw = aacCfg.getString("pass", "");
+            if (!u.empty()) {
+                std::string af = aacFormatted;
+                std::thread([u, user, pw, af]() { sendIcecastMetaUpdate(u, user, pw, af); }).detach();
+            }
+        }
+        if (m_mp3Running && mp3Cfg.getBool("metaEnabled", true)) {
+            std::string u = mp3Cfg.getString("url", "");
+            std::string user = mp3Cfg.getString("user", "source");
+            std::string pw = mp3Cfg.getString("pass", "");
+            if (!u.empty()) {
+                std::string mf2 = mp3Formatted;
+                std::thread([u, user, pw, mf2]() { sendIcecastMetaUpdate(u, user, pw, mf2); }).detach();
+            }
+        }
 
-                // Update metadata telemetry in a dedicated file to avoid races
-                // with input-level runtime_state writes.
-                std::string metaRtPath = m_cfgDir + "/metadata_runtime.json";
-                simplejson::Object metaRt = readJsonFile(metaRtPath);
-                int count = metaRt.getInt("eventCount", 0);
-                metaRt.setInt("eventCount", count + 1);
-                metaRt.setString("lastPayloadUtc", timestamp());
+        auto stateTag = [](bool running) { return running ? "RUNNING" : "STOPPED"; };
+        std::string aacLine = "META_SENT[AAC][" + std::string(stateTag(m_aacRunning)) + "]: " +
+            (m_aacRunning ? aacFormatted : "not emitted (stream stopped)");
+        std::string mp3Line = "META_SENT[MP3][" + std::string(stateTag(m_mp3Running)) + "]: " +
+            (m_mp3Running ? mp3Formatted : "not emitted (stream stopped)");
+        std::string hlsLine = "META_SENT[HLS][" + std::string(stateTag(m_hlsRunning)) + "]: " +
+            (m_hlsRunning ? hlsFormatted : "not emitted (stream stopped)");
+        std::string srtLine = "META_SENT[SRT][" + std::string(stateTag(m_srtRunning)) + "]: " +
+            (m_srtRunning ? srtFormatted : "not emitted (stream stopped)");
+        log(aacLine); logSys(aacLine);
+        log(mp3Line); logSys(mp3Line);
+        log(hlsLine); logSys(hlsLine);
+        log(srtLine); logSys(srtLine);
+    };
 
-                // Store a compact snippet of the raw XML for the UI metadata viewer.
-                std::string xmlSnippet = singleLine(xmlData);
-                if (xmlSnippet.size() > 500) xmlSnippet = xmlSnippet.substr(0, 500) + "...";
-                metaRt.setString("lastRawXml", xmlSnippet);
-
-                // Write to metadata cache file for UI to read
-                std::string cachePath = m_cfgDir + "/meta_current.xml";
-                std::ofstream mf(cachePath);
-                mf << xmlData;
-
-                // Load per-stream configs so the parser settings are applied.
-                simplejson::Object aacCfg = readJsonFile(m_cfgDir + "/aac.json");
-                simplejson::Object mp3Cfg = readJsonFile(m_cfgDir + "/mp3.json");
-                simplejson::Object hlsCfg = readJsonFile(m_cfgDir + "/hls.json");
-                simplejson::Object srtCfg = readJsonFile(m_cfgDir + "/srt.json");
-
-                std::string aacFormatted = formattedMetadataForStream("AAC", xmlData, aacCfg);
-                std::string mp3Formatted = formattedMetadataForStream("MP3", xmlData, mp3Cfg);
-                std::string hlsFormatted = formattedMetadataForStream("HLS", xmlData, hlsCfg);
-                std::string srtFormatted = formattedMetadataForStream("SRT", xmlData, srtCfg);
-
-                // Store the formatted HLS payload so the HTTP server can inject it at serve time.
-                {
-                    std::lock_guard<std::mutex> lk(m_hlsMetaMutex);
-                    m_hlsLastMetaPayload = hlsFormatted;
-                }
-
-                // Inject metadata into the active HLS playlist EXTINF tags when HLS is running.
-                if (m_hlsRunning) {
-                    std::string injectErr;
-                    bool injected = injectHlsMetadataIntoPlaylist(m_cfgDir, hlsCfg, hlsFormatted, injectErr);
-                    if (injected) {
-                        simplejson::Object parser = hlsCfg.getSubObject("metaParser");
-                        std::string scope = parser.getString("scope", "current");
-                        log("HLS playlist metadata injected (scope=" + scope + ")");
-                    } else if (injectErr != "playlist not found" && injectErr != "playlist empty") {
-                        log("HLS playlist metadata injection skipped: " + injectErr);
-                    }
-                }
-
-                // Persist per-stream formatted strings for the UI metadata viewer.
-                metaRt.setString("lastFormattedAAC", aacFormatted);
-                metaRt.setString("lastFormattedMP3", mp3Formatted);
-                metaRt.setString("lastFormattedHLS", hlsFormatted);
-                metaRt.setString("lastFormattedSRT", srtFormatted);
-                std::ofstream metaRtFile(metaRtPath);
-                metaRtFile << metaRt.serialize();
-
-                // Push stream-title updates to Icecast servers (out-of-band admin API).
-                if (m_aacRunning && aacCfg.getBool("metaEnabled", true)) {
-                    std::string u = aacCfg.getString("url",  "");
-                    std::string user = aacCfg.getString("user", "source");
-                    std::string pw   = aacCfg.getString("pass", "");
-                    if (!u.empty()) {
-                        std::string af = aacFormatted;
-                        std::thread([u,user,pw,af]() { sendIcecastMetaUpdate(u, user, pw, af); }).detach();
-                    }
-                }
-                if (m_mp3Running && mp3Cfg.getBool("metaEnabled", true)) {
-                    std::string u = mp3Cfg.getString("url",  "");
-                    std::string user = mp3Cfg.getString("user", "source");
-                    std::string pw   = mp3Cfg.getString("pass", "");
-                    if (!u.empty()) {
-                        std::string mf = mp3Formatted;
-                        std::thread([u,user,pw,mf]() { sendIcecastMetaUpdate(u, user, pw, mf); }).detach();
-                    }
-                }
-
-                auto stateTag = [](bool running) { return running ? "RUNNING" : "STOPPED"; };
-                std::string aacLine = "META_SENT[AAC][" + std::string(stateTag(m_aacRunning)) + "]: " +
-                    (m_aacRunning ? aacFormatted : "not emitted (stream stopped)");
-                std::string mp3Line = "META_SENT[MP3][" + std::string(stateTag(m_mp3Running)) + "]: " +
-                    (m_mp3Running ? mp3Formatted : "not emitted (stream stopped)");
-                std::string hlsLine = "META_SENT[HLS][" + std::string(stateTag(m_hlsRunning)) + "]: " +
-                    (m_hlsRunning ? hlsFormatted : "not emitted (stream stopped)");
-                std::string srtLine = "META_SENT[SRT][" + std::string(stateTag(m_srtRunning)) + "]: " +
-                    (m_srtRunning ? srtFormatted : "not emitted (stream stopped)");
-                log(aacLine); logSys(aacLine);
-                log(mp3Line); logSys(mp3Line);
-                log(hlsLine); logSys(hlsLine);
-                log(srtLine); logSys(srtLine);
-            };
-
-            std::string xmlData;
-            char chunk[4096];
-            bool sawPayload = false;
-            auto lastIdleLogAt = std::chrono::steady_clock::now() - std::chrono::seconds(20);
-            while (m_running) {
-                fd_set rfds;
-                FD_ZERO(&rfds);
-                FD_SET(cfd, &rfds);
-                timeval tv{1, 0};
-                int rc = select(cfd + 1, &rfds, nullptr, nullptr, &tv);
-                if (rc > 0) {
-                    ssize_t n = recv(cfd, chunk, sizeof(chunk), 0);
-                    if (n > 0) {
-                        xmlData.append(chunk, n);
-                        continue;
-                    }
-                    // Peer closed or socket error.
-                    break;
-                }
-                if (rc == 0) {
-                    // Idle gap on a long-lived connection: treat accumulated payload as one event.
-                    if (!xmlData.empty()) {
-                        sawPayload = true;
-                        emitMetadata(xmlData);
-                        xmlData.clear();
-                    } else {
-                        auto now = std::chrono::steady_clock::now();
-                        if ((now - lastIdleLogAt) > std::chrono::seconds(15)) {
-                            log("Metadata client connected but no payload yet: " + peer);
-                            lastIdleLogAt = now;
-                        }
-                    }
+    auto processSocketUntilClose = [this, &emitMetadata](int cfd, const std::string& peer) {
+        std::string xmlData;
+        char chunk[4096];
+        bool sawPayload = false;
+        auto lastIdleLogAt = std::chrono::steady_clock::now() - std::chrono::seconds(20);
+        while (m_running) {
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(cfd, &rfds);
+            timeval tv{1, 0};
+            int rc = select(cfd + 1, &rfds, nullptr, nullptr, &tv);
+            if (rc > 0) {
+                ssize_t n = recv(cfd, chunk, sizeof(chunk), 0);
+                if (n > 0) {
+                    xmlData.append(chunk, static_cast<size_t>(n));
                     continue;
                 }
                 break;
             }
-
-            if (!xmlData.empty()) {
-                sawPayload = true;
-                emitMetadata(xmlData);
+            if (rc == 0) {
+                if (!xmlData.empty()) {
+                    sawPayload = true;
+                    emitMetadata(xmlData);
+                    xmlData.clear();
+                } else {
+                    auto now = std::chrono::steady_clock::now();
+                    if ((now - lastIdleLogAt) > std::chrono::seconds(15)) {
+                        log("Metadata client connected but no payload yet: " + peer);
+                        lastIdleLogAt = now;
+                    }
+                }
+                continue;
             }
-            if (!sawPayload) {
-                log("Metadata client disconnected without payload: " + peer);
+            break;
+        }
+
+        if (!xmlData.empty()) {
+            sawPayload = true;
+            emitMetadata(xmlData);
+        }
+        if (!sawPayload) {
+            log("Metadata client disconnected without payload: " + peer);
+        }
+        close_socket(cfd);
+    };
+
+    auto openPullSocket = [](const std::string& host, int port, std::string& err) -> int {
+        err.clear();
+        addrinfo hints{};
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_protocol = IPPROTO_TCP;
+        addrinfo* res = nullptr;
+        std::string ps = std::to_string(port);
+        if (getaddrinfo(host.c_str(), ps.c_str(), &hints, &res) != 0 || !res) {
+            err = "resolve failed";
+            return -1;
+        }
+        int cfd = -1;
+        for (addrinfo* p = res; p; p = p->ai_next) {
+            cfd = socket(static_cast<int>(p->ai_family), static_cast<int>(p->ai_socktype), static_cast<int>(p->ai_protocol));
+            if (cfd < 0) continue;
+            if (connect(cfd, p->ai_addr, static_cast<int>(p->ai_addrlen)) == 0) {
+                freeaddrinfo(res);
+                return cfd;
             }
             close_socket(cfd);
-        }).detach();
+            cfd = -1;
+        }
+        freeaddrinfo(res);
+        err = "connect failed";
+        return -1;
+    };
+
+    auto lastPullFailLogAt = std::chrono::steady_clock::now() - std::chrono::seconds(20);
+
+    while (m_running) {
+        simplejson::Object rt = readRuntimeState(m_cfgDir);
+        bool metaRunning = rt.getBool("metadataListenerRunning", false);
+        simplejson::Object metaCfg = readJsonFile(m_cfgDir + "/metadata.json");
+
+        std::string mode = lowerCopy(trimCopy(metaCfg.getString("mode", "listen")));
+        if (mode != "pull") mode = "listen";
+
+        int listenPort = metaCfg.getInt("listenPort", 9000 + (m_idx - 1) * 10);
+        std::string pullHost = trimCopy(metaCfg.getString("dataConnectHost", ""));
+        int pullPort = metaCfg.getInt("dataConnectPort", 0);
+
+        if (!metaRunning) {
+            closeListenSocket();
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            continue;
+        }
+
+        if (mode == "listen") {
+            if (listenSfd < 0 || listenPort != activeListenPort) {
+                closeListenSocket();
+                listenSfd = socket(AF_INET, SOCK_STREAM, 0);
+                if (listenSfd < 0) {
+                    log("metadata listen socket() failed");
+                    std::this_thread::sleep_for(std::chrono::milliseconds(700));
+                    continue;
+                }
+                int opt = 1;
+#ifdef _WIN32
+                setsockopt(listenSfd, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
+#else
+                setsockopt(listenSfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+#endif
+                sockaddr_in addr{};
+                addr.sin_family = AF_INET;
+                addr.sin_addr.s_addr = htonl(INADDR_ANY);
+                addr.sin_port = htons(static_cast<uint16_t>(listenPort));
+                if (bind(listenSfd, (sockaddr*)&addr, sizeof(addr)) < 0) {
+                    log("metadata bind() failed on port " + std::to_string(listenPort));
+                    closeListenSocket();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(700));
+                    continue;
+                }
+                listen(listenSfd, 8);
+                activeListenPort = listenPort;
+                log("Metadata listener running in LISTEN mode on port " + std::to_string(listenPort));
+            }
+
+            fd_set fds;
+            FD_ZERO(&fds);
+            FD_SET(listenSfd, &fds);
+            timeval tv{1, 0};
+            if (select(listenSfd + 1, &fds, nullptr, nullptr, &tv) <= 0) continue;
+
+            sockaddr_in cli{};
+            socklen_t len = sizeof(cli);
+            int cfd = accept(listenSfd, (sockaddr*)&cli, &len);
+            if (cfd < 0) continue;
+
+            char peerIp[INET_ADDRSTRLEN] = {0};
+            const char* ipTxt = inet_ntop(AF_INET, &cli.sin_addr, peerIp, sizeof(peerIp));
+            std::string peer = std::string(ipTxt ? ipTxt : "unknown") + ":" + std::to_string(ntohs(cli.sin_port));
+            log("Metadata client connected (listen mode): " + peer);
+            logSys("Metadata client connected (listen mode): " + peer);
+            processSocketUntilClose(cfd, peer);
+            continue;
+        }
+
+        closeListenSocket();
+
+        if (pullHost.empty() || pullPort <= 0 || pullPort > 65535) {
+            auto now = std::chrono::steady_clock::now();
+            if ((now - lastPullFailLogAt) > std::chrono::seconds(10)) {
+                log("Metadata pull mode not started: set dataConnectHost and valid dataConnectPort");
+                lastPullFailLogAt = now;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(700));
+            continue;
+        }
+
+        std::string err;
+        int cfd = openPullSocket(pullHost, pullPort, err);
+        if (cfd < 0) {
+            auto now = std::chrono::steady_clock::now();
+            if ((now - lastPullFailLogAt) > std::chrono::seconds(3)) {
+                log("Metadata pull connect failed to " + pullHost + ":" + std::to_string(pullPort) + " (" + err + ")");
+                logSys("Metadata pull connect failed to " + pullHost + ":" + std::to_string(pullPort) + " (" + err + ")");
+                lastPullFailLogAt = now;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(900));
+            continue;
+        }
+
+        log("Metadata pull connected to " + pullHost + ":" + std::to_string(pullPort));
+        logSys("Metadata pull connected to " + pullHost + ":" + std::to_string(pullPort));
+        processSocketUntilClose(cfd, pullHost + ":" + std::to_string(pullPort));
+        log("Metadata pull socket closed; reconnecting");
     }
-    close_socket(sfd);
+
+    closeListenSocket();
 }

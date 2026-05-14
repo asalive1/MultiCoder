@@ -606,19 +606,25 @@ function cmdVal(id) { const el = document.getElementById('cmd_' + id); return el
 async function renderMetaSection(cl, cr) {
     const cfg  = await loadEncoderConfig(selectedEncoder);
     const meta = cfg.metadata || {};
+    const mode = (meta.mode || 'listen').toLowerCase() === 'pull' ? 'pull' : 'listen';
     const lp   = meta.listenPort || (9000 + (selectedEncoder-1) * 10);
-  const dh   = meta.dataConnectHost || '';
-  const dp   = meta.dataConnectPort || '';
+    const dh   = meta.dataConnectHost || '';
+    const dp   = meta.dataConnectPort || '';
 
     cl.innerHTML = `
     <h2>Metadata</h2>
+
+    <div class="form-row">
+      <label>Metadata Input Mode:</label>
+      <div style="display:flex;gap:16px;align-items:center;">
+        <label style="font-weight:400;"><input type="radio" name="metaMode" value="listen" ${mode === 'listen' ? 'checked' : ''}/> Listen (automation pushes to encoder)</label>
+        <label style="font-weight:400;"><input type="radio" name="metaMode" value="pull" ${mode === 'pull' ? 'checked' : ''}/> Pull (encoder connects to automation)</label>
+      </div>
+    </div>
+
     <div class="form-row">
       <label>Input Listen Port:</label>
       <input type="number" id="metaListenPort" value="${lp}"/>
-    </div>
-    <div class="action-row">
-      <button class="btn btn-success" id="metaStartBtn">Start Listen</button>
-      <button class="btn btn-danger"  id="metaStopBtn">Stop Listen</button>
     </div>
 
     <div class="form-row" style="margin-top:12px">
@@ -629,40 +635,51 @@ async function renderMetaSection(cl, cr) {
       <label>Data Connect Port:</label>
       <input type="number" id="metaConnectPort" value="${dp}"/>
     </div>
+
     <div class="action-row">
-      <button class="btn btn-primary" id="metaConnectBtn">Connect</button>
+      <button class="btn btn-success" id="metaStartBtn">Start Metadata</button>
+      <button class="btn btn-danger"  id="metaStopBtn">Stop Metadata</button>
+      <button class="btn btn-primary" id="metaConnectBtn">Test Connect</button>
     </div>
     <div class="action-row" style="margin-top:12px">
       <button class="btn" id="metaSaveBtn">Save</button>
     </div>
     <div id="metaPayloadStatus" style="margin-top:10px;font-size:11px;color:var(--muted);"></div>`;
 
+    const selectedMode = () => {
+      const el = document.querySelector('input[name="metaMode"]:checked');
+      return el ? el.value : 'listen';
+    };
+
+    const buildMetaPayload = () => ({
+      mode: selectedMode(),
+      listenPort: parseInt(document.getElementById('metaListenPort').value) || null,
+      dataConnectHost: (document.getElementById('metaConnectHost').value || '').trim(),
+      dataConnectPort: parseInt(document.getElementById('metaConnectPort').value) || null,
+    });
+
     document.getElementById('metaStartBtn').addEventListener('click', async () => {
-      await apiPost(`/api/encoder/${selectedEncoder}/metadata/start`, {});
-      showBanner('Metadata listener started', 'ok');
+      const res = await apiPost(`/api/encoder/${selectedEncoder}/metadata/start`, buildMetaPayload());
+      if (res && res.ok) showBanner(`Metadata started in ${res.mode || selectedMode()} mode`, 'ok');
+      else showBanner('Metadata start failed', 'error');
     });
 
     document.getElementById('metaStopBtn').addEventListener('click', async () => {
-      await apiPost(`/api/encoder/${selectedEncoder}/metadata/stop`, {});
-      showBanner('Metadata listener stopped');
+      await apiPost(`/api/encoder/${selectedEncoder}/metadata/stop`, buildMetaPayload());
+      showBanner('Metadata stopped');
     });
 
     document.getElementById('metaConnectBtn').addEventListener('click', async () => {
       const host = (document.getElementById('metaConnectHost').value || '').trim();
       const port = parseInt(document.getElementById('metaConnectPort').value) || 0;
       const res = await apiPost(`/api/encoder/${selectedEncoder}/metadata/connect`, { host, port });
-      if (res && res.ok) showBanner(`Metadata connect ${res.status || 'ok'}`, 'ok');
-      else showBanner('Metadata connect failed', 'error');
+      if (res && res.ok) showBanner(`Metadata test connect ${res.status || 'ok'}`, 'ok');
+      else showBanner('Metadata test connect failed', 'error');
     });
 
     document.getElementById('metaSaveBtn').addEventListener('click', async () => {
         try {
-            const data = {
-                listenPort: parseInt(document.getElementById('metaListenPort').value),
-                dataConnectHost: (document.getElementById('metaConnectHost').value || '').trim(),
-                dataConnectPort: parseInt(document.getElementById('metaConnectPort').value) || null,
-            };
-            await apiPost(`/api/encoder/${selectedEncoder}/config/metadata`, JSON.stringify(data));
+            await apiPost(`/api/encoder/${selectedEncoder}/config/metadata`, JSON.stringify(buildMetaPayload()));
             showBanner('Metadata config saved', 'ok');
         } catch (e) {
             showBanner('Metadata config save failed: ' + e.message, 'error');
@@ -745,7 +762,11 @@ async function refreshMetadataPayloadStatus() {
     const last = s.lastPayloadUtc ? s.lastPayloadUtc : 'never';
     const count = Number.isFinite(s.eventCount) ? s.eventCount : 0;
     const listener = s.listenerRunning ? 'running' : 'stopped';
-    el.innerHTML = `<strong>Metadata listener:</strong> ${listener}<br><strong>Metadata events received:</strong> ${count}<br><strong>Last metadata payload received at:</strong> ${escapeHtml(last)}`;
+    const mode = (s.mode || 'listen').toLowerCase();
+    const endpoint = mode === 'pull'
+      ? `${s.dataConnectHost || '(unset)'}:${s.dataConnectPort || '(unset)'}`
+      : `${s.listenPort || '(unset)'}`;
+    el.innerHTML = `<strong>Metadata state:</strong> ${listener}<br><strong>Metadata mode:</strong> ${escapeHtml(mode)}<br><strong>Mode endpoint:</strong> ${escapeHtml(endpoint)}<br><strong>Metadata events received:</strong> ${count}<br><strong>Last metadata payload received at:</strong> ${escapeHtml(last)}`;
   } catch {
     el.textContent = 'Metadata payload status unavailable';
   }
