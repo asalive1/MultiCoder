@@ -1,5 +1,5 @@
 {
-    "controlPort": 9010,
+    "controlPort": 9100,
     "controlEnabled": true,
     "commands": {
         "startAAC": "StartAAC",

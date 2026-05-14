@@ -325,7 +325,7 @@ static simplejson::Object readJsonFile(const std::string& path) {
 }
 
 static int controlPortForEncoder(int encoderOneBased) {
-    int defPort = 9010 + (encoderOneBased - 1) * 10;
+    int defPort = 9100 + (encoderOneBased - 1) * 10;
     simplejson::Object ctl = readJsonFile("/etc/encoder" + std::to_string(encoderOneBased) + "/control.json");
     return ctl.getInt("controlPort", defPort);
 }

@@ -2964,8 +2964,8 @@ void Worker::serveHlsHttp(int port, const std::string& hlsDir) {
 
 void Worker::listenControlPort() {
     // Read control port from /etc/encoder{N}/control.json
-    // Default: 9010 + (encoderIdx - 1) * 10
-    int ctlPort = 9010 + (m_idx - 1) * 10;
+    // Default: 9100 + (encoderIdx - 1) * 10
+    int ctlPort = 9100 + (m_idx - 1) * 10;
     // Try to read from config file
     {
         std::ifstream cf(m_cfgDir + "/control.json");

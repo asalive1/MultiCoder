@@ -83,7 +83,7 @@ EOF
     if [ ! -f "/etc/encoder${i}/control.json" ]; then
         cat > "/etc/encoder${i}/control.json" <<EOF
 {
-    "controlPort": $((9010 + (i - 1) * 10)),
+    "controlPort": $((9100 + (i - 1) * 10)),
     "controlEnabled": true,
     "commands": {
         "startAAC": "StartAAC", "stopAAC": "StopAAC",
