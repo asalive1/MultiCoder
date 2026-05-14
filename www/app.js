@@ -622,16 +622,16 @@ async function renderMetaSection(cl, cr) {
       </div>
     </div>
 
-    <div class="form-row">
+    <div class="form-row" id="metaListenRow">
       <label>Input Listen Port:</label>
       <input type="number" id="metaListenPort" value="${lp}"/>
     </div>
 
-    <div class="form-row" style="margin-top:12px">
+    <div class="form-row" id="metaPullHostRow" style="margin-top:12px">
       <label>Data Connect Host/IP:</label>
       <input type="text" id="metaConnectHost" value="${dh}" placeholder="automation.example.local or 10.0.0.25"/>
     </div>
-    <div class="form-row">
+    <div class="form-row" id="metaPullPortRow">
       <label>Data Connect Port:</label>
       <input type="number" id="metaConnectPort" value="${dp}"/>
     </div>
@@ -657,6 +657,35 @@ async function renderMetaSection(cl, cr) {
       dataConnectHost: (document.getElementById('metaConnectHost').value || '').trim(),
       dataConnectPort: parseInt(document.getElementById('metaConnectPort').value) || null,
     });
+
+    const applyMetaModeUi = () => {
+      const modeValue = selectedMode();
+      const listenEnabled = modeValue === 'listen';
+      const pullEnabled = modeValue === 'pull';
+
+      const listenRow = document.getElementById('metaListenRow');
+      const pullHostRow = document.getElementById('metaPullHostRow');
+      const pullPortRow = document.getElementById('metaPullPortRow');
+      const listenInput = document.getElementById('metaListenPort');
+      const pullHostInput = document.getElementById('metaConnectHost');
+      const pullPortInput = document.getElementById('metaConnectPort');
+      const connectBtn = document.getElementById('metaConnectBtn');
+
+      if (listenInput) listenInput.disabled = !listenEnabled;
+      if (pullHostInput) pullHostInput.disabled = !pullEnabled;
+      if (pullPortInput) pullPortInput.disabled = !pullEnabled;
+      if (connectBtn) connectBtn.disabled = !pullEnabled;
+
+      if (listenRow) listenRow.style.opacity = listenEnabled ? '1' : '0.45';
+      if (pullHostRow) pullHostRow.style.opacity = pullEnabled ? '1' : '0.45';
+      if (pullPortRow) pullPortRow.style.opacity = pullEnabled ? '1' : '0.45';
+    };
+
+    document.querySelectorAll('input[name="metaMode"]').forEach((el) => {
+      el.addEventListener('change', applyMetaModeUi);
+    });
+
+    applyMetaModeUi();
 
     document.getElementById('metaStartBtn').addEventListener('click', async () => {
       const res = await apiPost(`/api/encoder/${selectedEncoder}/metadata/start`, buildMetaPayload());
