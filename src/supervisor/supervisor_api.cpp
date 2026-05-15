@@ -1309,6 +1309,15 @@ static std::string handleReq(const std::string& raw) {
                 std::string audioDevice = req.getString("audioDevice", cfg.getString("audioDevice", ""));
                 int sampleRate = req.getInt("sampleRate", cfg.getInt("sampleRate", 48000));
                 double gainDb = req.getDouble("rtpGain", cfg.getDouble("rtpGain", 0.0));
+                std::string srtMode = req.getString("srtMode", cfg.getString("srtMode", "caller"));
+                if (srtMode != "listener") srtMode = "caller";
+                std::string srtHost = req.getString("srtHost", cfg.getString("srtHost", "127.0.0.1"));
+                int srtPort = req.getInt("srtPort", cfg.getInt("srtPort", 9250));
+                int srtLatency = req.getInt("srtLatency", cfg.getInt("srtLatency", 120));
+                std::string srtStreamId = req.getString("srtStreamId", cfg.getString("srtStreamId", ""));
+                int srtPbkeylen = req.getInt("srtPbkeylen", cfg.getInt("srtPbkeylen", 0));
+                if (!(srtPbkeylen == 0 || srtPbkeylen == 16 || srtPbkeylen == 24 || srtPbkeylen == 32)) srtPbkeylen = 0;
+                std::string srtPass = req.getString("srtPass", cfg.getString("srtPass", ""));
 
                 // Validate parameters
                 std::string validationError;
@@ -1320,6 +1329,12 @@ static std::string handleReq(const std::string& raw) {
                     }
                 } else if (inputType != "audio" && inputType != "srt") {
                     validationError = "Unknown input type: " + inputType;
+                } else if (inputType == "srt") {
+                    if (srtPort <= 0 || srtPort > 65535) {
+                        validationError = "SRT input: port must be 1-65535, got " + std::to_string(srtPort);
+                    } else if (srtMode == "caller" && srtHost.empty()) {
+                        validationError = "SRT input: host is required in caller mode";
+                    }
                 }
 
                 if (!validationError.empty()) {
@@ -1336,6 +1351,13 @@ static std::string handleReq(const std::string& raw) {
                 rt.setString("sessionAudioDevice", audioDevice);
                 rt.setInt("sessionSampleRate", sampleRate);
                 rt.setRaw("sessionGainDb", std::to_string(gainDb));
+                rt.setString("sessionSrtMode", srtMode);
+                rt.setString("sessionSrtHost", srtHost);
+                rt.setInt("sessionSrtPort", srtPort);
+                rt.setInt("sessionSrtLatency", srtLatency);
+                rt.setString("sessionSrtStreamId", srtStreamId);
+                rt.setInt("sessionSrtPbkeylen", srtPbkeylen);
+                rt.setString("sessionSrtPass", srtPass);
 
                 appendEncoderLog(idx + 1, "Input connect confirmed: type=" + inputType + 
                                  (inputType != "audio" ? " addr=" + rtpAddress + ":" + std::to_string(rtpPort) +

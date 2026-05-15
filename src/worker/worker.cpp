@@ -1822,14 +1822,15 @@ void Worker::startSRTInputRelay() {
     }
 
     auto inp  = readJsonFile(m_cfgDir + "/input.json");
-    std::string mode     = lowerCopy(trimCopy(inp.getString("srtMode", "caller")));
+    auto rt   = readRuntimeState(m_cfgDir);
+    std::string mode     = lowerCopy(trimCopy(rt.getString("sessionSrtMode", inp.getString("srtMode", "caller"))));
     if (mode != "listener") mode = "caller";
-    int         srtPort  = inp.getInt("srtPort", 9250);
-    std::string srtHost  = inp.getString("srtHost", "127.0.0.1");
-    int         latency  = inp.getInt("srtLatency", 120);
-    std::string streamId = inp.getString("srtStreamId", "");
-    int         pbkeylen = clampInt(inp.getInt("srtPbkeylen", 0), 0, 32);
-    std::string pass     = inp.getString("srtPass", "");
+    int         srtPort  = rt.getInt("sessionSrtPort", inp.getInt("srtPort", 9250));
+    std::string srtHost  = rt.getString("sessionSrtHost", inp.getString("srtHost", "127.0.0.1"));
+    int         latency  = rt.getInt("sessionSrtLatency", inp.getInt("srtLatency", 120));
+    std::string streamId = rt.getString("sessionSrtStreamId", inp.getString("srtStreamId", ""));
+    int         pbkeylen = clampInt(rt.getInt("sessionSrtPbkeylen", inp.getInt("srtPbkeylen", 0)), 0, 32);
+    std::string pass     = rt.getString("sessionSrtPass", inp.getString("srtPass", ""));
 
     // For listener mode, bind on all interfaces; for caller, connect outbound.
     std::string inputAddr = (mode == "listener") ? "0.0.0.0" : srtHost;
@@ -2018,14 +2019,14 @@ std::vector<std::string> Worker::buildFfmpegInputArgs() {
         } else {
             // No relay â€” direct SRT connection (caller mode only, since listener
             // mode would conflict with any other consumer on the same port).
-            std::string host     = inp.getString("srtHost", "127.0.0.1");
-            int         port     = inp.getInt("srtPort", 9250);
-            int         latency  = inp.getInt("srtLatency", 120);
-            std::string mode     = lowerCopy(trimCopy(inp.getString("srtMode", "caller")));
+            std::string host     = rt.getString("sessionSrtHost", inp.getString("srtHost", "127.0.0.1"));
+            int         port     = rt.getInt("sessionSrtPort", inp.getInt("srtPort", 9250));
+            int         latency  = rt.getInt("sessionSrtLatency", inp.getInt("srtLatency", 120));
+            std::string mode     = lowerCopy(trimCopy(rt.getString("sessionSrtMode", inp.getString("srtMode", "caller"))));
             if (mode != "listener") mode = "caller";
-            std::string streamId = inp.getString("srtStreamId", "");
-            int         pbkeylen = clampInt(inp.getInt("srtPbkeylen", 0), 0, 32);
-            std::string pass     = inp.getString("srtPass", "");
+            std::string streamId = rt.getString("sessionSrtStreamId", inp.getString("srtStreamId", ""));
+            int         pbkeylen = clampInt(rt.getInt("sessionSrtPbkeylen", inp.getInt("srtPbkeylen", 0)), 0, 32);
+            std::string pass     = rt.getString("sessionSrtPass", inp.getString("srtPass", ""));
             std::string inputAddr = (mode == "listener") ? "0.0.0.0" : host;
             std::string uri = "srt://" + inputAddr + ":" + std::to_string(port) + "?mode=" + mode;
             if (latency > 0)       uri += "&latency="   + std::to_string(latency);
@@ -2538,6 +2539,7 @@ static std::string resolveWinPath(const std::string& unixPath) {
 }
 
 void Worker::startHLS() {
+    std::lock_guard<std::recursive_mutex> lk(m_streamMutex);
     if (m_hlsRunning.load() || m_hlsProc != nullptr) {
         log("HLS already running; StartHLS ignored");
         return;
@@ -2721,6 +2723,7 @@ void Worker::stopHLS() {
 }
 
 void Worker::startSRT() {
+    std::lock_guard<std::recursive_mutex> lk(m_streamMutex);
     if (m_srtRunning.load() || m_srtProc != nullptr) {
         log("SRT already running; StartSRT ignored");
         return;

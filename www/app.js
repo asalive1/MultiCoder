@@ -426,6 +426,13 @@ function renderInputTypeFields(type, inp) {
     } else if (type === 'srt') {
         container.innerHTML = `
         <div class="form-row">
+          <label>SRT Mode:</label>
+          <select id="srtInMode">
+            <option value="caller"   ${inp.srtMode==='caller'?'selected':''}>Caller (connect to remote listener)</option>
+            <option value="listener" ${inp.srtMode==='listener'?'selected':''}>Listener (wait for incoming sender)</option>
+          </select>
+        </div>
+        <div class="form-row">
           <label>SRT Transport:</label>
           <select id="srtInTransport">
             <option value="mpeg-ts" ${inp.srtTransport==='mpeg-ts'?'selected':''}>MPEG-TS</option>
@@ -449,13 +456,43 @@ function renderInputTypeFields(type, inp) {
           <input type="password" id="srtInPass" value="${inp.srtPass||''}"/>
         </div>
         <div class="form-row">
+          <label>Stream ID:</label>
+          <input type="text" id="srtInStreamId" value="${inp.srtStreamId||''}"/>
+        </div>
+        <div class="form-row">
+          <label>PB Key Length:</label>
+          <select id="srtInPbkeylen">
+            <option value="0"  ${String(inp.srtPbkeylen||0)==='0'?'selected':''}>0 (None)</option>
+            <option value="16" ${String(inp.srtPbkeylen||0)==='16'?'selected':''}>16</option>
+            <option value="24" ${String(inp.srtPbkeylen||0)==='24'?'selected':''}>24</option>
+            <option value="32" ${String(inp.srtPbkeylen||0)==='32'?'selected':''}>32</option>
+          </select>
+        </div>
+        <div class="form-row">
           <label>Network Interface:</label>
           <select id="srtInIface">${interfaceOptions(inp.rtpInterface||'')}</select>
         </div>
+        <p id="srtInModeHint" style="font-size:10px;margin-top:4px;color:var(--muted)"></p>
         <p style="font-size:10px;margin-top:4px;color:var(--muted)">
           SRT over RTP encapsulates audio as RTP inside an SRT stream (useful for low-latency studio links).
           Raw MPEG-TS wraps audio/video as an MPEG transport stream.
         </p>`;
+
+        const modeEl = document.getElementById('srtInMode');
+        const hostEl = document.getElementById('srtInHost');
+        const hintEl = document.getElementById('srtInModeHint');
+        const applySrtModeUi = () => {
+          const mode = (modeEl && modeEl.value === 'listener') ? 'listener' : 'caller';
+          if (mode === 'listener') {
+            if (hostEl) hostEl.disabled = true;
+            if (hintEl) hintEl.textContent = 'Listener mode binds local port and waits for incoming SRT sender. Host is ignored.';
+          } else {
+            if (hostEl) hostEl.disabled = false;
+            if (hintEl) hintEl.textContent = 'Caller mode connects outbound to Host:Port.';
+          }
+        };
+        if (modeEl) modeEl.addEventListener('change', applySrtModeUi);
+        applySrtModeUi();
     }
 }
 
@@ -474,8 +511,18 @@ function gatherInputConfig(type) {
     if (type === 'rtp')
         return { ...base, rtpAddress: v('rtpAddress'), rtpPort: parseInt(v('rtpPort')), rtpInterface: v('rtpInterface') };
     if (type === 'srt')
-        return { ...base, srtTransport: v('srtInTransport'), srtHost: v('srtInHost'), srtPort: parseInt(v('srtInPort')),
-                 srtLatency: parseInt(v('srtInLatency')), srtPass: v('srtInPass'), rtpInterface: v('srtInIface') };
+      return {
+        ...base,
+        srtMode: v('srtInMode') || 'caller',
+        srtTransport: v('srtInTransport'),
+        srtHost: v('srtInHost'),
+        srtPort: parseInt(v('srtInPort')),
+        srtLatency: parseInt(v('srtInLatency')),
+        srtPass: v('srtInPass'),
+        srtStreamId: v('srtInStreamId'),
+        srtPbkeylen: parseInt(v('srtInPbkeylen')) || 0,
+        rtpInterface: v('srtInIface')
+      };
     if (type === 'audio')
       return { ...base, audioDevice: v('audioDevice') };
     return base;
