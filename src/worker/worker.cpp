@@ -1694,6 +1694,30 @@ static std::string resolveAdapterGuidToIp(const std::string& guidStr) {
 }
 #endif
 
+double Worker::getInputGainDb() {
+    auto inp = readJsonFile(m_cfgDir + "/input.json");
+    auto rt  = readRuntimeState(m_cfgDir);
+    // Session override (sessionGainDb in runtime_state) takes precedence over input.json rtpGain
+    return rt.getDouble("sessionGainDb", inp.getDouble("rtpGain", 0.0));
+}
+
+std::string Worker::buildAudioFilterWithGain(double gainDb) {
+    // If gain is 0, no filter needed (unity gain)
+    if (std::abs(gainDb) < 0.001) {
+        return "";
+    }
+    // FFmpeg volume filter: volume=<linear_factor>
+    // Convert dB to linear: linear = 10^(dB/20)
+    // Clamp gain to reasonable range: -24 dB to +24 dB (factors: 0.063 to 15.85)
+    gainDb = gainDb < -24.0 ? -24.0 : (gainDb > 24.0 ? 24.0 : gainDb);
+    double linearFactor = std::pow(10.0, gainDb / 20.0);
+    
+    // Format as FFmpeg volume filter
+    char buf[64] = {};
+    snprintf(buf, sizeof(buf), "volume=%.4f", linearFactor);
+    return std::string(buf);
+}
+
 std::vector<std::string> Worker::buildFfmpegInputArgs() {
     auto inp = readJsonFile(m_cfgDir + "/input.json");
     // Session params in runtime_state.json (written by supervisor's input/connect API)
@@ -1809,9 +1833,16 @@ std::vector<std::string> Worker::buildFfmpegInputArgs() {
         std::string host = inp.getString("srtHost", "127.0.0.1");
         int         port = inp.getInt("srtPort", 9250);
         int         latency = inp.getInt("srtLatency", 120);
+        std::string mode = lowerCopy(trimCopy(inp.getString("srtMode", "caller")));
+        if (mode != "listener") mode = "caller";
+        std::string streamId = inp.getString("srtStreamId", "");
+        int         pbkeylen = clampInt(inp.getInt("srtPbkeylen", 0), 0, 32);
         std::string pass = inp.getString("srtPass", "");
-        std::string uri = "srt://" + host + ":" + std::to_string(port) + "?mode=caller";
+        
+        std::string uri = "srt://" + host + ":" + std::to_string(port) + "?mode=" + mode;
         if (latency > 0) uri += "&latency=" + std::to_string(latency);
+        if (!streamId.empty()) uri += "&streamid=" + streamId;
+        if (pbkeylen > 0) uri += "&pbkeylen=" + std::to_string(pbkeylen);
         if (!pass.empty()) uri += "&passphrase=" + pass;
         args = {"-re", "-i", uri};
     } else {
@@ -2150,8 +2181,18 @@ void Worker::startAAC() {
                       + host + ":" + std::to_string(port) + "/" + mount;
 
     auto inputArgs = buildFfmpegInputArgs();
+    double gainDb = getInputGainDb();
+    std::string audioFilter = buildAudioFilterWithGain(gainDb);
+    
     std::vector<std::string> args = {"ffmpeg", "-y"};
     args.insert(args.end(), inputArgs.begin(), inputArgs.end());
+    
+    // Apply audio filter (gain/volume) if needed
+    if (!audioFilter.empty()) {
+        args.push_back("-af");
+        args.push_back(audioFilter);
+    }
+    
     args.insert(args.end(), {
         "-vn", "-c:a", "aac", "-b:a", std::to_string(bitrateKbps) + "k"
     });
@@ -2175,6 +2216,9 @@ void Worker::startAAC() {
     std::ostringstream aacSettings;
     aacSettings << "AAC settings: mode=" << mode
                 << " bitrate=" << bitrateKbps << "k";
+    if (!audioFilter.empty()) {
+        aacSettings << " gain=" << gainDb << "dB";
+    }
     if (mode == "advanced") {
         aacSettings << " sampleRate=" << (sampleRate > 0 ? std::to_string(sampleRate) : std::string("auto"))
                     << " profile=" << profile;
@@ -2227,8 +2271,18 @@ void Worker::startMP3() {
                       + host + ":" + std::to_string(port) + "/" + mount;
 
     auto inputArgs = buildFfmpegInputArgs();
+    double gainDb = getInputGainDb();
+    std::string audioFilter = buildAudioFilterWithGain(gainDb);
+    
     std::vector<std::string> args = {"ffmpeg", "-y"};
     args.insert(args.end(), inputArgs.begin(), inputArgs.end());
+    
+    // Apply audio filter (gain/volume) if needed
+    if (!audioFilter.empty()) {
+        args.push_back("-af");
+        args.push_back(audioFilter);
+    }
+    
     args.insert(args.end(), {
         "-vn", "-c:a", "libmp3lame", "-b:a", std::to_string(bitrateKbps) + "k"
     });
@@ -2251,6 +2305,9 @@ void Worker::startMP3() {
     std::ostringstream mp3Settings;
     mp3Settings << "MP3 settings: mode=" << mode
                 << " bitrate=" << bitrateKbps << "k";
+    if (!audioFilter.empty()) {
+        mp3Settings << " gain=" << gainDb << "dB";
+    }
     if (mode != "legacy") {
         mp3Settings << " sampleRate=" << (sampleRate > 0 ? std::to_string(sampleRate) : std::string("auto"));
     }
@@ -2358,6 +2415,9 @@ void Worker::startHLS() {
     int window   = cfg.getInt("window", 5);
 
     auto inputArgs = buildFfmpegInputArgs();
+    double gainDb = getInputGainDb();
+    std::string audioFilter = buildAudioFilterWithGain(gainDb);
+    
     // Use backslash separator on Windows so FFmpeg resolves the output paths
     // without needing Unix path emulation.
     char sep =
@@ -2372,6 +2432,13 @@ void Worker::startHLS() {
 
     std::vector<std::string> args = {"ffmpeg", "-y"};
     args.insert(args.end(), inputArgs.begin(), inputArgs.end());
+    
+    // Apply audio filter (gain/volume) if needed
+    if (!audioFilter.empty()) {
+        args.push_back("-af");
+        args.push_back(audioFilter);
+    }
+    
     args.insert(args.end(), {
         "-vn", "-c:a", "aac", "-b:a", "128k", "-ac", "2",
         "-f", "segment",
@@ -2494,6 +2561,9 @@ void Worker::startSRT() {
     }
 
     auto inputArgs = buildFfmpegInputArgs();
+    double gainDb = getInputGainDb();
+    std::string audioFilter = buildAudioFilterWithGain(gainDb);
+    
     std::string uri = "srt://" + host + ":" + std::to_string(port) + "?mode=" + mode;
     if (latency > 0) uri += "&latency=" + std::to_string(latency);
     if (buffer > 0) uri += "&sndbuf=" + std::to_string(buffer * 1024);
@@ -2518,6 +2588,13 @@ void Worker::startSRT() {
 
     std::vector<std::string> args = {"ffmpeg", "-y", "-loglevel", "debug"};
     args.insert(args.end(), inputArgs.begin(), inputArgs.end());
+    
+    // Apply audio filter (gain/volume) if needed
+    if (!audioFilter.empty()) {
+        args.push_back("-af");
+        args.push_back(audioFilter);
+    }
+    
     args.insert(args.end(), {
         "-vn", "-c:a", "aac", "-b:a", "128k", "-ac", "2",
         "-f", "mpegts",

@@ -9,5 +9,17 @@
     "sampleRate": 48000,
     "bitDepth": 24,
     "deviceIndex": 0,
-    "_comment": "inputType: axia | rtp | audio | srt. bitDepth: 24 for Axia LiveWire/AES67 (L24), 16 for legacy L16 RTP"
+    "srtHost": "127.0.0.1",
+    "srtPort": 9250,
+    "srtMode": "caller",
+    "srtLatency": 120,
+    "srtStreamId": "",
+    "srtPbkeylen": 0,
+    "srtPass": "",
+    "_comment_inputType": "axia | rtp | audio | srt. bitDepth: 24 for Axia LiveWire/AES67 (L24), 16 for legacy L16 RTP",
+    "_comment_rtpGain": "Input gain in dB applied to all encoder streams. Range: -24 to +24 dB. 0 = no gain adjustment (unity). Applied as FFmpeg volume filter to encoder FFmpeg processes. Also affects VU meter display.",
+    "_comment_srtMode": "caller: SRT input connects OUT to a listening SRT server. listener: SRT input binds and waits for incoming connections from SRT senders (e.g., another encoder's SRT output).",
+    "_comment_srtStreamId": "Optional SRT stream ID for identification and filtering. Leave empty if not needed.",
+    "_comment_srtPbkeylen": "SRT encryption key length: 0 (no encryption), 16, 24, or 32 bytes. Requires matching value on SRT peer.",
+    "_comment_srtLatency": "SRT latency in milliseconds. Typical range: 20-500 ms. Higher values provide more jitter buffer."
 }

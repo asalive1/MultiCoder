@@ -41,6 +41,11 @@ private:
     void listenMetaPort();
     void monitorInputLevels();
 
+    // Helper: retrieve input gain in dB (combines input.json rtpGain + session override)
+    double getInputGainDb();
+    // Helper: build FFmpeg audio filter string for gain (empty if gain == 0)
+    std::string buildAudioFilterWithGain(double gainDb);
+
     int m_idx;
     std::string m_cfgDir;
     std::string m_logPath;
