@@ -46,6 +46,20 @@ private:
     // Helper: build FFmpeg audio filter string for gain (empty if gain == 0)
     std::string buildAudioFilterWithGain(double gainDb);
 
+    // Real-time gain: polls sessionGainDb and restarts active streams when gain settles
+    void monitorGainChanges();
+    std::thread m_gainMonitorThread;
+    // Mutex serialising concurrent stream start/stop from control and gain monitor threads
+    std::recursive_mutex m_streamMutex;
+
+    // SRT input relay: FFmpeg process that receives an SRT source and re-muxes to
+    // raw PCM s16le UDP multicast (239.255.127.1:RELAYPORT) so all encoders and the
+    // VU meter share one connection.  Started by StartSRTInput control command.
+    void startSRTInputRelay();
+    void stopSRTInputRelay();
+    void* m_srtInputRelayProc{nullptr};
+    std::atomic<bool> m_srtInputRelayRunning{false};
+
     int m_idx;
     std::string m_cfgDir;
     std::string m_logPath;

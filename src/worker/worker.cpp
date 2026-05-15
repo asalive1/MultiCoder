@@ -1,4 +1,4 @@
-// worker.cpp — MultiCoder Worker Implementation
+﻿// worker.cpp â€” MultiCoder Worker Implementation
 // Handles logging, control port listener, metadata listener, and stream lifecycle.
 // Real encoding is deferred to the encoding pipeline modules (AAC, MP3, HLS, SRT).
 
@@ -265,6 +265,27 @@ static bool parseRtpStereoLevels(const char* data, size_t len, int& leftDb, int&
     else leftDb = clampDb(static_cast<int>(std::lround(20.0 * std::log10(lrms))));
     if (rrms <= 1e-9) rightDb = -60;
     else rightDb = clampDb(static_cast<int>(std::lround(20.0 * std::log10(rrms))));
+    return true;
+}
+
+// Parse raw PCM s16le interleaved stereo (from SRT relay UDP) and return dB levels.
+// Used by monitorInputLevels when inputType=srt and relay is active.
+static bool parsePcmS16leStereoLevels(const char* buf, size_t n, int& leftDb, int& rightDb) {
+    if (!buf || n < 4) return false;
+    const int16_t* samples = reinterpret_cast<const int16_t*>(buf);
+    size_t frameCount = n / 4; // 2 channels * 2 bytes per sample
+    if (frameCount < 1) return false;
+    double lsum = 0.0, rsum = 0.0;
+    for (size_t i = 0; i < frameCount; ++i) {
+        double ls = samples[i * 2]     / 32768.0;
+        double rs = samples[i * 2 + 1] / 32768.0;
+        lsum += ls * ls;
+        rsum += rs * rs;
+    }
+    double lrms = std::sqrt(lsum / static_cast<double>(frameCount));
+    double rrms = std::sqrt(rsum / static_cast<double>(frameCount));
+    leftDb  = lrms <= 1e-9 ? -60 : clampDb(static_cast<int>(std::lround(20.0 * std::log10(lrms))));
+    rightDb = rrms <= 1e-9 ? -60 : clampDb(static_cast<int>(std::lround(20.0 * std::log10(rrms))));
     return true;
 }
 
@@ -543,7 +564,7 @@ static std::string applyMetaTemplate(const std::string& tmpl, const std::string&
             out.replace(open, close - open + 1, val);
             pos = open + val.size();
         } else {
-            pos = close + 1;  // unknown/empty — leave literal
+            pos = close + 1;  // unknown/empty â€” leave literal
         }
     }
     return out;
@@ -610,8 +631,8 @@ static std::string hlsMetadataByParser(const std::string& xml, const simplejson:
 
     if (method == "ext") {
         // Produce Orban 5950HD-compatible EXT JSON matching the original encoder format.
-        // Field mapping: media_type→"type", trivia→"album", cart→"id"
-        // duration converted from milliseconds string → float seconds.
+        // Field mapping: media_typeâ†’"type", triviaâ†’"album", cartâ†’"id"
+        // duration converted from milliseconds string â†’ float seconds.
         // "start" estimated as current epoch (chained by duration for upcoming items).
         // "image" always present as "" for Orban compatibility.
         auto durSecsFromBlock = [](const std::string& block) -> double {
@@ -726,8 +747,8 @@ static std::string hlsMetadataByParser(const std::string& xml, const simplejson:
 }
 
 // Send an out-of-band ICY metadata title update to an Icecast server's admin API.
-// This is a fire-and-forget function — the caller should run it in a detached thread.
-// URL format: http://host[:port]/mountpoint  (or icecast:// — scheme is stripped).
+// This is a fire-and-forget function â€” the caller should run it in a detached thread.
+// URL format: http://host[:port]/mountpoint  (or icecast:// â€” scheme is stripped).
 static void sendIcecastMetaUpdate(const std::string& streamUrl,
                                   const std::string& user,
                                   const std::string& pass,
@@ -1176,7 +1197,7 @@ static bool openWasapiInput(WasapiInputMeter& m, const std::string& deviceToken,
         preferredName = getWaveDeviceName(devId);
     }
     if (preferredName.empty() && !deviceToken.empty()) {
-        // Token is a name string (not a numeric waveIn index) — use it directly for WASAPI matching
+        // Token is a name string (not a numeric waveIn index) â€” use it directly for WASAPI matching
         preferredName = deviceToken;
     }
 
@@ -1541,6 +1562,7 @@ Worker::~Worker() {
     killFfmpegProc(m_aacProc);
     killFfmpegProc(m_mp3Proc);
     killFfmpegProc(m_hlsProc);
+    killFfmpegProc(m_srtInputRelayProc);
     // Stop HLS HTTP server before joining threads
     if (m_hlsHttpRunning.load()) {
         m_hlsHttpRunning = false;
@@ -1553,6 +1575,7 @@ Worker::~Worker() {
     if (m_controlThread.joinable()) m_controlThread.join();
     if (m_metaThread.joinable())    m_metaThread.join();
     if (m_inputLevelThread.joinable()) m_inputLevelThread.join();
+    if (m_gainMonitorThread.joinable()) m_gainMonitorThread.join();
 }
 
 void Worker::logSys(const std::string& msg) {
@@ -1591,6 +1614,7 @@ void Worker::run() {
     m_controlThread = std::thread([this]() { listenControlPort(); });
     m_metaThread    = std::thread([this]() { listenMetaPort();    });
     m_inputLevelThread = std::thread([this]() { monitorInputLevels(); });
+    m_gainMonitorThread = std::thread([this]() { monitorGainChanges(); });
 
     log("Worker running. Waiting for start commands.");
     publishStreamHealth();
@@ -1603,7 +1627,7 @@ void Worker::run() {
             pollSinkProcesses();
         }
         if (!m_running || g_workerShutdown) break;
-        log("Heartbeat — AAC:" + std::string(m_aacRunning ? "LIVE" : "stopped")
+        log("Heartbeat â€” AAC:" + std::string(m_aacRunning ? "LIVE" : "stopped")
             + " MP3:" + std::string(m_mp3Running ? "LIVE" : "stopped")
             + " HLS:" + std::string(m_hlsRunning ? "LIVE" : "stopped")
             + " SRT:" + std::string(m_srtRunning ? "LIVE" : "stopped"));
@@ -1657,6 +1681,20 @@ void Worker::pollSinkProcesses() {
         m_srtRunning = false;
         log("SRT process exited; marking stream stopped");
         logSys("SRT process exited; marking stream stopped");
+        changed = true;
+    }
+
+    if (m_srtInputRelayRunning.load() && !ffmpegProcAlive(m_srtInputRelayProc)) {
+        m_srtInputRelayProc = nullptr;
+        m_srtInputRelayRunning = false;
+        // Clear relay state so encoders and VU meter don't keep trying to read a dead relay
+        std::lock_guard<std::mutex> lk(m_rtMutex);
+        simplejson::Object rt = readRuntimeState(m_cfgDir);
+        rt.setBool("srtRelayActive", false);
+        rt.setInt ("srtRelayPort",   0);
+        writeRuntimeState(m_cfgDir, rt);
+        log("SRT input relay process exited; relay stopped");
+        logSys("SRT input relay process exited; relay stopped");
         changed = true;
     }
 
@@ -1716,6 +1754,139 @@ std::string Worker::buildAudioFilterWithGain(double gainDb) {
     char buf[64] = {};
     snprintf(buf, sizeof(buf), "volume=%.4f", linearFactor);
     return std::string(buf);
+}
+
+// ---------------------------------------------------------------------------
+// Real-time gain monitor
+// Polls sessionGainDb every 150 ms. After the value has been stable for
+// 600 ms (debounce â€” avoids restarting on every slider tick), restarts any
+// active streams so they pick up the new volume filter value.
+// ---------------------------------------------------------------------------
+void Worker::monitorGainChanges() {
+    double lastApplied = getInputGainDb();
+    double lastSeen    = lastApplied;
+    auto lastChangeAt  = std::chrono::steady_clock::now();
+    const double kTol        = 0.05; // dB â€” ignore sub-0.05 dB jitter
+    const auto   kDebounce   = std::chrono::milliseconds(600);
+
+    while (m_running && !g_workerShutdown) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+        bool anyRunning = m_aacRunning || m_mp3Running || m_hlsRunning || m_srtRunning;
+        if (!anyRunning) {
+            // No streams active â€” keep lastApplied in sync so the first
+            // stream start doesn't trigger a spurious restart.
+            lastApplied  = getInputGainDb();
+            lastSeen     = lastApplied;
+            lastChangeAt = std::chrono::steady_clock::now();
+            continue;
+        }
+
+        double current = getInputGainDb();
+        if (std::abs(current - lastSeen) > kTol) {
+            lastSeen     = current;
+            lastChangeAt = std::chrono::steady_clock::now();
+        }
+
+        auto now = std::chrono::steady_clock::now();
+        if ((now - lastChangeAt) < kDebounce) continue; // still settling
+        if (std::abs(current - lastApplied) < kTol)    continue; // no net change
+
+        log("Gain changed " + std::to_string(lastApplied) + " -> " +
+            std::to_string(current) + " dB â€” restarting active streams");
+        lastApplied = current;
+
+        // Restart each active stream under the stream mutex so control
+        // commands issued concurrently are serialised safely.
+        if (m_aacRunning) { std::lock_guard<std::recursive_mutex> lk(m_streamMutex); stopAAC(); startAAC(); }
+        if (m_mp3Running) { std::lock_guard<std::recursive_mutex> lk(m_streamMutex); stopMP3(); startMP3(); }
+        if (m_hlsRunning) { std::lock_guard<std::recursive_mutex> lk(m_streamMutex); stopHLS(); startHLS(); }
+        if (m_srtRunning) { std::lock_guard<std::recursive_mutex> lk(m_streamMutex); stopSRT(); startSRT(); }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SRT input relay
+// Launches an FFmpeg process that receives the configured SRT source and
+// re-streams the decoded PCM as raw s16le over UDP multicast on the loopback
+// interface (239.255.127.1:RELAYPORT).  All encoder streams and the VU meter
+// subscribe to that relay so they share one inbound SRT connection.
+//
+// RELAYPORT formula: 7100 + (encoderIdx - 1) * 10
+// ---------------------------------------------------------------------------
+void Worker::startSRTInputRelay() {
+    std::lock_guard<std::recursive_mutex> lk(m_streamMutex);
+    if (m_srtInputRelayRunning) {
+        log("SRT input relay already running");
+        return;
+    }
+
+    auto inp  = readJsonFile(m_cfgDir + "/input.json");
+    std::string mode     = lowerCopy(trimCopy(inp.getString("srtMode", "caller")));
+    if (mode != "listener") mode = "caller";
+    int         srtPort  = inp.getInt("srtPort", 9250);
+    std::string srtHost  = inp.getString("srtHost", "127.0.0.1");
+    int         latency  = inp.getInt("srtLatency", 120);
+    std::string streamId = inp.getString("srtStreamId", "");
+    int         pbkeylen = clampInt(inp.getInt("srtPbkeylen", 0), 0, 32);
+    std::string pass     = inp.getString("srtPass", "");
+
+    // For listener mode, bind on all interfaces; for caller, connect outbound.
+    std::string inputAddr = (mode == "listener") ? "0.0.0.0" : srtHost;
+    std::string srtUri = "srt://" + inputAddr + ":" + std::to_string(srtPort) + "?mode=" + mode;
+    if (latency > 0)        srtUri += "&latency="    + std::to_string(latency);
+    if (!streamId.empty())  srtUri += "&streamid="   + streamId;
+    if (pbkeylen > 0)       srtUri += "&pbkeylen="   + std::to_string(pbkeylen);
+    if (!pass.empty())      srtUri += "&passphrase="  + pass;
+
+    // Relay output: raw PCM s16le over UDP multicast on loopback.
+    // All encoder FFmpeg processes and the VU meter will subscribe to this.
+    int relayPort = 7100 + (m_idx - 1) * 10;
+    const std::string relayMcast = "239.255.127.1";
+    std::string relayUri = "udp://" + relayMcast + ":" + std::to_string(relayPort)
+                         + "?localaddr=127.0.0.1&broadcast=1";
+
+    std::vector<std::string> args = {
+        "ffmpeg", "-y",
+        "-re", "-i", srtUri,
+        "-vn", "-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2",
+        "-f", "s16le", relayUri
+    };
+
+    log("SRT input relay starting â€” " + srtUri + " -> " + relayUri);
+    void* h = launchFfmpeg(args, "SRTInputRelay");
+    m_srtInputRelayProc = h;
+    if (!h) {
+        log("SRT input relay FAILED â€” could not start FFmpeg");
+        return;
+    }
+    m_srtInputRelayRunning = true;
+
+    {
+        std::lock_guard<std::mutex> lk2(m_rtMutex);
+        simplejson::Object rt = readRuntimeState(m_cfgDir);
+        rt.setBool("srtRelayActive", true);
+        rt.setInt ("srtRelayPort",   relayPort);
+        rt.setString("srtRelayAddr", relayMcast);
+        writeRuntimeState(m_cfgDir, rt);
+    }
+    log("SRT input relay active â€” mode=" + mode + " srtPort=" + std::to_string(srtPort)
+        + " relayPort=" + std::to_string(relayPort));
+}
+
+void Worker::stopSRTInputRelay() {
+    std::lock_guard<std::recursive_mutex> lk(m_streamMutex);
+    killFfmpegProc(m_srtInputRelayProc);
+    m_srtInputRelayRunning = false;
+    {
+        std::lock_guard<std::mutex> lk2(m_rtMutex);
+        simplejson::Object rt = readRuntimeState(m_cfgDir);
+        rt.setBool("srtRelayActive", false);
+        rt.setInt ("srtRelayPort",   0);
+        rt.setString("srtRelayAddr", "");
+        writeRuntimeState(m_cfgDir, rt);
+    }
+    log("SRT input relay stopped");
 }
 
 std::vector<std::string> Worker::buildFfmpegInputArgs() {
@@ -1802,7 +1973,7 @@ std::vector<std::string> Worker::buildFfmpegInputArgs() {
     } else if (type == "axia") {
         // Axia Livewire Standard Channels: L24 PCM RTP multicast, dynamic payload type 96.
         // Requires SDP file so FFmpeg knows the codec without RTCP negotiation.
-        // bitDepth defaults to 24 — Axia Standard channels use 24-bit samples.
+        // bitDepth defaults to 24 â€” Axia Standard channels use 24-bit samples.
         std::string addr  = rt.getString("sessionRtpAddress",   inp.getString("rtpAddress", "239.192.0.0"));
         int         port  = rt.getInt   ("sessionRtpPort",      inp.getInt("rtpPort", 5004));
         std::string iface = rt.getString("sessionRtpInterface", inp.getString("rtpInterface", ""));
@@ -1830,21 +2001,39 @@ std::vector<std::string> Worker::buildFfmpegInputArgs() {
         args = {"-f", "alsa", "-ac", "2", "-ar", "48000", "-i", alsaDev};
 #endif
     } else if (type == "srt") {
-        std::string host = inp.getString("srtHost", "127.0.0.1");
-        int         port = inp.getInt("srtPort", 9250);
-        int         latency = inp.getInt("srtLatency", 120);
-        std::string mode = lowerCopy(trimCopy(inp.getString("srtMode", "caller")));
-        if (mode != "listener") mode = "caller";
-        std::string streamId = inp.getString("srtStreamId", "");
-        int         pbkeylen = clampInt(inp.getInt("srtPbkeylen", 0), 0, 32);
-        std::string pass = inp.getString("srtPass", "");
-        
-        std::string uri = "srt://" + host + ":" + std::to_string(port) + "?mode=" + mode;
-        if (latency > 0) uri += "&latency=" + std::to_string(latency);
-        if (!streamId.empty()) uri += "&streamid=" + streamId;
-        if (pbkeylen > 0) uri += "&pbkeylen=" + std::to_string(pbkeylen);
-        if (!pass.empty()) uri += "&passphrase=" + pass;
-        args = {"-re", "-i", uri};
+        // When the SRT input relay is active (StartSRTInput was sent on input/connect),
+        // all encoder streams read from the shared relay rather than making separate
+        // SRT connections.  The relay re-streams decoded PCM as raw s16le over UDP
+        // multicast so multiple FFmpeg processes can share one inbound connection.
+        bool relayActive = rt.getBool("srtRelayActive", false);
+        int  relayPort   = rt.getInt ("srtRelayPort",   0);
+        std::string relayAddr = rt.getString("srtRelayAddr", "239.255.127.1");
+
+        if (relayActive && relayPort > 0) {
+            // Read raw PCM s16le from relay multicast on loopback
+            std::string relayUri = "udp://" + relayAddr + ":" + std::to_string(relayPort)
+                                 + "?localaddr=127.0.0.1";
+            args = {"-f", "s16le", "-ar", "48000", "-ac", "2",
+                    "-i", relayUri};
+        } else {
+            // No relay â€” direct SRT connection (caller mode only, since listener
+            // mode would conflict with any other consumer on the same port).
+            std::string host     = inp.getString("srtHost", "127.0.0.1");
+            int         port     = inp.getInt("srtPort", 9250);
+            int         latency  = inp.getInt("srtLatency", 120);
+            std::string mode     = lowerCopy(trimCopy(inp.getString("srtMode", "caller")));
+            if (mode != "listener") mode = "caller";
+            std::string streamId = inp.getString("srtStreamId", "");
+            int         pbkeylen = clampInt(inp.getInt("srtPbkeylen", 0), 0, 32);
+            std::string pass     = inp.getString("srtPass", "");
+            std::string inputAddr = (mode == "listener") ? "0.0.0.0" : host;
+            std::string uri = "srt://" + inputAddr + ":" + std::to_string(port) + "?mode=" + mode;
+            if (latency > 0)       uri += "&latency="   + std::to_string(latency);
+            if (!streamId.empty()) uri += "&streamid="  + streamId;
+            if (pbkeylen > 0)      uri += "&pbkeylen="  + std::to_string(pbkeylen);
+            if (!pass.empty())     uri += "&passphrase=" + pass;
+            args = {"-re", "-i", uri};
+        }
     } else {
         // Fallback: treat as generic RTP multicast
         std::string addr     = rt.getString("sessionRtpAddress",   inp.getString("rtpAddress", "239.192.0.0"));
@@ -1969,7 +2158,7 @@ void* Worker::launchFfmpeg(const std::vector<std::string>& args, const std::stri
     // the supervisor was started).
     std::string exePath = findFfmpegExe();
     if (exePath.empty()) {
-        log("[" + tag + "] FAILED — ffmpeg.exe not found. "
+        log("[" + tag + "] FAILED â€” ffmpeg.exe not found. "
             "Install FFmpeg and add it to PATH, or restart the supervisor after installation.");
         return nullptr;
     }
@@ -2025,7 +2214,7 @@ void* Worker::launchFfmpeg(const std::vector<std::string>& args, const std::stri
     if (hLog != INVALID_HANDLE_VALUE) CloseHandle(hLog);
 
     if (!ok) {
-        log("[" + tag + "] FAILED to start FFmpeg — error " + std::to_string(GetLastError()));
+        log("[" + tag + "] FAILED to start FFmpeg â€” error " + std::to_string(GetLastError()));
         return nullptr;
     }
     CloseHandle(pi.hThread);
@@ -2053,7 +2242,7 @@ void* Worker::launchFfmpeg(const std::vector<std::string>& args, const std::stri
 
     pid_t pid = fork();
     if (pid < 0) {
-        log("[" + tag + "] FAILED — fork() error");
+        log("[" + tag + "] FAILED â€” fork() error");
         return nullptr;
     }
     if (pid == 0) {
@@ -2115,7 +2304,7 @@ void Worker::killFfmpegProc(void*& h) {
             if (waitpid(static_cast<pid_t>(pid), &status, WNOHANG) != 0) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
-        // Reap child (non-blocking — may already be reaped above)
+        // Reap child (non-blocking â€” may already be reaped above)
         waitpid(static_cast<pid_t>(pid), nullptr, WNOHANG);
     }
     h = nullptr;
@@ -2150,6 +2339,7 @@ static void parseIcecastUrl(const std::string& url,
 // ---------- stream lifecycle ----------
 
 void Worker::startAAC() {
+    std::lock_guard<std::recursive_mutex> lk(m_streamMutex);
     auto cfg = readJsonFile(m_cfgDir + "/aac.json");
     std::string url  = cfg.getString("url",  "");
     std::string user = cfg.getString("user", "source");
@@ -2167,7 +2357,7 @@ void Worker::startAAC() {
     }
 
     if (url.empty()) {
-        log("AAC: no URL configured in aac.json — cannot start");
+        log("AAC: no URL configured in aac.json â€” cannot start");
         return;
     }
 
@@ -2228,16 +2418,17 @@ void Worker::startAAC() {
     void* h = launchFfmpeg(args, "AAC");
     m_aacProc = h;
     if (!m_aacProc) {
-        log("AAC Icecast FAILED — could not start FFmpeg for " + url);
+        log("AAC Icecast FAILED â€” could not start FFmpeg for " + url);
         return;
     }
-    log("AAC Icecast stream started successfully — " + url);
+    log("AAC Icecast stream started successfully â€” " + url);
 
     m_aacRunning = true;
     publishStreamHealth();
 }
 
 void Worker::stopAAC() {
+    std::lock_guard<std::recursive_mutex> lk(m_streamMutex);
     killFfmpegProc(m_aacProc);
     m_aacRunning = false;
     log("AAC Icecast stopped");
@@ -2245,6 +2436,7 @@ void Worker::stopAAC() {
 }
 
 void Worker::startMP3() {
+    std::lock_guard<std::recursive_mutex> lk(m_streamMutex);
     auto cfg = readJsonFile(m_cfgDir + "/mp3.json");
     std::string url  = cfg.getString("url",  "");
     std::string user = cfg.getString("user", "source");
@@ -2258,7 +2450,7 @@ void Worker::startMP3() {
     int vbrQuality = clampInt(cfg.getInt("vbrQuality", 4), 0, 9);
 
     if (url.empty()) {
-        log("MP3: no URL configured in mp3.json — cannot start");
+        log("MP3: no URL configured in mp3.json â€” cannot start");
         return;
     }
 
@@ -2317,16 +2509,17 @@ void Worker::startMP3() {
     void* h = launchFfmpeg(args, "MP3");
     m_mp3Proc = h;
     if (!m_mp3Proc) {
-        log("MP3 Icecast FAILED — could not start FFmpeg for " + url);
+        log("MP3 Icecast FAILED â€” could not start FFmpeg for " + url);
         return;
     }
-    log("MP3 Icecast stream started successfully — " + url);
+    log("MP3 Icecast stream started successfully â€” " + url);
 
     m_mp3Running = true;
     publishStreamHealth();
 }
 
 void Worker::stopMP3() {
+    std::lock_guard<std::recursive_mutex> lk(m_streamMutex);
     killFfmpegProc(m_mp3Proc);
     m_mp3Running = false;
     log("MP3 Icecast stopped");
@@ -2396,7 +2589,7 @@ void Worker::startHLS() {
     gethostname(hostnameBuf, sizeof(hostnameBuf) - 1);
     std::string hostname = hostnameBuf[0] ? hostnameBuf : "localhost";
 
-    // Canonical "live stream" URL — built from the playback port when configured,
+    // Canonical "live stream" URL â€” built from the playback port when configured,
     // otherwise fall back to the supervisor's built-in HLS proxy route.
     std::string hlsUrl;
     if (playbackPort > 0) {
@@ -2455,12 +2648,12 @@ void Worker::startHLS() {
     void* h = launchFfmpeg(args, "HLS");
     m_hlsProc = h;
     if (!m_hlsProc) {
-        log("HLS FAILED — could not start FFmpeg");
+        log("HLS FAILED â€” could not start FFmpeg");
         return;
     }
     log("HLS FFmpeg encoding started");
 
-    // Start segment monitor — logs each .ts file as FFmpeg writes it
+    // Start segment monitor â€” logs each .ts file as FFmpeg writes it
     if (m_hlsSegMonThread.joinable()) {
         m_hlsSegMonRunning = false;
         m_hlsSegMonThread.join();
@@ -2471,7 +2664,7 @@ void Worker::startHLS() {
     // Start dedicated HLS HTTP server on the configured playback port
     if (playbackPort > 0) {
         if (m_hlsHttpThread.joinable()) {
-            // A previous server thread is still alive — stop it first
+            // A previous server thread is still alive â€” stop it first
             m_hlsHttpRunning = false;
             int old = m_hlsHttpSocket.load();
             if (old != -1) close_socket(old);
@@ -2498,7 +2691,7 @@ void Worker::startHLS() {
         }
 #endif
         log("HLS HTTP server listening on port " + std::to_string(playbackPort)
-            + " — access stream at: " + hlsUrl);
+            + " â€” access stream at: " + hlsUrl);
     } else {
         log("HLS stream access URL: " + hlsUrl);
     }
@@ -2508,6 +2701,7 @@ void Worker::startHLS() {
 }
 
 void Worker::stopHLS() {
+    std::lock_guard<std::recursive_mutex> lk(m_streamMutex);
     // Stop segment monitor
     if (m_hlsSegMonRunning.load()) {
         m_hlsSegMonRunning = false;
@@ -2545,18 +2739,18 @@ void Worker::startSRT() {
     int pbkeylen = cfg.getInt("pbkeylen", 16);
 
     if (host.empty()) {
-        log("SRT FAILED — host is empty in srt.json");
+        log("SRT FAILED â€” host is empty in srt.json");
         return;
     }
     if (port <= 0 || port > 65535) {
-        log("SRT FAILED — invalid port in srt.json: " + std::to_string(port));
+        log("SRT FAILED â€” invalid port in srt.json: " + std::to_string(port));
         return;
     }
     if (mode.empty()) mode = "caller";
     if (transport.empty()) transport = "mpeg-ts";
 
     if (transport != "mpeg-ts" && transport != "mpegts") {
-        log("SRT FAILED — unsupported transport '" + transport + "'. Only MPEG-TS is currently implemented.");
+        log("SRT FAILED â€” unsupported transport '" + transport + "'. Only MPEG-TS is currently implemented.");
         return;
     }
 
@@ -2604,16 +2798,17 @@ void Worker::startSRT() {
     void* h = launchFfmpeg(args, "SRT");
     m_srtProc = h;
     if (!m_srtProc) {
-        log("SRT FAILED — could not start FFmpeg for " + host + ":" + std::to_string(port));
+        log("SRT FAILED â€” could not start FFmpeg for " + host + ":" + std::to_string(port));
         return;
     }
 
-    log("SRT FFmpeg stream started — waiting for connection/handshake details in encoder log");
+    log("SRT FFmpeg stream started â€” waiting for connection/handshake details in encoder log");
     m_srtRunning = true;
     publishStreamHealth();
 }
 
 void Worker::stopSRT() {
+    std::lock_guard<std::recursive_mutex> lk(m_streamMutex);
     killFfmpegProc(m_srtProc);
     m_srtRunning = false;
     log("SRT stopped");
@@ -2653,7 +2848,7 @@ void Worker::monitorHlsSegments(const std::string& hlsDir) {
                 + " (" + std::to_string(sz / 1024) + " KB)");
         }
 
-        // Prune seen set to avoid unbounded growth — keep only files still on disk
+        // Prune seen set to avoid unbounded growth â€” keep only files still on disk
         if (segCount % 20 == 0 && segCount > 0) {
             std::set<std::string> stillPresent;
             for (auto& e : fs::directory_iterator(hlsDir, ec)) {
@@ -2690,7 +2885,7 @@ static std::string isoToUtcZ(const std::string& s) {
         int mn = std::stoi(base.substr(14, 2));
         int sc = std::stoi(base.substr(17, 2));
         std::string frac = (base.size() > 19 && base[19] == '.') ? base.substr(19) : "";
-        // Parse offset ±HHMM or ±HH:MM
+        // Parse offset Â±HHMM or Â±HH:MM
         int tzSign = (tz[0] == '-') ? -1 : 1;
         std::string tzd = tz.substr(1);
         tzd.erase(std::remove(tzd.begin(), tzd.end(), ':'), tzd.end());
@@ -2763,7 +2958,7 @@ void Worker::serveHlsHttp(int port, const std::string& hlsDir) {
     addr.sin_port        = htons(static_cast<uint16_t>(port));
     if (bind(sfd, (sockaddr*)&addr, sizeof(addr)) < 0) {
         log("HLS HTTP server: bind() failed on port " + std::to_string(port)
-            + " — check that port is not already in use");
+            + " â€” check that port is not already in use");
         close_socket(sfd);
         m_hlsHttpRunning = false;
         return;
@@ -3139,21 +3334,24 @@ void Worker::listenControlPort() {
             bool known = (cmd == "StartAAC" || cmd == "StopAAC" ||
                           cmd == "StartMP3" || cmd == "StopMP3" ||
                           cmd == "StartHLS" || cmd == "StopHLS" ||
-                          cmd == "StartSRT" || cmd == "StopSRT");
+                          cmd == "StartSRT" || cmd == "StopSRT" ||
+                          cmd == "StartSRTInput" || cmd == "StopSRTInput");
 
             if (known) {
                 // ACK first so supervisor retries don't duplicate long-running start operations.
                 const char* ack = "OK\n";
                 send(cfd, ack, 3, MSG_NOSIGNAL);
 
-                if      (cmd == "StartAAC")  startAAC();
-                else if (cmd == "StopAAC")   stopAAC();
-                else if (cmd == "StartMP3")  startMP3();
-                else if (cmd == "StopMP3")   stopMP3();
-                else if (cmd == "StartHLS")  startHLS();
-                else if (cmd == "StopHLS")   stopHLS();
-                else if (cmd == "StartSRT")  startSRT();
-                else if (cmd == "StopSRT")   stopSRT();
+                if      (cmd == "StartAAC")       startAAC();
+                else if (cmd == "StopAAC")        stopAAC();
+                else if (cmd == "StartMP3")       startMP3();
+                else if (cmd == "StopMP3")        stopMP3();
+                else if (cmd == "StartHLS")       startHLS();
+                else if (cmd == "StopHLS")        stopHLS();
+                else if (cmd == "StartSRT")       startSRT();
+                else if (cmd == "StopSRT")        stopSRT();
+                else if (cmd == "StartSRTInput")  startSRTInputRelay();
+                else if (cmd == "StopSRTInput")   stopSRTInputRelay();
             } else {
                 log("Unknown control command: " + cmd);
                 const char* nack = "ERR\n";
@@ -3221,6 +3419,19 @@ void Worker::monitorInputLevels() {
         int sampleRate = cfg.getInt("sessionSampleRate", inCfg.getInt("sampleRate", 48000));
         int bitDepth   = inCfg.getInt("bitDepth", 24);
 
+        // SRT relay: if the relay is active the VU monitor reads raw PCM s16le
+        // from the relay's UDP multicast rather than RTP. Override rtpAddr/rtpPort
+        // so the existing socket-open and select() path is reused; the packet
+        // parsing branch is chosen below based on srtRelayActive.
+        bool srtRelayActive = (inType == "srt") && cfg.getBool("srtRelayActive", false);
+        int  srtRelayPort   = cfg.getInt("srtRelayPort", 0);
+        std::string srtRelayAddr = cfg.getString("srtRelayAddr", "239.255.127.1");
+        if (srtRelayActive && srtRelayPort > 0) {
+            rtpAddr = srtRelayAddr;
+            rtpPort = srtRelayPort;
+            iface   = "127.0.0.1"; // loopback interface for multicast join
+        }
+
         if (connected && !lastConnected) {
             log("Input connect requested: type=" + inType + " addr=" + rtpAddr +
                 " port=" + std::to_string(rtpPort) +
@@ -3232,7 +3443,9 @@ void Worker::monitorInputLevels() {
         }
         lastConnected = connected;
 
-        bool canSampleRtp = connected && (inType == "rtp" || inType == "axia") && !rtpAddr.empty() && rtpPort > 0;
+        bool canSampleRtp = connected && (inType == "rtp" || inType == "axia" ||
+                                          (inType == "srt" && srtRelayActive)) &&
+                            !rtpAddr.empty() && rtpPort > 0;
         bool canSampleAudio = connected && (inType == "audio");
 
         if ((inType != activeInputType) && levelSocket >= 0) {
@@ -3269,7 +3482,7 @@ void Worker::monitorInputLevels() {
                 std::string mode = std::string("audio:") + (audioDevice.empty() ? "default" : audioDevice) + ":" + std::to_string(sampleRate);
                 bool validDevId = parseWaveDeviceId(audioDevice, devId);
                 if (!validDevId && !audioDevice.empty()) {
-                    // Token is not numeric — try matching by device name (stable across reboots)
+                    // Token is not numeric â€” try matching by device name (stable across reboots)
                     validDevId = findWaveDeviceByName(audioDevice, devId);
                 }
                 if (!validDevId && !audioDevice.empty()) {
@@ -3281,7 +3494,7 @@ void Worker::monitorInputLevels() {
                     std::string waveErr;
                     if (!openWaveInput(waveMeter, devId, sampleRate, waveErr)) {
                         if (lastUnsupportedMode != mode) {
-                            log("Audio input connect failed (waveIn): " + waveErr + " — will attempt WASAPI");
+                            log("Audio input connect failed (waveIn): " + waveErr + " â€” will attempt WASAPI");
                             lastUnsupportedMode = mode;
                         }
                     } else {
@@ -3309,7 +3522,7 @@ void Worker::monitorInputLevels() {
                         }
                     }
                 } else if (!wasapiMeter.open && (validDevId || audioDevice.empty())) {
-                    // waveIn failed to open — try WASAPI directly without waiting for !hadData
+                    // waveIn failed to open â€” try WASAPI directly without waiting for !hadData
                     std::string wasapiErr;
                     if (openWasapiInput(wasapiMeter, audioDevice, wasapiErr)) {
                         log("WASAPI direct capture enabled on endpoint: " +
@@ -3424,12 +3637,19 @@ void Worker::monitorInputLevels() {
         int left = -60;
         int right = -60;
         if (ready > 0 && FD_ISSET(levelSocket, &fds)) {
-            char pkt[2048];
+            char pkt[4096];
             ssize_t n = recv(levelSocket, pkt, sizeof(pkt), 0);
             if (n > 0) {
                 int rawL = -60;
                 int rawR = -60;
-                if (parseRtpStereoLevels(pkt, static_cast<size_t>(n), rawL, rawR, bitDepth)) {
+                bool parsed = false;
+                if (srtRelayActive) {
+                    // Raw PCM s16le interleaved stereo from relay UDP
+                    parsed = parsePcmS16leStereoLevels(pkt, static_cast<size_t>(n), rawL, rawR);
+                } else {
+                    parsed = parseRtpStereoLevels(pkt, static_cast<size_t>(n), rawL, rawR, bitDepth);
+                }
+                if (parsed) {
                     left = calibrateMeterDb(rawL, gainDb);
                     right = calibrateMeterDb(rawR, gainDb);
                     lastDataAt = std::chrono::steady_clock::now();

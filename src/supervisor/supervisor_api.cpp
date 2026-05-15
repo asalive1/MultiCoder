@@ -1346,6 +1346,14 @@ static std::string handleReq(const std::string& raw) {
                 fs::create_directories(dir);
                 atomicWriteRuntimeState(idx + 1, rt);
 
+                // For SRT input, tell the worker to start its SRT relay immediately
+                // so the SRT port is bound/connected as soon as the user clicks Connect.
+                if (inputType == "srt") {
+                    std::string srtCmdErr;
+                    sendWorkerControlCommand(idx + 1, "StartSRTInput", srtCmdErr);
+                    // Non-fatal if the worker isn't up yet — it will read srtRelayActive on start.
+                }
+
                 // Auto-start the worker if it is not currently running.
                 // Use both heartbeat age AND a recent-launch marker to prevent
                 // zombie spawning when the user clicks Connect rapidly.
@@ -1370,6 +1378,18 @@ static std::string handleReq(const std::string& raw) {
                     }
                 }
             } else {
+                // Stop the SRT relay if one was active before disconnecting
+                simplejson::Object rtDis = readRuntimeState(idx + 1);
+                std::string prevType = rtDis.getString("sessionInputType", "");
+                if (prevType == "srt") {
+                    std::string srtErr;
+                    sendWorkerControlCommand(idx + 1, "StopSRTInput", srtErr);
+                    // Also clear relay state so VU meter stops polling
+                    rtDis.setBool("srtRelayActive", false);
+                    rtDis.setInt ("srtRelayPort",   0);
+                    rtDis.setString("srtRelayAddr",  "");
+                    atomicWriteRuntimeState(idx + 1, rtDis);
+                }
                 setRuntimeInputConnected(idx + 1, false);
             }
             std::string bodyResp = std::string("{\"ok\":true,\"inputConnected\":") +
