@@ -26,8 +26,9 @@ let metadataStatusTimer = null;
 let metaPanelTimer = null;
 let metaLastEventCount = 0;
 // Per-stream history: each entry is { ts, text } for that stream only.
-let metaStreamHistory = { aac: [], mp3: [], hls: [], srt: [] };
+let metaStreamHistory = { metadata: [], aac: [], mp3: [], hls: [], srt: [] };
 const STREAM_SECTIONS = ['aac', 'mp3', 'hls', 'srt'];
+const META_VIEW_SECTIONS = ['metadata', 'aac', 'mp3', 'hls', 'srt'];
 const SRT_INPUT_LATENCY_MIN_MS = 0;
 const SRT_INPUT_LATENCY_MAX_MS = 90000;
 
@@ -51,6 +52,119 @@ function renderCommandRows(rows) {
       <input type="text" class="scteAction" value="${escapeHtml((r && r.action) || '')}" placeholder="Action" style="width:130px"/>
       <button class="btn scteRowRemove" type="button">-</button>
     </div>`).join('');
+}
+
+function renderMetaScteConfigPane(scte, cueListenPort, watchTags, whitelistEntries, scteRows) {
+  return `
+  <h2>SCTE-35 Cue Settings</h2>
+  <div class="form-row">
+    <label>Enable SCTE-35 Listening:</label>
+    <select id="scteListenEnabled">
+      <option value="false" ${scte.listenEnabled ? '' : 'selected'}>OFF</option>
+      <option value="true" ${scte.listenEnabled ? 'selected' : ''}>ON</option>
+    </select>
+  </div>
+  <div class="form-row scte-dependent">
+    <label>Enable SCTE-35 Engine:</label>
+    <select id="scteEnabled">
+      <option value="false" ${scte.enabled ? '' : 'selected'}>OFF</option>
+      <option value="true" ${scte.enabled ? 'selected' : ''}>ON</option>
+    </select>
+  </div>
+  <div class="form-row scte-dependent">
+    <label>Listen Transport:</label>
+    <select id="scteListenTransport">
+      <option value="http" ${(scte.listenTransport || 'http') === 'http' ? 'selected' : ''}>HTTP</option>
+      <option value="tcp" ${(scte.listenTransport || '') === 'tcp' ? 'selected' : ''}>TCP</option>
+      <option value="both" ${(scte.listenTransport || '') === 'both' ? 'selected' : ''}>Both</option>
+    </select>
+  </div>
+  <div class="form-row scte-dependent">
+    <label>Cue Listen Port:</label>
+    <input type="number" id="scteListenPort" min="1" max="65535" value="${cueListenPort}"/>
+  </div>
+  <div class="form-row scte-dependent">
+    <label>Cue Delivery Type:</label>
+    <select id="scteDeliveryType">
+      <option value="json" ${(scte.cueDeliveryType || 'json') === 'json' ? 'selected' : ''}>JSON Only</option>
+      <option value="xml" ${(scte.cueDeliveryType || '') === 'xml' ? 'selected' : ''}>XML Only</option>
+      <option value="both" ${(scte.cueDeliveryType || '') === 'both' ? 'selected' : ''}>Both</option>
+    </select>
+  </div>
+  <div class="form-row scte-dependent">
+    <label>Passthrough Mode:</label>
+    <select id="sctePassthroughMode">
+      <option value="off" ${(scte.passthroughMode || '') === 'off' ? 'selected' : ''}>OFF</option>
+      <option value="pass-through" ${(scte.passthroughMode || 'pass-through') === 'pass-through' ? 'selected' : ''}>Pass-through</option>
+      <option value="generate-from-cues" ${(scte.passthroughMode || '') === 'generate-from-cues' ? 'selected' : ''}>Generate from Cues</option>
+    </select>
+  </div>
+  <div class="form-row scte-dependent">
+    <label>Require Event ID:</label>
+    <select id="scteRequireEventId">
+      <option value="false" ${scte.requireEventId ? '' : 'selected'}>No</option>
+      <option value="true" ${scte.requireEventId ? 'selected' : ''}>Yes</option>
+    </select>
+  </div>
+  <div class="form-row scte-dependent">
+    <label>Require Token:</label>
+    <select id="scteRequireToken">
+      <option value="false" ${scte.requireToken ? '' : 'selected'}>No</option>
+      <option value="true" ${scte.requireToken ? 'selected' : ''}>Yes</option>
+    </select>
+  </div>
+  <div class="form-row scte-dependent">
+    <label>Token:</label>
+    <input type="text" id="scteToken" value="${escapeHtml(scte.token || '')}" placeholder="Optional shared token"/>
+  </div>
+  <div class="form-row scte-dependent">
+    <label>Watch XML Tags:</label>
+    <input type="text" id="scteWatchTags" value="${escapeHtml(watchTags)}" placeholder="SCTE, Event_ID, Event_Duration"/>
+  </div>
+  <div class="form-row scte-dependent">
+    <label>Whitelist:</label>
+    <select id="scteWhitelistEnabled">
+      <option value="false" ${scte.whitelistEnabled ? '' : 'selected'}>OFF</option>
+      <option value="true" ${scte.whitelistEnabled ? 'selected' : ''}>ON</option>
+    </select>
+  </div>
+  <div class="form-row scte-dependent">
+    <label>Whitelist Entries:</label>
+    <input type="text" id="scteWhitelistEntries" value="${escapeHtml(whitelistEntries)}" placeholder="192.168.1.10, 10.1.0.0/16"/>
+  </div>
+  <div class="form-row scte-dependent" style="align-items:flex-start;">
+    <label>Command Mapping:</label>
+    <div id="scteCommandRows" style="width:100%">${renderCommandRows(scteRows)}</div>
+  </div>
+  <div class="action-row scte-dependent">
+    <button class="btn" id="scteAddRowBtn" type="button">Add Command Row</button>
+  </div>
+  <div class="form-row scte-dependent">
+    <label>Override Rate Limit:</label>
+    <select id="scteOverrideRateLimit">
+      <option value="false" ${scte.overrideRateLimit ? '' : 'selected'}>Use Global</option>
+      <option value="true" ${scte.overrideRateLimit ? 'selected' : ''}>Override</option>
+    </select>
+  </div>
+  <div class="form-row scte-dependent">
+    <label>Rate Limit Count:</label>
+    <input type="number" id="scteRateLimitCount" min="1" value="${Number.isFinite(scte.rateLimitCount) ? scte.rateLimitCount : 5}"/>
+  </div>
+  <div class="form-row scte-dependent">
+    <label>Rate Limit Window (sec):</label>
+    <input type="number" id="scteRateLimitWindowSec" min="1" value="${Number.isFinite(scte.rateLimitWindowSec) ? scte.rateLimitWindowSec : 10}"/>
+  </div>
+  <div class="form-row scte-dependent">
+    <label>Override Dedupe:</label>
+    <select id="scteOverrideDedupe">
+      <option value="false" ${scte.overrideDedupe ? '' : 'selected'}>Use Global</option>
+      <option value="true" ${scte.overrideDedupe ? 'selected' : ''}>Override</option>
+    </select>
+  </div>
+  <div class="form-row scte-dependent">
+    <label>Dedupe Seconds:</label>
+    <input type="number" id="scteDedupeSeconds" min="0" value="${Number.isFinite(scte.dedupeSeconds) ? scte.dedupeSeconds : 30}"/>
+  </div>`;
 }
 
 function setMainLayout(mode) {
@@ -232,7 +346,7 @@ function selectEncoder(id) {
     selectedEncoder = id;
     selectedSection = 'input';  // default section
     metaLastEventCount = 0;
-    metaStreamHistory = { aac: [], mp3: [], hls: [], srt: [] };
+  metaStreamHistory = { metadata: [], aac: [], mp3: [], hls: [], srt: [] };
     renderEncoderCards();
     renderLeftNav();
     loadSection('input');
@@ -253,9 +367,9 @@ async function loadSection(section) {
   if (inputStatusTimer) { clearInterval(inputStatusTimer); inputStatusTimer = null; }
   if (metadataStatusTimer) { clearInterval(metadataStatusTimer); metadataStatusTimer = null; }
   setMainLayout(section === 'log' ? 'log' : 'default');
-  // Panel 4 is only relevant for stream sections.
+  // Panel 4 is relevant for metadata + stream sections.
   const rightPanel = document.getElementById('rightPanel');
-  if (STREAM_SECTIONS.includes(section)) {
+  if (META_VIEW_SECTIONS.includes(section)) {
     rightPanel.style.display = '';
     startMetaPanelPoller();
   } else {
@@ -361,6 +475,9 @@ async function renderInputSection(cl, cr) {
       updateVUFromLevels(vuLastRaw);
       scheduleGainPreviewUpdate();
     });
+    slider.addEventListener('change', () => {
+      applyGainNow();
+    });
     box.addEventListener('change', () => {
       let v = parseFloat(box.value);
       v = Math.max(-15, Math.min(15, v));
@@ -368,6 +485,7 @@ async function renderInputSection(cl, cr) {
       slider.value = v;
       updateVUFromLevels(vuLastRaw);
       scheduleGainPreviewUpdate();
+      applyGainNow();
     });
 
     // Input type toggle
@@ -625,6 +743,15 @@ function scheduleGainPreviewUpdate() {
   }, 120);
 }
 
+async function applyGainNow() {
+  if (!selectedEncoder) return;
+  try {
+    const gain = parseFloat((document.getElementById('gainBox') || {}).value || '0') || 0;
+    await apiPost(`/api/encoder/${selectedEncoder}/input/apply-gain`, { gainDb: gain });
+  } catch {
+  }
+}
+
 async function refreshInputStatusLine() {
   if (!selectedEncoder || selectedSection !== 'input') return;
   const el = document.getElementById('inputStatusLine');
@@ -753,117 +880,9 @@ async function renderMetaSection(cl, cr) {
       <button class="btn" id="metaSaveBtn">Save</button>
     </div>
 
-    <h3 style="margin-top:16px">SCTE-35 Cue Listening</h3>
-    <div class="form-row">
-      <label>Enable SCTE-35 Listening:</label>
-      <select id="scteListenEnabled">
-        <option value="false" ${scte.listenEnabled ? '' : 'selected'}>OFF</option>
-        <option value="true" ${scte.listenEnabled ? 'selected' : ''}>ON</option>
-      </select>
-    </div>
-    <div class="form-row scte-dependent">
-      <label>Enable SCTE-35 Engine:</label>
-      <select id="scteEnabled">
-        <option value="false" ${scte.enabled ? '' : 'selected'}>OFF</option>
-        <option value="true" ${scte.enabled ? 'selected' : ''}>ON</option>
-      </select>
-    </div>
-    <div class="form-row scte-dependent">
-      <label>Listen Transport:</label>
-      <select id="scteListenTransport">
-        <option value="http" ${(scte.listenTransport || 'http') === 'http' ? 'selected' : ''}>HTTP</option>
-        <option value="tcp" ${(scte.listenTransport || '') === 'tcp' ? 'selected' : ''}>TCP</option>
-        <option value="both" ${(scte.listenTransport || '') === 'both' ? 'selected' : ''}>Both</option>
-      </select>
-    </div>
-    <div class="form-row scte-dependent">
-      <label>Cue Listen Port:</label>
-      <input type="number" id="scteListenPort" min="1" max="65535" value="${cueListenPort}"/>
-    </div>
-    <div class="form-row scte-dependent">
-      <label>Cue Delivery Type:</label>
-      <select id="scteDeliveryType">
-        <option value="json" ${(scte.cueDeliveryType || 'json') === 'json' ? 'selected' : ''}>JSON Only</option>
-        <option value="xml" ${(scte.cueDeliveryType || '') === 'xml' ? 'selected' : ''}>XML Only</option>
-        <option value="both" ${(scte.cueDeliveryType || '') === 'both' ? 'selected' : ''}>Both</option>
-      </select>
-    </div>
-    <div class="form-row scte-dependent">
-      <label>Passthrough Mode:</label>
-      <select id="sctePassthroughMode">
-        <option value="off" ${(scte.passthroughMode || '') === 'off' ? 'selected' : ''}>OFF</option>
-        <option value="pass-through" ${(scte.passthroughMode || 'pass-through') === 'pass-through' ? 'selected' : ''}>Pass-through</option>
-        <option value="generate-from-cues" ${(scte.passthroughMode || '') === 'generate-from-cues' ? 'selected' : ''}>Generate from Cues</option>
-      </select>
-    </div>
-    <div class="form-row scte-dependent">
-      <label>Require Event ID:</label>
-      <select id="scteRequireEventId">
-        <option value="false" ${scte.requireEventId ? '' : 'selected'}>No</option>
-        <option value="true" ${scte.requireEventId ? 'selected' : ''}>Yes</option>
-      </select>
-    </div>
-    <div class="form-row scte-dependent">
-      <label>Require Token:</label>
-      <select id="scteRequireToken">
-        <option value="false" ${scte.requireToken ? '' : 'selected'}>No</option>
-        <option value="true" ${scte.requireToken ? 'selected' : ''}>Yes</option>
-      </select>
-    </div>
-    <div class="form-row scte-dependent">
-      <label>Token:</label>
-      <input type="text" id="scteToken" value="${escapeHtml(scte.token || '')}" placeholder="Optional shared token"/>
-    </div>
-    <div class="form-row scte-dependent">
-      <label>Watch XML Tags:</label>
-      <input type="text" id="scteWatchTags" value="${escapeHtml(watchTags)}" placeholder="SCTE, Event_ID, Event_Duration"/>
-    </div>
-    <div class="form-row scte-dependent">
-      <label>Whitelist:</label>
-      <select id="scteWhitelistEnabled">
-        <option value="false" ${scte.whitelistEnabled ? '' : 'selected'}>OFF</option>
-        <option value="true" ${scte.whitelistEnabled ? 'selected' : ''}>ON</option>
-      </select>
-    </div>
-    <div class="form-row scte-dependent">
-      <label>Whitelist Entries:</label>
-      <input type="text" id="scteWhitelistEntries" value="${escapeHtml(whitelistEntries)}" placeholder="192.168.1.10, 10.1.0.0/16"/>
-    </div>
-    <div class="form-row scte-dependent" style="align-items:flex-start;">
-      <label>Command Mapping:</label>
-      <div id="scteCommandRows" style="width:100%">${renderCommandRows(scteRows)}</div>
-    </div>
-    <div class="action-row scte-dependent">
-      <button class="btn" id="scteAddRowBtn" type="button">Add Command Row</button>
-    </div>
-    <div class="form-row scte-dependent">
-      <label>Override Rate Limit:</label>
-      <select id="scteOverrideRateLimit">
-        <option value="false" ${scte.overrideRateLimit ? '' : 'selected'}>Use Global</option>
-        <option value="true" ${scte.overrideRateLimit ? 'selected' : ''}>Override</option>
-      </select>
-    </div>
-    <div class="form-row scte-dependent">
-      <label>Rate Limit Count:</label>
-      <input type="number" id="scteRateLimitCount" min="1" value="${Number.isFinite(scte.rateLimitCount) ? scte.rateLimitCount : 5}"/>
-    </div>
-    <div class="form-row scte-dependent">
-      <label>Rate Limit Window (sec):</label>
-      <input type="number" id="scteRateLimitWindowSec" min="1" value="${Number.isFinite(scte.rateLimitWindowSec) ? scte.rateLimitWindowSec : 10}"/>
-    </div>
-    <div class="form-row scte-dependent">
-      <label>Override Dedupe:</label>
-      <select id="scteOverrideDedupe">
-        <option value="false" ${scte.overrideDedupe ? '' : 'selected'}>Use Global</option>
-        <option value="true" ${scte.overrideDedupe ? 'selected' : ''}>Override</option>
-      </select>
-    </div>
-    <div class="form-row scte-dependent">
-      <label>Dedupe Seconds:</label>
-      <input type="number" id="scteDedupeSeconds" min="0" value="${Number.isFinite(scte.dedupeSeconds) ? scte.dedupeSeconds : 30}"/>
-    </div>
-
     <div id="metaPayloadStatus" style="margin-top:10px;font-size:11px;color:var(--muted);"></div>`;
+
+    cr.innerHTML = renderMetaScteConfigPane(scte, cueListenPort, watchTags, whitelistEntries, scteRows);
 
     const selectedMode = () => {
       const el = document.querySelector('input[name="metaMode"]:checked');
@@ -1001,14 +1020,16 @@ function startMetaPanelPoller() {
 
 async function refreshMetaPanel() {
   if (!selectedEncoder) return;
-  if (!STREAM_SECTIONS.includes(selectedSection)) return;
-  const streamLabel = selectedSection.toUpperCase();
+  if (!META_VIEW_SECTIONS.includes(selectedSection)) return;
+  const streamLabel = selectedSection === 'metadata' ? 'METADATA INPUT' : selectedSection.toUpperCase();
   const titleEl = document.getElementById('metaPanelTitle');
   if (titleEl) titleEl.textContent = `Encoder ${selectedEncoder} \u2013 ${streamLabel} Metadata Viewer`;
   const incoming = document.getElementById('metaIncoming');
   const sent = document.getElementById('metaSent');
+  const scteBox = document.getElementById('metaScte');
+  const scteTitle = document.getElementById('metaScteTitle');
   const prev = document.getElementById('prevEvents');
-  if (!incoming || !sent || !prev) return;
+  if (!incoming || !sent || !scteBox || !prev) return;
   // Map section name to the metadata_runtime key for this stream.
   const streamFormattedKey = {
     aac: 'lastFormattedAAC',
@@ -1018,16 +1039,37 @@ async function refreshMetaPanel() {
   }[selectedSection];
   try {
     const s = await apiGet(`/api/encoder/${selectedEncoder}/metadata/status`);
+    if (scteTitle) {
+      scteTitle.textContent = (selectedSection === 'hls' || selectedSection === 'srt')
+        ? 'SCTE-25 Commands'
+        : 'SCTE-35 Commands';
+    }
     incoming.textContent = s.lastRawXml || (s.eventCount ? '(raw payload not yet cached)' : 'Waiting for data...');
-    // Data Sent: strictly this stream only — no cross-stream fallback.
+    // Data Sent: strictly selected stream (or metadata-mode details) — no cross-stream fallback.
     const streamPayload = (streamFormattedKey && s[streamFormattedKey]) || '\u2014';
     const scteRx = s.lastScteReceived || '\u2014';
     const scteTx = s.lastScteSent || '\u2014';
-    sent.textContent = `${streamPayload}\n\nSCTE-35 Received: ${scteRx}\nSCTE-35 Sent: ${scteTx}`;
+    const scteRej = s.lastScteRejected || '\u2014';
+    if (selectedSection === 'metadata') {
+      const mode = (s.mode || 'listen').toLowerCase();
+      const endpoint = mode === 'pull'
+        ? `${s.dataConnectHost || '(unset)'}:${s.dataConnectPort || '(unset)'}`
+        : `${s.listenPort || '(unset)'}`;
+      sent.textContent = `Mode: ${mode}\nEndpoint: ${endpoint}\nCue Endpoint: ${s.cueEndpoint || `/api/encoder/${selectedEncoder}/cue`}`;
+      scteBox.textContent = `Received: ${scteRx}\nSent: ${scteTx}\nRejected: ${scteRej}`;
+    } else {
+      sent.textContent = streamPayload;
+      scteBox.textContent = `Received: ${scteRx}\nSent: ${scteTx}\nRejected: ${scteRej}`;
+    }
     // Previous Events: build per-stream history when a new event arrives.
     const newCount = Number.isFinite(s.eventCount) ? s.eventCount : 0;
     if (newCount > metaLastEventCount && newCount > 0) {
       const ts = s.lastPayloadUtc || new Date().toISOString();
+      const raw = (s.lastRawXml && s.lastRawXml.length) ? s.lastRawXml : null;
+      if (raw !== null) {
+        metaStreamHistory.metadata.unshift({ ts, text: raw });
+        if (metaStreamHistory.metadata.length > 10) metaStreamHistory.metadata.pop();
+      }
       // Record the latest formatted text in each stream's history list.
       STREAM_SECTIONS.forEach(st => {
         const key = { aac: 'lastFormattedAAC', mp3: 'lastFormattedMP3', hls: 'lastFormattedHLS', srt: 'lastFormattedSRT' }[st];
@@ -1055,6 +1097,8 @@ async function refreshMetaPanel() {
     }
   } catch {
     incoming.textContent = 'Metadata status unavailable';
+    sent.textContent = '\u2014';
+    scteBox.textContent = '\u2014';
   }
 }
 
@@ -1072,10 +1116,7 @@ async function refreshMetadataPayloadStatus() {
       ? `${s.dataConnectHost || '(unset)'}:${s.dataConnectPort || '(unset)'}`
       : `${s.listenPort || '(unset)'}`;
     const cueEndpoint = s.cueEndpoint || `/api/encoder/${selectedEncoder}/cue`;
-    const scteRx = s.lastScteReceived || '\u2014';
-    const scteTx = s.lastScteSent || '\u2014';
-    const scteRej = s.lastScteRejected || '\u2014';
-    el.innerHTML = `<strong>Metadata state:</strong> ${listener}<br><strong>Metadata mode:</strong> ${escapeHtml(mode)}<br><strong>Mode endpoint:</strong> ${escapeHtml(endpoint)}<br><strong>Cue endpoint:</strong> ${escapeHtml(cueEndpoint)}<br><strong>Metadata events received:</strong> ${count}<br><strong>Last metadata payload received at:</strong> ${escapeHtml(last)}<br><strong>SCTE-35 Received:</strong> ${escapeHtml(scteRx)}<br><strong>SCTE-35 Sent:</strong> ${escapeHtml(scteTx)}<br><strong>SCTE-35 Rejected:</strong> ${escapeHtml(scteRej)}`;
+    el.innerHTML = `<strong>Metadata state:</strong> ${listener}<br><strong>Metadata mode:</strong> ${escapeHtml(mode)}<br><strong>Mode endpoint:</strong> ${escapeHtml(endpoint)}<br><strong>Cue endpoint:</strong> ${escapeHtml(cueEndpoint)}<br><strong>Metadata events received:</strong> ${count}<br><strong>Last metadata payload received at:</strong> ${escapeHtml(last)}`;
   } catch {
     el.textContent = 'Metadata payload status unavailable';
   }
@@ -1641,7 +1682,20 @@ async function renderSRTSection(cl, cr) {
       <label>Network Interface:</label>
       <select id="srtIface">${interfaceOptions(srtIface)}</select>
     </div>
-    <h3 style="margin-top:12px">SRT Metadata</h3>
+    <p style="font-size:10px;color:var(--muted);margin:6px 0 12px">
+      <strong>Metadata in SRT:</strong> "Now Playing" metadata is embedded as a KLV/ID3 block inside the MPEG-TS PID stream
+      when transport is MPEG-TS. For RTP transport, metadata embedding is not standardised; a best-effort RTCP APP packet
+      is sent. Receiving end must support the same convention. This limitation is inherent to SRT/MPEG-TS metadata handling.
+    </p>
+    <div class="action-row">
+      <button class="btn btn-success" id="srtStartBtn">${enc.srt ? '⬤ Running' : 'Start SRT'}</button>
+      <button class="btn btn-danger"  id="srtStopBtn">Stop SRT</button>
+      <button class="btn"             id="srtSaveBtn">Save</button>
+    </div>`;
+
+    cr.innerHTML = `
+    <h2>SRT Metadata + SCTE/Sidecar</h2>
+    <h3 style="margin-top:4px">SRT Metadata</h3>
     <div class="form-row">
       <label>Metadata Format:</label>
       <select id="srtMetaFormat">
@@ -1706,16 +1760,6 @@ async function renderSRTSection(cl, cr) {
     <div class="form-row srt-sidecar-dependent">
       <label>Retries:</label>
       <input type="number" id="srtSidecarRetries" min="0" max="20" value="${Number.isFinite(srt.sidecar && srt.sidecar.retries) ? srt.sidecar.retries : 3}"/>
-    </div>
-    <p style="font-size:10px;color:var(--muted);margin:6px 0 12px">
-      <strong>Metadata in SRT:</strong> "Now Playing" metadata is embedded as a KLV/ID3 block inside the MPEG-TS PID stream
-      when transport is MPEG-TS. For RTP transport, metadata embedding is not standardised; a best-effort RTCP APP packet
-      is sent. Receiving end must support the same convention. This limitation is inherent to SRT/MPEG-TS metadata handling.
-    </p>
-    <div class="action-row">
-      <button class="btn btn-success" id="srtStartBtn">${enc.srt ? '⬤ Running' : 'Start SRT'}</button>
-      <button class="btn btn-danger"  id="srtStopBtn">Stop SRT</button>
-      <button class="btn"             id="srtSaveBtn">Save</button>
     </div>`;
 
     const applySrtUi = () => {

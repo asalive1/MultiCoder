@@ -1,5 +1,9 @@
 if (WIN32)
     add_library(multicoder_threads INTERFACE)
+    set(MULTICODER_ICON_COPY ${CMAKE_CURRENT_BINARY_DIR}/MultiCoder.ico)
+    set(MULTICODER_ICON_RC ${CMAKE_CURRENT_BINARY_DIR}/multicoder_icon.rc)
+    configure_file(${CMAKE_SOURCE_DIR}/MultiCoder.ico ${MULTICODER_ICON_COPY} COPYONLY)
+    file(WRITE ${MULTICODER_ICON_RC} "IDI_APP_ICON ICON \"MultiCoder.ico\"\n")
 else()
     find_package(Threads REQUIRED)
     add_library(multicoder_threads INTERFACE)
@@ -11,6 +15,7 @@ add_executable(multicoder-supervisor
     supervisor/main.cpp
     supervisor/supervisor_api.cpp
     common/SimpleJson.cpp
+    $<$<BOOL:${WIN32}>:${MULTICODER_ICON_RC}>
 )
 target_include_directories(multicoder-supervisor PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -30,6 +35,7 @@ add_executable(multicoder-worker
     worker/worker.cpp
     livewire/LivewireMapping.cpp
     common/SimpleJson.cpp
+    $<$<BOOL:${WIN32}>:${MULTICODER_ICON_RC}>
 )
 target_include_directories(multicoder-worker PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include

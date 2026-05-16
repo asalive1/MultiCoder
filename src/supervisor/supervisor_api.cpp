@@ -1231,6 +1231,14 @@ static std::string handleReq(const std::string& raw, const std::string& clientIp
         std::string js = readFile(uiAssetPath("app.js"));
         return js.empty() ? httpResp(404, "text/plain", "app.js not found") : httpResp(200, "application/javascript", js);
     }
+    if (method == "GET" && (path == "/favicon.ico" || path == "/MultiCoder.ico")) {
+        std::string ico = readFile(uiAssetPath("favicon.ico"));
+        if (ico.empty()) ico = readFile(uiAssetPath("MultiCoder.ico"));
+#ifdef MULTICODER_SOURCE_ROOT
+        if (ico.empty()) ico = readFile(std::string(MULTICODER_SOURCE_ROOT) + "/MultiCoder.ico");
+#endif
+        return ico.empty() ? httpResp(404, "text/plain", "favicon not found") : httpResp(200, "image/x-icon", ico);
+    }
     if (method == "GET" && path == "/health") return httpResp(200, "application/json", "{\"status\":\"ok\",\"service\":\"multicoder-supervisor\"}");
 
     if (method == "GET" && path == "/api/encoders") return httpResp(200, "application/json", allEncodersJson());
@@ -1635,6 +1643,36 @@ static std::string handleReq(const std::string& raw, const std::string& clientIp
             simplejson::Object rt = readRuntimeState(idx + 1);
             rt.setRaw("sessionGainDb", std::to_string(gainDb));
             atomicWriteRuntimeState(idx + 1, rt);
+            return httpResp(200, "application/json", "{\"ok\":true}");
+        }
+
+        if (method == "POST" && sub == "input/apply-gain") {
+            simplejson::Object req;
+            req.parse(body);
+            double gainDb = req.getDouble("gainDb", 0.0);
+
+            simplejson::Object rt = readRuntimeState(idx + 1);
+            rt.setRaw("sessionGainDb", std::to_string(gainDb));
+            atomicWriteRuntimeState(idx + 1, rt);
+
+            // Force active outputs to re-open FFmpeg with the new gain filter.
+            // This runs only on settled UI changes (not slider ticks).
+            bool aacRunning = rt.getBool("workerAacRunning", false);
+            bool mp3Running = rt.getBool("workerMp3Running", false);
+            bool hlsRunning = rt.getBool("workerHlsRunning", false);
+            bool srtRunning = rt.getBool("workerSrtRunning", false);
+
+            std::string sendErr;
+            auto restartStream = [&](const std::string& stopCmd, const std::string& startCmd) {
+                sendWorkerControlCommand(idx + 1, stopCmd, sendErr);
+                sendWorkerControlCommand(idx + 1, startCmd, sendErr);
+            };
+            if (aacRunning) restartStream("StopAAC", "StartAAC");
+            if (mp3Running) restartStream("StopMP3", "StartMP3");
+            if (hlsRunning) restartStream("StopHLS", "StartHLS");
+            if (srtRunning) restartStream("StopSRT", "StartSRT");
+
+            appendEncoderLog(idx + 1, "Input gain applied: " + std::to_string(gainDb) + " dB");
             return httpResp(200, "application/json", "{\"ok\":true}");
         }
 

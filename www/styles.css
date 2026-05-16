@@ -234,8 +234,11 @@ main.log-expanded #rightPanel {
   overflow-y: auto;
   max-height: 120px;
 }
+#metaIncoming { min-height: 86px; max-height: 180px; }
+#metaSent, #metaScte { min-height: 56px; max-height: 120px; }
 .prev-events { list-style: none; margin-top: 4px; }
-.prev-events li { font-size: 11px; border-bottom: 1px solid #eee; padding: 2px 0; }
+.prev-events { max-height: 320px; overflow-y: auto; }
+.prev-events li { font-size: 11px; border-bottom: 1px solid #eee; padding: 2px 0; word-break: break-word; }
 
 /* ---- Modal / overlay ---- */
 .modal-overlay {

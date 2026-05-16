@@ -1,6 +1,6 @@
 # MultiCoder
 
-**v2.2.1 — Multi-channel audio encoder with Icecast AAC/MP3, HLS, SRT, and configurable SCTE cue ingest.**
+**v2.2.2 — Multi-channel audio encoder with Icecast AAC/MP3, HLS, SRT, and configurable SCTE cue ingest.**
 
 MultiCoder manages 1–5 independent encoding instances from a single web UI.
 Each encoder runs as its own worker process; restarting one encoder never disturbs the others.
