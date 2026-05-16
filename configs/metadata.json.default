@@ -3,5 +3,31 @@
     "listenPort": 9000,
     "dataConnectHost": "",
     "dataConnectPort": null,
+    "scte": {
+        "enabled": false,
+        "listenEnabled": false,
+        "listenTransport": "http",
+        "listenPort": 9041,
+        "cueDeliveryType": "json",
+        "passthroughMode": "pass-through",
+        "requireEventId": false,
+        "requireToken": false,
+        "token": "",
+        "watchTags": ["SCTE", "Event_ID", "Event_Duration"],
+        "commandRows": [
+            {"match": "BREAK", "action": "START_BREAK"},
+            {"match": "END_BREAK", "action": "END_BREAK"},
+            {"match": "LEGAL_ID", "action": "LEGAL_ID"},
+            {"match": "START_BREAK", "action": "START_BREAK"},
+            {"match": "END_BREAK_NOW", "action": "END_BREAK_NOW"}
+        ],
+        "whitelistEnabled": false,
+        "whitelistEntries": [],
+        "overrideRateLimit": false,
+        "rateLimitCount": 5,
+        "rateLimitWindowSec": 10,
+        "overrideDedupe": false,
+        "dedupeSeconds": 30
+    },
     "_note": "mode: listen or pull. listen uses listenPort for inbound push. pull connects outbound to dataConnectHost:dataConnectPort and ingests metadata from that socket."
 }

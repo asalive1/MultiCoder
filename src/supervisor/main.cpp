@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <string>
 #include <thread>
 #include "supervisor_api.h"
 #ifdef _WIN32
@@ -12,6 +13,20 @@
 
 static std::atomic<bool> g_svShutdown{false};
 static void svSigHandler(int) { g_svShutdown = true; }
+
+static std::string envValue(const char* name) {
+#ifdef _WIN32
+    char* buf = nullptr;
+    size_t len = 0;
+    if (_dupenv_s(&buf, &len, name) != 0 || !buf) return "";
+    std::string out(buf);
+    free(buf);
+    return out;
+#else
+    const char* v = std::getenv(name);
+    return v ? std::string(v) : std::string();
+#endif
+}
 
 int main(int argc, char** argv) {
     std::cout << "MultiCoder Supervisor starting...\n";
@@ -31,8 +46,9 @@ int main(int argc, char** argv) {
     std::filesystem::create_directories("/etc/MC");
 
     int port = 8050;
-    if (const char* envPort = std::getenv("UI_PORT")) {
-        int parsed = std::atoi(envPort);
+    std::string envPort = envValue("UI_PORT");
+    if (!envPort.empty()) {
+        int parsed = std::atoi(envPort.c_str());
         if (parsed > 0 && parsed < 65536) port = parsed;
     }
 

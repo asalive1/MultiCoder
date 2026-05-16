@@ -10,5 +10,17 @@
     "encryption": "none",
     "passphrase": "",
     "pbkeylen": 16,
+    "metaFormat": "id3",
+    "metaHandling": "xmlPassThrough",
+    "metaCustomFields": [],
+    "scteEnabled": false,
+    "sctePassthrough": "pass-through",
+    "sidecar": {
+        "enabled": false,
+        "transport": "http-json",
+        "mode": "mirror",
+        "url": "",
+        "retries": 3
+    },
     "_note": "metadata: Now Playing embedded in MPEG-TS KLV/ID3 block (PID 0x0011). For RTP mode, best-effort RTCP APP packet. Receiving end must support the same convention."
 }

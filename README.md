@@ -1,6 +1,6 @@
 # MultiCoder
 
-**v2.0 — Multi-channel audio encoder with Icecast AAC/MP3, HLS, and SRT output.**
+**v2.2.1 — Multi-channel audio encoder with Icecast AAC/MP3, HLS, SRT, and configurable SCTE cue ingest.**
 
 MultiCoder manages 1–5 independent encoding instances from a single web UI.
 Each encoder runs as its own worker process; restarting one encoder never disturbs the others.
@@ -190,6 +190,23 @@ Example: `artist={artist} | title={title} | {stationId}`
 
 **Legacy mode:**  
 Select a separator and an ordered list of XML field names to concatenate.
+
+### SCTE-35 Cueing and Matching
+
+- Global SCTE enable/defaults are configured in **Admin → Application Settings**.
+- Per-encoder SCTE listen/match settings live in **Metadata Input Configuration**.
+- HTTP cue endpoint is exposed at `/api/encoder/{id}/cue`.
+- Matching is exact and case-sensitive against configured command rows.
+- Non-matching cues are logged as `No Matching Command` and are not executed.
+- Source allowlist accepts single IPv4 addresses and CIDR subnets.
+- Rate limit and dedupe/replay windows inherit global defaults unless overridden per encoder.
+
+### SRT Input Delay
+
+- SRT input delay (receiver-side latency) is configured per encoder in **Input Configuration** when `Input Source = SRT`.
+- Valid range is `0` to `90000` ms.
+- Saved value persists to `input.json` and is copied into runtime session state on connect.
+- Effective latency is shown in Input status summary and logged by worker SRT input paths.
 
 ### HLS Metadata Profile Selector
 

@@ -1,6 +1,6 @@
 # MultiCoder Technical Writeup (Engineering Handoff)
 
-Last updated: 2026-05-15
+Last updated: 2026-05-16
 
 ## 1. Purpose and Scope
 
@@ -103,6 +103,13 @@ Disconnect path:
 ## 3.5 SRT as Input
 
 If input type is `srt`, worker builds FFmpeg input URI from `input.json` (`srtHost`, `srtPort`, optional latency/passphrase).
+
+SRT input delay implementation details:
+- Persisted key: `input.json.srtLatency`.
+- Runtime key: `runtime_state.json.sessionSrtLatency` (set on input/connect).
+- Validation range: `0..90000` ms.
+- Worker applies session value first, then saved config fallback.
+- Delay is applied in both relay SRT URI and direct SRT fallback URI paths.
 
 ## 4. Encoder Output Pipelines
 
@@ -310,6 +317,14 @@ Metadata controls:
 - `POST /api/encoder/{id}/metadata/connect`
 - `GET /api/encoder/{id}/metadata/status`
 
+Cue ingest controls:
+- `POST /api/encoder/{id}/cue`
+  - HTTP cue ingest endpoint on the same supervisor listener (port 8050 by default).
+  - Matches incoming cue values case-sensitively against `metadata.scte.commandRows`.
+  - If no exact match exists, logs `No Matching Command` and does not execute.
+  - Applies optional source allowlist (IPv4/CIDR), rate limit, and dedupe/replay checks.
+  - Writes SCTE runtime fields into `metadata_runtime.json`.
+
 Stream controls:
 - `POST /api/encoder/{id}/aac/start|stop`
 - `POST /api/encoder/{id}/mp3/start|stop`
@@ -343,6 +358,12 @@ Supervisor currently maps stream actions to these canonical command strings.
 - `firstLoginRequired` (bool): force password change flow.
 - `iceURL`, `iceMountAAC`, `iceMountMP3` (string): default UI/system values.
 - `interfaces` (object): optional interface map.
+- SCTE global keys:
+  - `scteGlobalEnabled` (bool).
+  - `scteGlobalRateLimitCount` (int, default `5`).
+  - `scteGlobalRateLimitWindowSec` (int, default `10`).
+  - `scteGlobalDedupeSeconds` (int, default `30`).
+  - `scteLogLevel` (`info|debug|warning`).
 
 ## 7.2 input.json
 
@@ -357,6 +378,7 @@ Supervisor currently maps stream actions to these canonical command strings.
 - `bitDepth` (int; 24 default for Axia/L24, 16 for legacy L16).
 - `deviceIndex` (int, legacy/local audio token usage context).
 - For SRT input path: `srtHost`, `srtPort`, `srtLatency`, `srtPass` (consumed when `inputType=srt`).
+- `srtLatency` validation: `0..90000` ms.
 
 ## 7.3 control.json
 
@@ -370,6 +392,16 @@ Supervisor currently maps stream actions to these canonical command strings.
 - `listenPort` (int).
 - `dataConnectHost` (string).
 - `dataConnectPort` (int/null).
+- `scte` (object): per-encoder SCTE/cue settings:
+  - `enabled`, `listenEnabled`, `listenTransport`, `listenPort`.
+  - `cueDeliveryType` (`json|xml|both`).
+  - `passthroughMode` (`off|pass-through|generate-from-cues`).
+  - `requireEventId`, `requireToken`, `token`.
+  - `watchTags` (string array).
+  - `commandRows` (array of `{match, action}`).
+  - `whitelistEnabled`, `whitelistEntries` (IPv4/CIDR array).
+  - `overrideRateLimit`, `rateLimitCount`, `rateLimitWindowSec`.
+  - `overrideDedupe`, `dedupeSeconds`.
 
 ## 7.5 aac.json
 
@@ -422,6 +454,12 @@ Supervisor currently maps stream actions to these canonical command strings.
 - `encryption` (string, UI/config semantics).
 - `passphrase` (string).
 - `pbkeylen` (16|24|32).
+- SCTE/output fields:
+  - `metaFormat` (`id3|klv`).
+  - `metaHandling` (`xmlPassThrough|customExport`).
+  - `metaCustomFields` (string array).
+  - `scteEnabled`, `sctePassthrough`.
+  - `sidecar` object (`enabled`, `transport`, `mode`, `url`, `retries`).
 
 ## 8. Runtime State Files
 
@@ -450,6 +488,9 @@ Typical keys:
 - `lastFormattedMP3`
 - `lastFormattedHLS`
 - `lastFormattedSRT`
+- `lastScteReceived`
+- `lastScteSent`
+- `lastScteRejected`
 
 ## 9. Logging and Observability
 

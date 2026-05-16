@@ -21,5 +21,5 @@
     "_comment_srtMode": "caller: SRT input connects OUT to a listening SRT server. listener: SRT input binds and waits for incoming connections from SRT senders (e.g., another encoder's SRT output).",
     "_comment_srtStreamId": "Optional SRT stream ID for identification and filtering. Leave empty if not needed.",
     "_comment_srtPbkeylen": "SRT encryption key length: 0 (no encryption), 16, 24, or 32 bytes. Requires matching value on SRT peer.",
-    "_comment_srtLatency": "SRT latency in milliseconds. Typical range: 20-500 ms. Higher values provide more jitter buffer."
+    "_comment_srtLatency": "SRT input latency in milliseconds (receiver-side jitter buffer). Valid range: 0-90000 ms."
 }

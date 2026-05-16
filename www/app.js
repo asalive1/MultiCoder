@@ -28,6 +28,30 @@ let metaLastEventCount = 0;
 // Per-stream history: each entry is { ts, text } for that stream only.
 let metaStreamHistory = { aac: [], mp3: [], hls: [], srt: [] };
 const STREAM_SECTIONS = ['aac', 'mp3', 'hls', 'srt'];
+const SRT_INPUT_LATENCY_MIN_MS = 0;
+const SRT_INPUT_LATENCY_MAX_MS = 90000;
+
+function listFromCsv(text) {
+  return String(text || '').split(',').map(s => s.trim()).filter(Boolean);
+}
+
+function renderCommandRows(rows) {
+  const safeRows = Array.isArray(rows) && rows.length ? rows : [
+    { match: 'BREAK', action: 'START_BREAK' },
+    { match: 'END_BREAK', action: 'END_BREAK' },
+    { match: 'LEGAL_ID', action: 'LEGAL_ID' },
+    { match: 'START_BREAK', action: 'START_BREAK' },
+    { match: 'END_BREAK_NOW', action: 'END_BREAK_NOW' },
+  ];
+  return safeRows.map((r, idx) => `
+    <div class="form-row scte-cmd-row" data-row="${idx}" style="gap:6px;align-items:center;">
+      <label style="min-width:120px">Command ${idx + 1}:</label>
+      <input type="text" class="scteMatch" value="${escapeHtml((r && r.match) || '')}" placeholder="Match text" style="width:130px"/>
+      <span style="color:var(--muted)">=&gt;</span>
+      <input type="text" class="scteAction" value="${escapeHtml((r && r.action) || '')}" placeholder="Action" style="width:130px"/>
+      <button class="btn scteRowRemove" type="button">-</button>
+    </div>`).join('');
+}
 
 function setMainLayout(mode) {
   const main = document.querySelector('main');
@@ -355,6 +379,11 @@ async function renderInputSection(cl, cr) {
       try {
         const selectedType = document.getElementById('inputTypeSelect').value;
         const data = gatherInputConfig(selectedType);
+        const validationError = validateInputConfigPayload(data);
+        if (validationError) {
+          showBanner(validationError, 'error');
+          return;
+        }
         await apiPost(`/api/encoder/${selectedEncoder}/config/input`, JSON.stringify(data));
         showBanner('Input config saved', 'ok');
         await refreshInputStatusLine();
@@ -364,12 +393,21 @@ async function renderInputSection(cl, cr) {
     });
 
     document.getElementById('connectBtn').addEventListener('click', async () => {
-      const selectedType = document.getElementById('inputTypeSelect').value;
-      const data = gatherInputConfig(selectedType);
-      await apiPost(`/api/encoder/${selectedEncoder}/input/connect`, data);
-      showBanner(`Encoder ${selectedEncoder}: input connected`, 'ok');
-      await refreshInputLevels();
-      await refreshInputStatusLine();
+      try {
+        const selectedType = document.getElementById('inputTypeSelect').value;
+        const data = gatherInputConfig(selectedType);
+        const validationError = validateInputConfigPayload(data);
+        if (validationError) {
+          showBanner(validationError, 'error');
+          return;
+        }
+        await apiPost(`/api/encoder/${selectedEncoder}/input/connect`, data);
+        showBanner(`Encoder ${selectedEncoder}: input connected`, 'ok');
+        await refreshInputLevels();
+        await refreshInputStatusLine();
+      } catch (e) {
+        showBanner('Input connect failed: ' + e.message, 'error');
+      }
     });
 
     document.getElementById('disconnectBtn').addEventListener('click', async () => {
@@ -448,8 +486,8 @@ function renderInputTypeFields(type, inp) {
           <input type="number" id="srtInPort" value="${inp.srtPort||9050}"/>
         </div>
         <div class="form-row">
-          <label>Latency (ms):</label>
-          <input type="number" id="srtInLatency" value="${inp.srtLatency||120}"/>
+          <label>SRT Input Delay (ms):</label>
+          <input type="number" id="srtInLatency" min="${SRT_INPUT_LATENCY_MIN_MS}" max="${SRT_INPUT_LATENCY_MAX_MS}" value="${Number.isFinite(inp.srtLatency) ? inp.srtLatency : 120}"/>
         </div>
         <div class="form-row">
           <label>Stream Password:</label>
@@ -473,6 +511,10 @@ function renderInputTypeFields(type, inp) {
           <select id="srtInIface">${interfaceOptions(inp.rtpInterface||'')}</select>
         </div>
         <p id="srtInModeHint" style="font-size:10px;margin-top:4px;color:var(--muted)"></p>
+        <p style="font-size:10px;margin-top:4px;color:var(--muted)">
+          Receiver-side latency controls SRT jitter buffering. Lower values reduce delay but can increase dropouts on unstable links.
+          Valid range: ${SRT_INPUT_LATENCY_MIN_MS}-${SRT_INPUT_LATENCY_MAX_MS} ms.
+        </p>
         <p style="font-size:10px;margin-top:4px;color:var(--muted)">
           SRT over RTP encapsulates audio as RTP inside an SRT stream (useful for low-latency studio links).
           Raw MPEG-TS wraps audio/video as an MPEG transport stream.
@@ -526,6 +568,18 @@ function gatherInputConfig(type) {
     if (type === 'audio')
       return { ...base, audioDevice: v('audioDevice') };
     return base;
+}
+
+function validateInputConfigPayload(payload) {
+  if (!payload || payload.inputType !== 'srt') return null;
+  const latency = Number(payload.srtLatency);
+  if (!Number.isFinite(latency)) {
+    return `SRT input delay must be a number (${SRT_INPUT_LATENCY_MIN_MS}-${SRT_INPUT_LATENCY_MAX_MS} ms).`;
+  }
+  if (latency < SRT_INPUT_LATENCY_MIN_MS || latency > SRT_INPUT_LATENCY_MAX_MS) {
+    return `SRT input delay must be ${SRT_INPUT_LATENCY_MIN_MS}-${SRT_INPUT_LATENCY_MAX_MS} ms. Got ${latency}.`;
+  }
+  return null;
 }
 
 function dbToPercent(db) {
@@ -657,6 +711,13 @@ async function renderMetaSection(cl, cr) {
     const lp   = meta.listenPort || (9000 + (selectedEncoder-1) * 10);
     const dh   = meta.dataConnectHost || '';
     const dp   = meta.dataConnectPort || '';
+    const scte = meta.scte || {};
+    const scteRows = Array.isArray(scte.commandRows) ? scte.commandRows : [];
+    const watchTags = Array.isArray(scte.watchTags) && scte.watchTags.length
+      ? scte.watchTags.join(', ')
+      : 'SCTE, Event_ID, Event_Duration';
+    const whitelistEntries = Array.isArray(scte.whitelistEntries) ? scte.whitelistEntries.join(', ') : '';
+    const cueListenPort = Number.isFinite(scte.listenPort) ? scte.listenPort : (9040 + selectedEncoder);
 
     cl.innerHTML = `
     <h2>Metadata</h2>
@@ -691,6 +752,117 @@ async function renderMetaSection(cl, cr) {
     <div class="action-row" style="margin-top:12px">
       <button class="btn" id="metaSaveBtn">Save</button>
     </div>
+
+    <h3 style="margin-top:16px">SCTE-35 Cue Listening</h3>
+    <div class="form-row">
+      <label>Enable SCTE-35 Listening:</label>
+      <select id="scteListenEnabled">
+        <option value="false" ${scte.listenEnabled ? '' : 'selected'}>OFF</option>
+        <option value="true" ${scte.listenEnabled ? 'selected' : ''}>ON</option>
+      </select>
+    </div>
+    <div class="form-row scte-dependent">
+      <label>Enable SCTE-35 Engine:</label>
+      <select id="scteEnabled">
+        <option value="false" ${scte.enabled ? '' : 'selected'}>OFF</option>
+        <option value="true" ${scte.enabled ? 'selected' : ''}>ON</option>
+      </select>
+    </div>
+    <div class="form-row scte-dependent">
+      <label>Listen Transport:</label>
+      <select id="scteListenTransport">
+        <option value="http" ${(scte.listenTransport || 'http') === 'http' ? 'selected' : ''}>HTTP</option>
+        <option value="tcp" ${(scte.listenTransport || '') === 'tcp' ? 'selected' : ''}>TCP</option>
+        <option value="both" ${(scte.listenTransport || '') === 'both' ? 'selected' : ''}>Both</option>
+      </select>
+    </div>
+    <div class="form-row scte-dependent">
+      <label>Cue Listen Port:</label>
+      <input type="number" id="scteListenPort" min="1" max="65535" value="${cueListenPort}"/>
+    </div>
+    <div class="form-row scte-dependent">
+      <label>Cue Delivery Type:</label>
+      <select id="scteDeliveryType">
+        <option value="json" ${(scte.cueDeliveryType || 'json') === 'json' ? 'selected' : ''}>JSON Only</option>
+        <option value="xml" ${(scte.cueDeliveryType || '') === 'xml' ? 'selected' : ''}>XML Only</option>
+        <option value="both" ${(scte.cueDeliveryType || '') === 'both' ? 'selected' : ''}>Both</option>
+      </select>
+    </div>
+    <div class="form-row scte-dependent">
+      <label>Passthrough Mode:</label>
+      <select id="sctePassthroughMode">
+        <option value="off" ${(scte.passthroughMode || '') === 'off' ? 'selected' : ''}>OFF</option>
+        <option value="pass-through" ${(scte.passthroughMode || 'pass-through') === 'pass-through' ? 'selected' : ''}>Pass-through</option>
+        <option value="generate-from-cues" ${(scte.passthroughMode || '') === 'generate-from-cues' ? 'selected' : ''}>Generate from Cues</option>
+      </select>
+    </div>
+    <div class="form-row scte-dependent">
+      <label>Require Event ID:</label>
+      <select id="scteRequireEventId">
+        <option value="false" ${scte.requireEventId ? '' : 'selected'}>No</option>
+        <option value="true" ${scte.requireEventId ? 'selected' : ''}>Yes</option>
+      </select>
+    </div>
+    <div class="form-row scte-dependent">
+      <label>Require Token:</label>
+      <select id="scteRequireToken">
+        <option value="false" ${scte.requireToken ? '' : 'selected'}>No</option>
+        <option value="true" ${scte.requireToken ? 'selected' : ''}>Yes</option>
+      </select>
+    </div>
+    <div class="form-row scte-dependent">
+      <label>Token:</label>
+      <input type="text" id="scteToken" value="${escapeHtml(scte.token || '')}" placeholder="Optional shared token"/>
+    </div>
+    <div class="form-row scte-dependent">
+      <label>Watch XML Tags:</label>
+      <input type="text" id="scteWatchTags" value="${escapeHtml(watchTags)}" placeholder="SCTE, Event_ID, Event_Duration"/>
+    </div>
+    <div class="form-row scte-dependent">
+      <label>Whitelist:</label>
+      <select id="scteWhitelistEnabled">
+        <option value="false" ${scte.whitelistEnabled ? '' : 'selected'}>OFF</option>
+        <option value="true" ${scte.whitelistEnabled ? 'selected' : ''}>ON</option>
+      </select>
+    </div>
+    <div class="form-row scte-dependent">
+      <label>Whitelist Entries:</label>
+      <input type="text" id="scteWhitelistEntries" value="${escapeHtml(whitelistEntries)}" placeholder="192.168.1.10, 10.1.0.0/16"/>
+    </div>
+    <div class="form-row scte-dependent" style="align-items:flex-start;">
+      <label>Command Mapping:</label>
+      <div id="scteCommandRows" style="width:100%">${renderCommandRows(scteRows)}</div>
+    </div>
+    <div class="action-row scte-dependent">
+      <button class="btn" id="scteAddRowBtn" type="button">Add Command Row</button>
+    </div>
+    <div class="form-row scte-dependent">
+      <label>Override Rate Limit:</label>
+      <select id="scteOverrideRateLimit">
+        <option value="false" ${scte.overrideRateLimit ? '' : 'selected'}>Use Global</option>
+        <option value="true" ${scte.overrideRateLimit ? 'selected' : ''}>Override</option>
+      </select>
+    </div>
+    <div class="form-row scte-dependent">
+      <label>Rate Limit Count:</label>
+      <input type="number" id="scteRateLimitCount" min="1" value="${Number.isFinite(scte.rateLimitCount) ? scte.rateLimitCount : 5}"/>
+    </div>
+    <div class="form-row scte-dependent">
+      <label>Rate Limit Window (sec):</label>
+      <input type="number" id="scteRateLimitWindowSec" min="1" value="${Number.isFinite(scte.rateLimitWindowSec) ? scte.rateLimitWindowSec : 10}"/>
+    </div>
+    <div class="form-row scte-dependent">
+      <label>Override Dedupe:</label>
+      <select id="scteOverrideDedupe">
+        <option value="false" ${scte.overrideDedupe ? '' : 'selected'}>Use Global</option>
+        <option value="true" ${scte.overrideDedupe ? 'selected' : ''}>Override</option>
+      </select>
+    </div>
+    <div class="form-row scte-dependent">
+      <label>Dedupe Seconds:</label>
+      <input type="number" id="scteDedupeSeconds" min="0" value="${Number.isFinite(scte.dedupeSeconds) ? scte.dedupeSeconds : 30}"/>
+    </div>
+
     <div id="metaPayloadStatus" style="margin-top:10px;font-size:11px;color:var(--muted);"></div>`;
 
     const selectedMode = () => {
@@ -703,6 +875,29 @@ async function renderMetaSection(cl, cr) {
       listenPort: parseInt(document.getElementById('metaListenPort').value) || null,
       dataConnectHost: (document.getElementById('metaConnectHost').value || '').trim(),
       dataConnectPort: parseInt(document.getElementById('metaConnectPort').value) || null,
+      scte: {
+        enabled: document.getElementById('scteEnabled').value === 'true',
+        listenEnabled: document.getElementById('scteListenEnabled').value === 'true',
+        listenTransport: document.getElementById('scteListenTransport').value || 'http',
+        listenPort: parseInt(document.getElementById('scteListenPort').value) || (9040 + selectedEncoder),
+        cueDeliveryType: document.getElementById('scteDeliveryType').value || 'json',
+        passthroughMode: document.getElementById('sctePassthroughMode').value || 'pass-through',
+        requireEventId: document.getElementById('scteRequireEventId').value === 'true',
+        requireToken: document.getElementById('scteRequireToken').value === 'true',
+        token: (document.getElementById('scteToken').value || '').trim(),
+        watchTags: listFromCsv(document.getElementById('scteWatchTags').value),
+        whitelistEnabled: document.getElementById('scteWhitelistEnabled').value === 'true',
+        whitelistEntries: listFromCsv(document.getElementById('scteWhitelistEntries').value),
+        commandRows: Array.from(document.querySelectorAll('#scteCommandRows .scte-cmd-row')).map(row => ({
+          match: (row.querySelector('.scteMatch') || {}).value || '',
+          action: (row.querySelector('.scteAction') || {}).value || '',
+        })).map(r => ({ match: (r.match || '').trim(), action: (r.action || '').trim() })).filter(r => r.match.length > 0),
+        overrideRateLimit: document.getElementById('scteOverrideRateLimit').value === 'true',
+        rateLimitCount: parseInt(document.getElementById('scteRateLimitCount').value) || 5,
+        rateLimitWindowSec: parseInt(document.getElementById('scteRateLimitWindowSec').value) || 10,
+        overrideDedupe: document.getElementById('scteOverrideDedupe').value === 'true',
+        dedupeSeconds: parseInt(document.getElementById('scteDedupeSeconds').value) || 30,
+      },
     });
 
     const applyMetaModeUi = () => {
@@ -726,11 +921,42 @@ async function renderMetaSection(cl, cr) {
       if (listenRow) listenRow.style.opacity = listenEnabled ? '1' : '0.45';
       if (pullHostRow) pullHostRow.style.opacity = pullEnabled ? '1' : '0.45';
       if (pullPortRow) pullPortRow.style.opacity = pullEnabled ? '1' : '0.45';
+
+      const scteEnabled = document.getElementById('scteListenEnabled') && document.getElementById('scteListenEnabled').value === 'true';
+      document.querySelectorAll('.scte-dependent').forEach(el => {
+        el.style.opacity = scteEnabled ? '1' : '0.45';
+        el.querySelectorAll('input,select,button,textarea').forEach(ctrl => { ctrl.disabled = !scteEnabled; });
+      });
     };
 
     document.querySelectorAll('input[name="metaMode"]').forEach((el) => {
       el.addEventListener('change', applyMetaModeUi);
     });
+    const scteListenEnabled = document.getElementById('scteListenEnabled');
+    if (scteListenEnabled) scteListenEnabled.addEventListener('change', applyMetaModeUi);
+
+    const cmdRows = document.getElementById('scteCommandRows');
+    const bindRowButtons = () => {
+      cmdRows.querySelectorAll('.scteRowRemove').forEach(btn => {
+        btn.onclick = () => {
+          const allRows = Array.from(cmdRows.querySelectorAll('.scte-cmd-row'));
+          if (allRows.length <= 1) return;
+          const row = btn.closest('.scte-cmd-row');
+          if (row) row.remove();
+        };
+      });
+    };
+    bindRowButtons();
+    const addRowBtn = document.getElementById('scteAddRowBtn');
+    if (addRowBtn) {
+      addRowBtn.addEventListener('click', () => {
+        const wrap = document.createElement('div');
+        wrap.innerHTML = renderCommandRows([{ match: '', action: '' }]);
+        const row = wrap.firstElementChild;
+        if (row) cmdRows.appendChild(row);
+        bindRowButtons();
+      });
+    }
 
     applyMetaModeUi();
 
@@ -794,7 +1020,10 @@ async function refreshMetaPanel() {
     const s = await apiGet(`/api/encoder/${selectedEncoder}/metadata/status`);
     incoming.textContent = s.lastRawXml || (s.eventCount ? '(raw payload not yet cached)' : 'Waiting for data...');
     // Data Sent: strictly this stream only — no cross-stream fallback.
-    sent.textContent = (streamFormattedKey && s[streamFormattedKey]) || '\u2014';
+    const streamPayload = (streamFormattedKey && s[streamFormattedKey]) || '\u2014';
+    const scteRx = s.lastScteReceived || '\u2014';
+    const scteTx = s.lastScteSent || '\u2014';
+    sent.textContent = `${streamPayload}\n\nSCTE-35 Received: ${scteRx}\nSCTE-35 Sent: ${scteTx}`;
     // Previous Events: build per-stream history when a new event arrives.
     const newCount = Number.isFinite(s.eventCount) ? s.eventCount : 0;
     if (newCount > metaLastEventCount && newCount > 0) {
@@ -842,7 +1071,11 @@ async function refreshMetadataPayloadStatus() {
     const endpoint = mode === 'pull'
       ? `${s.dataConnectHost || '(unset)'}:${s.dataConnectPort || '(unset)'}`
       : `${s.listenPort || '(unset)'}`;
-    el.innerHTML = `<strong>Metadata state:</strong> ${listener}<br><strong>Metadata mode:</strong> ${escapeHtml(mode)}<br><strong>Mode endpoint:</strong> ${escapeHtml(endpoint)}<br><strong>Metadata events received:</strong> ${count}<br><strong>Last metadata payload received at:</strong> ${escapeHtml(last)}`;
+    const cueEndpoint = s.cueEndpoint || `/api/encoder/${selectedEncoder}/cue`;
+    const scteRx = s.lastScteReceived || '\u2014';
+    const scteTx = s.lastScteSent || '\u2014';
+    const scteRej = s.lastScteRejected || '\u2014';
+    el.innerHTML = `<strong>Metadata state:</strong> ${listener}<br><strong>Metadata mode:</strong> ${escapeHtml(mode)}<br><strong>Mode endpoint:</strong> ${escapeHtml(endpoint)}<br><strong>Cue endpoint:</strong> ${escapeHtml(cueEndpoint)}<br><strong>Metadata events received:</strong> ${count}<br><strong>Last metadata payload received at:</strong> ${escapeHtml(last)}<br><strong>SCTE-35 Received:</strong> ${escapeHtml(scteRx)}<br><strong>SCTE-35 Sent:</strong> ${escapeHtml(scteTx)}<br><strong>SCTE-35 Rejected:</strong> ${escapeHtml(scteRej)}`;
   } catch {
     el.textContent = 'Metadata payload status unavailable';
   }
@@ -1149,6 +1382,21 @@ async function renderHLSSection(cl, cr) {
       <input type="checkbox" id="hlsMeta" ${hls.metaEnabled!==false?'checked':''}/>
     </div>
     <div class="form-row">
+      <label>SCTE-35:</label>
+      <select id="hlsScteEnabled">
+        <option value="false" ${(hls.scteEnabled === true) ? '' : 'selected'}>OFF</option>
+        <option value="true" ${(hls.scteEnabled === true) ? 'selected' : ''}>ON</option>
+      </select>
+    </div>
+    <div class="form-row hls-scte-dependent">
+      <label>SCTE Passthrough:</label>
+      <select id="hlsSctePassthrough">
+        <option value="off" ${(hls.sctePassthrough || '') === 'off' ? 'selected' : ''}>OFF</option>
+        <option value="pass-through" ${(hls.sctePassthrough || 'pass-through') === 'pass-through' ? 'selected' : ''}>Pass-through</option>
+        <option value="generate-from-cues" ${(hls.sctePassthrough || '') === 'generate-from-cues' ? 'selected' : ''}>Generate from Cues</option>
+      </select>
+    </div>
+    <div class="form-row">
       <label>Network Interface:</label>
       <select id="hlsIface">${interfaceOptions(hls.iface||'')}</select>
     </div>
@@ -1197,6 +1445,8 @@ async function renderHLSSection(cl, cr) {
                 startTimeOffset: parseInt(document.getElementById('hlsStartOffset').value),
                 lowLatency: document.getElementById('hlsLowLat').checked,
                 metaEnabled: document.getElementById('hlsMeta').checked,
+                scteEnabled: document.getElementById('hlsScteEnabled').value === 'true',
+                sctePassthrough: document.getElementById('hlsSctePassthrough').value || 'pass-through',
                 iface: document.getElementById('hlsIface').value,
             };
             await apiPost(`/api/encoder/${selectedEncoder}/config/hls`, JSON.stringify(data));
@@ -1205,6 +1455,15 @@ async function renderHLSSection(cl, cr) {
             showBanner('HLS config save failed: ' + e.message, 'error');
         }
     });
+    const applyHlsScteUi = () => {
+      const on = document.getElementById('hlsScteEnabled').value === 'true';
+      document.querySelectorAll('.hls-scte-dependent').forEach(el => {
+        el.style.opacity = on ? '1' : '0.45';
+        el.querySelectorAll('input,select,button').forEach(ctrl => { ctrl.disabled = !on; });
+      });
+    };
+    document.getElementById('hlsScteEnabled').addEventListener('change', applyHlsScteUi);
+    applyHlsScteUi();
     document.getElementById('hlsEditMetaLink').addEventListener('click', e => {
         e.preventDefault();
         renderHLSMetaEditor(cr, cfg);
@@ -1382,6 +1641,72 @@ async function renderSRTSection(cl, cr) {
       <label>Network Interface:</label>
       <select id="srtIface">${interfaceOptions(srtIface)}</select>
     </div>
+    <h3 style="margin-top:12px">SRT Metadata</h3>
+    <div class="form-row">
+      <label>Metadata Format:</label>
+      <select id="srtMetaFormat">
+        <option value="id3" ${(srt.metaFormat || 'id3') === 'id3' ? 'selected' : ''}>ID3</option>
+        <option value="klv" ${(srt.metaFormat || '') === 'klv' ? 'selected' : ''}>KLV Packets</option>
+      </select>
+    </div>
+    <div class="form-row">
+      <label>Metadata Handling:</label>
+      <select id="srtMetaHandling">
+        <option value="xmlPassThrough" ${(srt.metaHandling || 'xmlPassThrough') === 'xmlPassThrough' ? 'selected' : ''}>XML pass-through</option>
+        <option value="customExport" ${(srt.metaHandling || '') === 'customExport' ? 'selected' : ''}>Custom export</option>
+      </select>
+    </div>
+    <div class="form-row">
+      <label>Custom Export Fields:</label>
+      <input type="text" id="srtMetaCustomFields" value="${escapeHtml(Array.isArray(srt.metaCustomFields) ? srt.metaCustomFields.join(', ') : '')}" placeholder="title, artist, duration"/>
+    </div>
+
+    <h3 style="margin-top:12px">SRT SCTE-35 Output</h3>
+    <div class="form-row">
+      <label>SCTE-35:</label>
+      <select id="srtScteEnabled">
+        <option value="false" ${(srt.scteEnabled === true) ? '' : 'selected'}>OFF</option>
+        <option value="true" ${(srt.scteEnabled === true) ? 'selected' : ''}>ON</option>
+      </select>
+    </div>
+    <div class="form-row srt-scte-dependent">
+      <label>Passthrough:</label>
+      <select id="srtSctePassthrough">
+        <option value="off" ${(srt.sctePassthrough || '') === 'off' ? 'selected' : ''}>OFF</option>
+        <option value="pass-through" ${(srt.sctePassthrough || 'pass-through') === 'pass-through' ? 'selected' : ''}>Pass-through</option>
+        <option value="generate-from-cues" ${(srt.sctePassthrough || '') === 'generate-from-cues' ? 'selected' : ''}>Generate from Cues</option>
+      </select>
+    </div>
+
+    <h3 style="margin-top:12px">SRT Sidecar</h3>
+    <div class="form-row">
+      <label>Enable Sidecar:</label>
+      <select id="srtSidecarEnabled">
+        <option value="false" ${(srt.sidecar && srt.sidecar.enabled) ? '' : 'selected'}>OFF</option>
+        <option value="true" ${(srt.sidecar && srt.sidecar.enabled) ? 'selected' : ''}>ON</option>
+      </select>
+    </div>
+    <div class="form-row srt-sidecar-dependent">
+      <label>Transport:</label>
+      <select id="srtSidecarTransport">
+        <option value="http-json" ${((srt.sidecar && srt.sidecar.transport) || 'http-json') === 'http-json' ? 'selected' : ''}>HTTP POST JSON</option>
+      </select>
+    </div>
+    <div class="form-row srt-sidecar-dependent">
+      <label>Mode:</label>
+      <select id="srtSidecarMode">
+        <option value="mirror" ${((srt.sidecar && srt.sidecar.mode) || 'mirror') === 'mirror' ? 'selected' : ''}>Mirror</option>
+        <option value="fallback" ${((srt.sidecar && srt.sidecar.mode) || '') === 'fallback' ? 'selected' : ''}>Fallback</option>
+      </select>
+    </div>
+    <div class="form-row srt-sidecar-dependent">
+      <label>Endpoint URL:</label>
+      <input type="text" id="srtSidecarUrl" value="${escapeHtml((srt.sidecar && srt.sidecar.url) || '')}" placeholder="http://destination/api/sidecar"/>
+    </div>
+    <div class="form-row srt-sidecar-dependent">
+      <label>Retries:</label>
+      <input type="number" id="srtSidecarRetries" min="0" max="20" value="${Number.isFinite(srt.sidecar && srt.sidecar.retries) ? srt.sidecar.retries : 3}"/>
+    </div>
     <p style="font-size:10px;color:var(--muted);margin:6px 0 12px">
       <strong>Metadata in SRT:</strong> "Now Playing" metadata is embedded as a KLV/ID3 block inside the MPEG-TS PID stream
       when transport is MPEG-TS. For RTP transport, metadata embedding is not standardised; a best-effort RTCP APP packet
@@ -1392,6 +1717,22 @@ async function renderSRTSection(cl, cr) {
       <button class="btn btn-danger"  id="srtStopBtn">Stop SRT</button>
       <button class="btn"             id="srtSaveBtn">Save</button>
     </div>`;
+
+    const applySrtUi = () => {
+      const scteOn = document.getElementById('srtScteEnabled').value === 'true';
+      document.querySelectorAll('.srt-scte-dependent').forEach(el => {
+        el.style.opacity = scteOn ? '1' : '0.45';
+        el.querySelectorAll('input,select,button').forEach(ctrl => { ctrl.disabled = !scteOn; });
+      });
+      const sidecarOn = document.getElementById('srtSidecarEnabled').value === 'true';
+      document.querySelectorAll('.srt-sidecar-dependent').forEach(el => {
+        el.style.opacity = sidecarOn ? '1' : '0.45';
+        el.querySelectorAll('input,select,button').forEach(ctrl => { ctrl.disabled = !sidecarOn; });
+      });
+    };
+    document.getElementById('srtScteEnabled').addEventListener('change', applySrtUi);
+    document.getElementById('srtSidecarEnabled').addEventListener('change', applySrtUi);
+    applySrtUi();
 
     document.getElementById('srtStartBtn').addEventListener('click', async () => {
       const res = await apiPost(`/api/encoder/${selectedEncoder}/srt/start`, {});
@@ -1407,7 +1748,10 @@ async function renderSRTSection(cl, cr) {
     });
     document.getElementById('srtSaveBtn').addEventListener('click', async () => {
         try {
+        const existing = await loadEncoderConfig(selectedEncoder);
+        const existingSrt = (existing && existing.srt) || {};
             const data = {
+          ...existingSrt,
                 transport:   document.getElementById('srtTransport').value,
                 mode:        document.getElementById('srtMode').value,
                 host:        document.getElementById('srtHost').value,
@@ -1420,6 +1764,18 @@ async function renderSRTSection(cl, cr) {
                 passphrase:  document.getElementById('srtPassphrase').value,
                 pbkeylen:    parseInt(document.getElementById('srtPbkeylen').value),
                 iface:       document.getElementById('srtIface').value,
+                metaFormat:  document.getElementById('srtMetaFormat').value,
+                metaHandling: document.getElementById('srtMetaHandling').value,
+                metaCustomFields: listFromCsv(document.getElementById('srtMetaCustomFields').value),
+                scteEnabled: document.getElementById('srtScteEnabled').value === 'true',
+                sctePassthrough: document.getElementById('srtSctePassthrough').value,
+                sidecar: {
+                  enabled: document.getElementById('srtSidecarEnabled').value === 'true',
+                  transport: document.getElementById('srtSidecarTransport').value || 'http-json',
+                  mode: document.getElementById('srtSidecarMode').value || 'mirror',
+                  url: (document.getElementById('srtSidecarUrl').value || '').trim(),
+                  retries: parseInt(document.getElementById('srtSidecarRetries').value) || 0,
+                },
             };
             await apiPost(`/api/encoder/${selectedEncoder}/config/srt`, JSON.stringify(data));
             showBanner('SRT config saved', 'ok');
@@ -1588,6 +1944,34 @@ async function renderAdminAppSettings(cl) {
       <label>Max Encoder Count:</label>
       <input type="number" id="cfgEncoderCount" value="${cfg.encoderCount !== undefined ? cfg.encoderCount : 2}" min="1" max="10" style="width:80px"/>
     </div>
+    <h3 style="margin-top:12px">SCTE-35 Configuration</h3>
+    <div class="form-row">
+      <label>Enable SCTE-35 Cues:</label>
+      <select id="cfgScteGlobalEnabled">
+        <option value="true" ${(cfg.scteGlobalEnabled !== false) ? 'selected' : ''}>Yes</option>
+        <option value="false" ${(cfg.scteGlobalEnabled === false) ? 'selected' : ''}>No</option>
+      </select>
+    </div>
+    <div class="form-row">
+      <label>Global Rate Limit Count:</label>
+      <input type="number" id="cfgScteRateCount" min="1" value="${Number.isFinite(cfg.scteGlobalRateLimitCount) ? cfg.scteGlobalRateLimitCount : 5}" style="width:100px"/>
+    </div>
+    <div class="form-row">
+      <label>Global Rate Window (sec):</label>
+      <input type="number" id="cfgScteRateWindow" min="1" value="${Number.isFinite(cfg.scteGlobalRateLimitWindowSec) ? cfg.scteGlobalRateLimitWindowSec : 10}" style="width:100px"/>
+    </div>
+    <div class="form-row">
+      <label>Global Dedupe Seconds:</label>
+      <input type="number" id="cfgScteDedupe" min="0" value="${Number.isFinite(cfg.scteGlobalDedupeSeconds) ? cfg.scteGlobalDedupeSeconds : 30}" style="width:100px"/>
+    </div>
+    <div class="form-row">
+      <label>SCTE Log Level:</label>
+      <select id="cfgScteLogLevel">
+        <option value="info" ${String(cfg.scteLogLevel || 'info').toLowerCase() === 'info' ? 'selected' : ''}>Info</option>
+        <option value="debug" ${String(cfg.scteLogLevel || '').toLowerCase() === 'debug' ? 'selected' : ''}>Debug</option>
+        <option value="warning" ${String(cfg.scteLogLevel || '').toLowerCase() === 'warning' ? 'selected' : ''}>Warning / Error</option>
+      </select>
+    </div>
     <div class="form-row">
       <label>Change Password:</label>
       <input type="password" id="cfgNewPass" placeholder="New password" style="width:160px"/>
@@ -1619,6 +2003,11 @@ async function renderAdminAppSettings(cl) {
             logRotSize:   parseInt(document.getElementById('cfgLogRotSize').value),
             logRetention: parseInt(document.getElementById('cfgLogRetention').value),
             encoderCount: parseInt(document.getElementById('cfgEncoderCount').value),
+          scteGlobalEnabled: document.getElementById('cfgScteGlobalEnabled').value === 'true',
+          scteGlobalRateLimitCount: parseInt(document.getElementById('cfgScteRateCount').value) || 5,
+          scteGlobalRateLimitWindowSec: parseInt(document.getElementById('cfgScteRateWindow').value) || 10,
+          scteGlobalDedupeSeconds: parseInt(document.getElementById('cfgScteDedupe').value) || 30,
+          scteLogLevel: (document.getElementById('cfgScteLogLevel').value || 'info').toLowerCase(),
         });
         if (np) data.adminPass = np;
         await apiPost('/api/admin/config', JSON.stringify(data));

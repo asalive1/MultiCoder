@@ -18,6 +18,8 @@
 #include <set>
 #include <iomanip>
 #include <vector>
+#include <deque>
+#include <unordered_map>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -50,6 +52,8 @@ namespace fs = std::filesystem;
 
 namespace {
 constexpr int kIcecastFailureTimeoutUs = 60 * 1000 * 1000;
+std::mutex g_sidecarDedupMutex;
+std::unordered_map<std::string, int64_t> g_sidecarRecentIds;
 
 std::string trimCopy(const std::string& value) {
     size_t first = value.find_first_not_of(" \t\r\n");
@@ -87,6 +91,159 @@ bool isAacProfileAllowed(const std::string& profile) {
         "aac_low", "aac_he", "aac_he_v2", "mpeg2_aac_low"
     };
     return allowed.find(profile) != allowed.end();
+}
+
+int64_t nowMsEpoch() {
+    return static_cast<int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
+}
+
+bool parseIpv4(const std::string& ip, uint32_t& outHostOrder) {
+    in_addr addr{};
+    if (inet_pton(AF_INET, ip.c_str(), &addr) != 1) return false;
+    outHostOrder = ntohl(addr.s_addr);
+    return true;
+}
+
+bool ipInCidr(const std::string& ip, const std::string& cidrOrIp) {
+    uint32_t ipVal = 0;
+    if (!parseIpv4(ip, ipVal)) return false;
+    size_t slash = cidrOrIp.find('/');
+    if (slash == std::string::npos) {
+        uint32_t one = 0;
+        return parseIpv4(cidrOrIp, one) && one == ipVal;
+    }
+    std::string netStr = cidrOrIp.substr(0, slash);
+    std::string bitsStr = cidrOrIp.substr(slash + 1);
+    int bits = 0;
+    try { bits = std::stoi(bitsStr); } catch (...) { return false; }
+    if (bits < 0 || bits > 32) return false;
+    uint32_t net = 0;
+    if (!parseIpv4(netStr, net)) return false;
+    uint32_t mask = bits == 0 ? 0u : (0xFFFFFFFFu << (32 - bits));
+    return (ipVal & mask) == (net & mask);
+}
+
+std::string makeSocketPeerIp(int cfd) {
+    sockaddr_storage peer{};
+    socklen_t plen = sizeof(peer);
+    if (getpeername(cfd, reinterpret_cast<sockaddr*>(&peer), &plen) != 0) return "";
+    char ipbuf[INET6_ADDRSTRLEN] = {};
+    if (peer.ss_family == AF_INET) {
+        auto* a4 = reinterpret_cast<sockaddr_in*>(&peer);
+        if (inet_ntop(AF_INET, &a4->sin_addr, ipbuf, sizeof(ipbuf))) return ipbuf;
+    } else if (peer.ss_family == AF_INET6) {
+        auto* a6 = reinterpret_cast<sockaddr_in6*>(&peer);
+        if (inet_ntop(AF_INET6, &a6->sin6_addr, ipbuf, sizeof(ipbuf))) return ipbuf;
+    }
+    return "";
+}
+
+std::string makeSocketPeerEndpoint(int cfd) {
+    sockaddr_storage peer{};
+    socklen_t plen = sizeof(peer);
+    if (getpeername(cfd, reinterpret_cast<sockaddr*>(&peer), &plen) != 0) return "unknown";
+    char ipbuf[INET6_ADDRSTRLEN] = {};
+    int port = 0;
+    if (peer.ss_family == AF_INET) {
+        auto* a4 = reinterpret_cast<sockaddr_in*>(&peer);
+        if (!inet_ntop(AF_INET, &a4->sin_addr, ipbuf, sizeof(ipbuf))) std::snprintf(ipbuf, sizeof(ipbuf), "%s", "unknown");
+        port = ntohs(a4->sin_port);
+    } else if (peer.ss_family == AF_INET6) {
+        auto* a6 = reinterpret_cast<sockaddr_in6*>(&peer);
+        if (!inet_ntop(AF_INET6, &a6->sin6_addr, ipbuf, sizeof(ipbuf))) std::snprintf(ipbuf, sizeof(ipbuf), "%s", "unknown");
+        port = ntohs(a6->sin6_port);
+    }
+    return std::string(ipbuf) + ":" + std::to_string(port);
+}
+
+struct CueCommandRow {
+    std::string match;
+    std::string action;
+};
+
+std::vector<CueCommandRow> parseCueCommandRows(const std::string& raw) {
+    std::vector<CueCommandRow> rows;
+    std::string s = trimCopy(raw);
+    if (s.size() < 2 || s.front() != '[' || s.back() != ']') return rows;
+    size_t i = 0;
+    while (i < s.size()) {
+        size_t start = s.find('{', i);
+        if (start == std::string::npos) break;
+        int depth = 0;
+        bool inStr = false;
+        size_t j = start;
+        for (; j < s.size(); ++j) {
+            char c = s[j];
+            if (c == '"' && (j == 0 || s[j - 1] != '\\')) inStr = !inStr;
+            if (inStr) continue;
+            if (c == '{') ++depth;
+            else if (c == '}') {
+                --depth;
+                if (depth == 0) { ++j; break; }
+            }
+        }
+        if (j <= start || j > s.size()) break;
+        simplejson::Object obj;
+        if (obj.parse(s.substr(start, j - start))) {
+            std::string match = trimCopy(obj.getString("match", obj.getString("command", obj.getString("name", ""))));
+            std::string action = trimCopy(obj.getString("action", obj.getString("target", "")));
+            if (!match.empty()) rows.push_back({match, action});
+        }
+        i = j;
+    }
+    return rows;
+}
+
+std::vector<std::string> splitLines(const std::string& text) {
+    std::vector<std::string> out;
+    std::string cur;
+    for (char c : text) {
+        if (c == '\n') {
+            out.push_back(trimCopy(cur));
+            cur.clear();
+        } else if (c != '\r') {
+            cur.push_back(c);
+        }
+    }
+    if (!cur.empty()) out.push_back(trimCopy(cur));
+    return out;
+}
+
+std::string extractCueFromXml(const std::string& xml, const std::vector<std::string>& watchTags) {
+    std::string lowerXml = xml;
+    std::transform(lowerXml.begin(), lowerXml.end(), lowerXml.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    for (const auto& tag : watchTags) {
+        std::string t = tag;
+        std::transform(t.begin(), t.end(), t.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        std::string open = "<" + t + ">";
+        std::string close = "</" + t + ">";
+        size_t b = lowerXml.find(open);
+        if (b == std::string::npos) continue;
+        b += open.size();
+        size_t e = lowerXml.find(close, b);
+        if (e == std::string::npos || e <= b) continue;
+        std::string v = xml.substr(b, e - b);
+        if (!v.empty()) return trimCopy(v);
+    }
+    return "";
+}
+
+bool sidecarIdRecentlySent(const std::string& idempotencyKey, int dedupeSec) {
+    if (idempotencyKey.empty() || dedupeSec <= 0) return false;
+    int64_t nowMs = nowMsEpoch();
+    int64_t cutoff = nowMs - static_cast<int64_t>(dedupeSec) * 1000;
+    std::lock_guard<std::mutex> lk(g_sidecarDedupMutex);
+    for (auto it = g_sidecarRecentIds.begin(); it != g_sidecarRecentIds.end();) {
+        if (it->second < cutoff) it = g_sidecarRecentIds.erase(it);
+        else ++it;
+    }
+    auto it = g_sidecarRecentIds.find(idempotencyKey);
+    if (it != g_sidecarRecentIds.end() && it->second >= cutoff) return true;
+    g_sidecarRecentIds[idempotencyKey] = nowMs;
+    return false;
 }
 }
 
@@ -1648,6 +1805,7 @@ Worker::~Worker() {
     if (m_hlsSegMonThread.joinable()) m_hlsSegMonThread.join();
     if (m_controlThread.joinable()) m_controlThread.join();
     if (m_metaThread.joinable())    m_metaThread.join();
+    if (m_cueThread.joinable())     m_cueThread.join();
     if (m_inputLevelThread.joinable()) m_inputLevelThread.join();
     if (m_gainMonitorThread.joinable()) m_gainMonitorThread.join();
 }
@@ -1687,6 +1845,7 @@ void Worker::run() {
     // Start control and meta listener threads
     m_controlThread = std::thread([this]() { listenControlPort(); });
     m_metaThread    = std::thread([this]() { listenMetaPort();    });
+    m_cueThread     = std::thread([this]() { listenCueTcpPort();  });
     m_inputLevelThread = std::thread([this]() { monitorInputLevels(); });
     m_gainMonitorThread = std::thread([this]() { monitorGainChanges(); });
 
@@ -1720,6 +1879,7 @@ void Worker::publishStreamHealth() {
     rt.setBool("workerHlsRunning", m_hlsRunning.load());
     rt.setBool("workerSrtRunning", m_srtRunning.load());
     rt.setBool("controlListenerRunning", m_controlListenerRunning.load());
+    rt.setBool("cueListenerRunning", m_cueListenerRunning.load());
     writeRuntimeState(m_cfgDir, rt);
 }
 
@@ -1928,7 +2088,11 @@ void Worker::startSRTInputRelay() {
         "-f", "s16le", relayUri
     };
 
-    log("SRT input relay starting â€” " + srtUri + " -> " + relayUri);
+    log("SRT input relay preparing connection");
+    log("SRT input relay mode: " + mode);
+    log("SRT input relay configured latency: " + std::to_string(latency) + " ms");
+    log("SRT input relay source URI: " + maskSrtUriPassphrase(srtUri));
+    log("SRT input relay target URI: " + relayUri);
     void* h = launchFfmpeg(args, "SRTInputRelay");
     m_srtInputRelayProc = h;
     if (!h) {
@@ -1946,6 +2110,7 @@ void Worker::startSRTInputRelay() {
         writeRuntimeState(m_cfgDir, rt);
     }
     log("SRT input relay active â€” mode=" + mode + " srtPort=" + std::to_string(srtPort)
+        + " latency=" + std::to_string(latency) + "ms"
         + " relayPort=" + std::to_string(relayPort));
 }
 
@@ -2088,6 +2253,7 @@ std::vector<std::string> Worker::buildFfmpegInputArgs() {
             // Read raw PCM s16le from relay multicast on loopback
             std::string relayUri = "udp://" + relayAddr + ":" + std::to_string(relayPort)
                                  + "?localaddr=127.0.0.1";
+            log("SRT input path: using relay URI " + relayUri);
             args = {"-f", "s16le", "-ar", "48000", "-ac", "2",
                     "-i", relayUri};
         } else {
@@ -2107,6 +2273,9 @@ std::vector<std::string> Worker::buildFfmpegInputArgs() {
             if (!streamId.empty()) uri += "&streamid="  + streamId;
             if (pbkeylen > 0)      uri += "&pbkeylen="  + std::to_string(pbkeylen);
             if (!pass.empty())     uri += "&passphrase=" + pass;
+            log("SRT input path: direct fallback mode active");
+            log("SRT input direct fallback latency: " + std::to_string(latency) + " ms");
+            log("SRT input direct fallback URI: " + maskSrtUriPassphrase(uri));
             args = {"-re", "-i", uri};
         }
     } else {
@@ -3354,6 +3523,231 @@ void Worker::serveHlsHttp(int port, const std::string& hlsDir) {
 
 // ---------- control port listener ----------
 
+bool Worker::executeControlCommand(const std::string& cmd,
+                                   const std::string& source,
+                                   const std::string& eventId,
+                                   const std::string& cueValue) {
+    bool known = (cmd == "StartAAC" || cmd == "StopAAC" ||
+                  cmd == "StartMP3" || cmd == "StopMP3" ||
+                  cmd == "StartHLS" || cmd == "StopHLS" ||
+                  cmd == "StartSRT" || cmd == "StopSRT" ||
+                  cmd == "StartSRTInput" || cmd == "StopSRTInput");
+    if (!known) return false;
+
+    if      (cmd == "StartAAC")       startAAC();
+    else if (cmd == "StopAAC")        stopAAC();
+    else if (cmd == "StartMP3")       startMP3();
+    else if (cmd == "StopMP3")        stopMP3();
+    else if (cmd == "StartHLS")       startHLS();
+    else if (cmd == "StopHLS")        stopHLS();
+    else if (cmd == "StartSRT")       startSRT();
+    else if (cmd == "StopSRT")        stopSRT();
+    else if (cmd == "StartSRTInput")  startSRTInputRelay();
+    else if (cmd == "StopSRTInput")   stopSRTInputRelay();
+
+    bool isScteAction = false;
+    {
+        simplejson::Object metaCfg = readJsonFile(m_cfgDir + "/metadata.json");
+        simplejson::Object scte = metaCfg.getSubObject("scte");
+        auto rows = parseCueCommandRows(scte.getRawValue("commandRows", "[]"));
+        for (const auto& r : rows) {
+            if (trimCopy(r.action) == cmd) {
+                isScteAction = true;
+                break;
+            }
+        }
+    }
+
+    if (isScteAction) {
+        simplejson::Object srtCfg = readJsonFile(m_cfgDir + "/srt.json");
+        bool primaryLikelyAvailable = m_srtRunning.load() && srtCfg.getBool("scteEnabled", false);
+        emitScteSidecarEvent(cmd, eventId, cueValue, source, primaryLikelyAvailable);
+    }
+
+    return true;
+}
+
+void Worker::emitScteSidecarEvent(const std::string& action,
+                                  const std::string& eventId,
+                                  const std::string& cueValue,
+                                  const std::string& source,
+                                  bool primaryPathLikelyAvailable) {
+    simplejson::Object srtCfg = readJsonFile(m_cfgDir + "/srt.json");
+    simplejson::Object sidecar = srtCfg.getSubObject("sidecar");
+    if (!sidecar.getBool("enabled", false)) return;
+
+    std::string url = trimCopy(sidecar.getString("url", ""));
+    if (url.empty()) {
+        log("SCTE sidecar skipped: sidecar enabled but URL is empty");
+        return;
+    }
+    std::string mode = lowerCopy(trimCopy(sidecar.getString("mode", "mirror")));
+    if (mode != "fallback") mode = "mirror";
+    if (mode == "fallback" && primaryPathLikelyAvailable) {
+        log("SCTE sidecar fallback skipped: primary path appears available");
+        return;
+    }
+
+    int retries = clampInt(sidecar.getInt("retries", 3), 0, 20);
+    std::string transport = lowerCopy(trimCopy(sidecar.getString("transport", "http-json")));
+    if (transport != "http-json") {
+        log("SCTE sidecar skipped: unsupported transport '" + transport + "'");
+        return;
+    }
+
+    simplejson::Object metaCfg = readJsonFile(m_cfgDir + "/metadata.json");
+    simplejson::Object scte = metaCfg.getSubObject("scte");
+    int dedupeSec = scte.getInt("dedupeSeconds", 30);
+    if (dedupeSec < 0) dedupeSec = 0;
+
+    std::string resolvedEventId = trimCopy(eventId);
+    if (resolvedEventId.empty()) {
+        resolvedEventId = "enc" + std::to_string(m_idx) + "-" + std::to_string(nowMsEpoch());
+    }
+    std::string idempotencyKey = "enc=" + std::to_string(m_idx) + "|event=" + resolvedEventId + "|action=" + action;
+
+    if (sidecarIdRecentlySent(idempotencyKey, dedupeSec)) {
+        log("SCTE sidecar deduped (idempotency key seen recently): " + idempotencyKey);
+        return;
+    }
+
+    std::string ts = timestamp();
+    std::string payload =
+        std::string("{") +
+        "\"eventId\":\"" + jsonEscapeCompact(resolvedEventId) + "\"," +
+        "\"timestamp\":\"" + jsonEscapeCompact(ts) + "\"," +
+        "\"action\":\"" + jsonEscapeCompact(action) + "\"," +
+        "\"cue\":\"" + jsonEscapeCompact(cueValue) + "\"," +
+        "\"source\":\"" + jsonEscapeCompact(source) + "\"," +
+        "\"encoderId\":" + std::to_string(m_idx) +
+        "}";
+
+    std::thread([this, url, payload, idempotencyKey, retries, action]() {
+        auto sendOne = [this](const std::string& targetUrl,
+                              const std::string& body,
+                              const std::string& idemKey,
+                              int& statusCode,
+                              std::string& err) -> bool {
+            statusCode = 0;
+            err.clear();
+
+            std::string u = trimCopy(targetUrl);
+            std::string proto = "http://";
+            if (u.rfind(proto, 0) != 0) {
+                err = "only http:// URLs supported";
+                return false;
+            }
+            std::string rest = u.substr(proto.size());
+            size_t slash = rest.find('/');
+            std::string hostPort = (slash == std::string::npos) ? rest : rest.substr(0, slash);
+            std::string path = (slash == std::string::npos) ? "/" : rest.substr(slash);
+            std::string host = hostPort;
+            int port = 80;
+            size_t colon = hostPort.rfind(':');
+            if (colon != std::string::npos) {
+                host = hostPort.substr(0, colon);
+                try { port = std::stoi(hostPort.substr(colon + 1)); }
+                catch (...) { err = "invalid sidecar port"; return false; }
+            }
+            if (host.empty()) { err = "sidecar host empty"; return false; }
+
+            std::string req =
+                "POST " + path + " HTTP/1.1\r\n" +
+                "Host: " + host + "\r\n" +
+                "Content-Type: application/json\r\n" +
+                "X-Idempotency-Key: " + idemKey + "\r\n" +
+                "Connection: close\r\n" +
+                "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" +
+                body;
+
+            addrinfo hints{};
+            hints.ai_family = AF_UNSPEC;
+            hints.ai_socktype = SOCK_STREAM;
+            hints.ai_protocol = IPPROTO_TCP;
+            addrinfo* res = nullptr;
+            std::string portStr = std::to_string(port);
+            if (getaddrinfo(host.c_str(), portStr.c_str(), &hints, &res) != 0 || !res) {
+                err = "sidecar resolve failed";
+                return false;
+            }
+
+            bool ok = false;
+            for (addrinfo* p = res; p; p = p->ai_next) {
+                int sock = static_cast<int>(::socket(p->ai_family, p->ai_socktype, p->ai_protocol));
+                if (sock < 0) continue;
+#ifdef _WIN32
+                DWORD tv = 2500;
+                setsockopt((SOCKET)sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
+                setsockopt((SOCKET)sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+#else
+                struct timeval tv{2, 500000};
+                setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+                setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+                if (::connect(sock, p->ai_addr, static_cast<int>(p->ai_addrlen)) != 0) {
+                    close_socket(sock);
+                    continue;
+                }
+#ifdef _WIN32
+                int sendFlags = 0;
+#else
+                int sendFlags = MSG_NOSIGNAL;
+#endif
+                ssize_t sent = ::send(sock, req.c_str(), static_cast<int>(req.size()), sendFlags);
+                if (sent <= 0) {
+                    close_socket(sock);
+                    continue;
+                }
+                char resp[512] = {};
+                ssize_t n = ::recv(sock, resp, sizeof(resp) - 1, 0);
+                close_socket(sock);
+                if (n <= 0) continue;
+                std::string line(resp, static_cast<size_t>(n));
+                size_t eol = line.find('\n');
+                if (eol != std::string::npos) line = line.substr(0, eol);
+                auto p1 = line.find(' ');
+                if (p1 != std::string::npos) {
+                    auto p2 = line.find(' ', p1 + 1);
+                    try {
+                        statusCode = std::stoi(line.substr(p1 + 1, p2 == std::string::npos ? std::string::npos : p2 - p1 - 1));
+                    } catch (...) {
+                        statusCode = 0;
+                    }
+                }
+                ok = statusCode >= 200 && statusCode < 300;
+                if (!ok && statusCode > 0) {
+                    err = "HTTP " + std::to_string(statusCode);
+                }
+                break;
+            }
+
+            freeaddrinfo(res);
+            if (!ok && err.empty()) err = "connect/send failed";
+            return ok;
+        };
+
+        bool delivered = false;
+        int status = 0;
+        std::string err;
+        for (int attempt = 0; attempt <= retries; ++attempt) {
+            if (sendOne(url, payload, idempotencyKey, status, err)) {
+                delivered = true;
+                log("SCTE sidecar POST success action=" + action + " status=" + std::to_string(status)
+                    + " attempt=" + std::to_string(attempt + 1));
+                break;
+            }
+            log("SCTE sidecar POST failed action=" + action + " attempt=" + std::to_string(attempt + 1)
+                + " err=" + err);
+            if (attempt < retries) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(250 * (attempt + 1)));
+            }
+        }
+        if (!delivered) {
+            logSys("SCTE sidecar POST giving up action=" + action + " after " + std::to_string(retries + 1) + " attempts");
+        }
+    }).detach();
+}
+
 void Worker::listenControlPort() {
     // Read control port from /etc/encoder{N}/control.json
     // Default: 9100 + (encoderIdx - 1) * 10
@@ -3419,16 +3813,10 @@ void Worker::listenControlPort() {
                 const char* ack = "OK\n";
                 send(cfd, ack, 3, MSG_NOSIGNAL);
 
-                if      (cmd == "StartAAC")       startAAC();
-                else if (cmd == "StopAAC")        stopAAC();
-                else if (cmd == "StartMP3")       startMP3();
-                else if (cmd == "StopMP3")        stopMP3();
-                else if (cmd == "StartHLS")       startHLS();
-                else if (cmd == "StopHLS")        stopHLS();
-                else if (cmd == "StartSRT")       startSRT();
-                else if (cmd == "StopSRT")        stopSRT();
-                else if (cmd == "StartSRTInput")  startSRTInputRelay();
-                else if (cmd == "StopSRTInput")   stopSRTInputRelay();
+                simplejson::Object rt = readRuntimeState(m_cfgDir);
+                std::string ev = rt.getString("sessionScteEventId", "");
+                std::string cue = rt.getString("sessionScteCue", "");
+                executeControlCommand(cmd, "control", ev, cue);
             } else {
                 log("Unknown control command: " + cmd);
                 const char* nack = "ERR\n";
@@ -3439,6 +3827,339 @@ void Worker::listenControlPort() {
     }
     close_socket(sfd);
     m_controlListenerRunning = false;
+    publishStreamHealth();
+}
+
+void Worker::listenCueTcpPort() {
+    enum class CueFraming { NewlineDelimited, LengthPrefixed };
+
+    struct CueRuntime {
+        std::deque<int64_t> recentTimes;
+        std::unordered_map<std::string, int64_t> byCue;
+    };
+    static std::mutex s_cueMutex;
+    static std::unordered_map<int, CueRuntime> s_cueRuntime;
+
+    int listenSfd = -1;
+    int activePort = 0;
+    m_cueListenerRunning = false;
+
+    auto closeSock = [&]() {
+        if (listenSfd >= 0) {
+            close_socket(listenSfd);
+            listenSfd = -1;
+            activePort = 0;
+        }
+    };
+
+    auto writeScteRuntime = [this](const std::string& key, const std::string& value) {
+        std::string path = m_cfgDir + "/metadata_runtime.json";
+        simplejson::Object rt = readJsonFile(path);
+        rt.setString(key, value);
+        std::ofstream f(path, std::ios::trunc);
+        f << rt.serialize();
+    };
+
+    auto isAllowlisted = [](const std::string& ip, bool enabled, const std::vector<std::string>& entries) {
+        if (!enabled) return true;
+        if (ip.empty()) return false;
+        for (const auto& e : entries) {
+            if (ipInCidr(ip, trimCopy(e))) return true;
+        }
+        return false;
+    };
+
+    auto findMatchedAction = [](const std::string& cue, const std::vector<CueCommandRow>& rows) -> std::string {
+        for (const auto& r : rows) {
+            if (r.match == cue) return r.action;
+        }
+        return "";
+    };
+
+    auto parseFramedMessages = [](CueFraming framing, std::string& buf, std::vector<std::string>& out) {
+        out.clear();
+        if (framing == CueFraming::NewlineDelimited) {
+            size_t pos = 0;
+            while (true) {
+                size_t nl = buf.find('\n', pos);
+                if (nl == std::string::npos) break;
+                std::string line = trimCopy(buf.substr(pos, nl - pos));
+                if (!line.empty()) out.push_back(line);
+                pos = nl + 1;
+            }
+            if (pos > 0) buf.erase(0, pos);
+            return;
+        }
+
+        // Length-prefixed framing: 4-byte big-endian payload length + payload.
+        size_t offset = 0;
+        while (buf.size() - offset >= 4) {
+            const unsigned char* p = reinterpret_cast<const unsigned char*>(buf.data() + offset);
+            uint32_t len = (static_cast<uint32_t>(p[0]) << 24) |
+                           (static_cast<uint32_t>(p[1]) << 16) |
+                           (static_cast<uint32_t>(p[2]) << 8) |
+                           static_cast<uint32_t>(p[3]);
+            if (len > 1024 * 1024) {
+                // Guard against malformed framing.
+                buf.clear();
+                break;
+            }
+            if (buf.size() - offset < static_cast<size_t>(4 + len)) break;
+            std::string payload = trimCopy(buf.substr(offset + 4, len));
+            if (!payload.empty()) out.push_back(payload);
+            offset += 4 + len;
+        }
+        if (offset > 0) buf.erase(0, offset);
+    };
+
+    auto processCueMessage = [this, &writeScteRuntime, &findMatchedAction, &isAllowlisted](
+                                const std::string& msg,
+                                const std::string& peerIp,
+                                const std::string& peerEndpoint,
+                                const simplejson::Object& scteCfg,
+                                const simplejson::Object& sysCfg) {
+        simplejson::Object req;
+        bool isJson = req.parse(msg);
+
+        std::vector<std::string> watchTags = jsonArrayStrings(scteCfg.getRawValue("watchTags", "[\"SCTE\",\"Event_ID\",\"Event_Duration\"]"));
+        if (watchTags.empty()) watchTags = {"SCTE", "Event_ID", "Event_Duration"};
+
+        std::string cueValue;
+        std::string eventId;
+        std::string token;
+        if (isJson) {
+            static const char* keys[] = {"command", "cue", "action", "event", "eventName", "scte", "message", "name"};
+            for (const char* k : keys) {
+                cueValue = trimCopy(req.getString(k, ""));
+                if (!cueValue.empty()) break;
+            }
+            eventId = trimCopy(req.getString("eventId", req.getString("event_id", "")));
+            token = trimCopy(req.getString("token", ""));
+        } else if (msg.find('<') != std::string::npos) {
+            cueValue = extractCueFromXml(msg, watchTags);
+            eventId = trimCopy(xmlField(msg, {"Event_ID"}));
+            token = trimCopy(xmlField(msg, {"Token"}));
+        } else {
+            cueValue = trimCopy(msg);
+        }
+
+        std::string deliveryType = lowerCopy(trimCopy(scteCfg.getString("cueDeliveryType", "json")));
+        if (deliveryType.empty()) deliveryType = "json";
+        bool allowsJson = (deliveryType == "json" || deliveryType == "both");
+        bool allowsXml = (deliveryType == "xml" || deliveryType == "both");
+        if ((isJson && !allowsJson) || (!isJson && msg.find('<') != std::string::npos && !allowsXml)) {
+            log("SCTE TCP cue rejected: delivery type disallows payload from " + peerEndpoint);
+            writeScteRuntime("lastScteRejected", "delivery-type");
+            return;
+        }
+
+        bool requireEventId = scteCfg.getBool("requireEventId", false);
+        bool requireToken = scteCfg.getBool("requireToken", false);
+        std::string expectedToken = trimCopy(scteCfg.getString("token", ""));
+
+        if (cueValue.empty()) {
+            log("SCTE TCP cue rejected: empty cue payload from " + peerEndpoint);
+            writeScteRuntime("lastScteRejected", "empty-cue");
+            return;
+        }
+        if (requireEventId && eventId.empty()) {
+            log("SCTE TCP cue rejected: Event ID required for cue '" + cueValue + "'");
+            writeScteRuntime("lastScteRejected", "event-id-required");
+            return;
+        }
+        if (requireToken && (expectedToken.empty() || token != expectedToken)) {
+            log("SCTE TCP cue rejected: token required/mismatch for cue '" + cueValue + "'");
+            writeScteRuntime("lastScteRejected", "token-mismatch");
+            return;
+        }
+
+        bool whitelistEnabled = scteCfg.getBool("whitelistEnabled", false);
+        std::vector<std::string> whitelistEntries = jsonArrayStrings(scteCfg.getRawValue("whitelistEntries", "[]"));
+        if (!isAllowlisted(peerIp, whitelistEnabled, whitelistEntries)) {
+            log("SCTE TCP cue rejected: source not allowlisted " + peerEndpoint);
+            writeScteRuntime("lastScteRejected", "allowlist");
+            return;
+        }
+
+        int globalRateCount = sysCfg.getInt("scteGlobalRateLimitCount", 5);
+        int globalRateWindowSec = sysCfg.getInt("scteGlobalRateLimitWindowSec", 10);
+        int globalDedupeSec = sysCfg.getInt("scteGlobalDedupeSeconds", 30);
+        bool overrideRate = scteCfg.getBool("overrideRateLimit", false);
+        bool overrideDedupe = scteCfg.getBool("overrideDedupe", false);
+        int rateCount = overrideRate ? scteCfg.getInt("rateLimitCount", globalRateCount) : globalRateCount;
+        int rateWindowSec = overrideRate ? scteCfg.getInt("rateLimitWindowSec", globalRateWindowSec) : globalRateWindowSec;
+        int dedupeSec = overrideDedupe ? scteCfg.getInt("dedupeSeconds", globalDedupeSec) : globalDedupeSec;
+        rateCount = clampInt(rateCount, 1, 10000);
+        rateWindowSec = clampInt(rateWindowSec, 1, 3600);
+        dedupeSec = clampInt(dedupeSec, 0, 86400);
+
+        int64_t nowMs = nowMsEpoch();
+        {
+            std::lock_guard<std::mutex> lk(s_cueMutex);
+            CueRuntime& rt = s_cueRuntime[m_idx];
+            int64_t floorMs = nowMs - static_cast<int64_t>(rateWindowSec) * 1000;
+            while (!rt.recentTimes.empty() && rt.recentTimes.front() < floorMs) rt.recentTimes.pop_front();
+            if (static_cast<int>(rt.recentTimes.size()) >= rateCount) {
+                log("SCTE TCP cue rejected: rate limit exceeded for cue '" + cueValue + "'");
+                writeScteRuntime("lastScteRejected", "rate-limit");
+                return;
+            }
+            auto it = rt.byCue.find(cueValue);
+            if (it != rt.byCue.end() && dedupeSec > 0 && (nowMs - it->second) < static_cast<int64_t>(dedupeSec) * 1000) {
+                log("SCTE TCP cue deduped/replay-rejected: " + cueValue);
+                writeScteRuntime("lastScteRejected", "dedupe");
+                return;
+            }
+            rt.recentTimes.push_back(nowMs);
+            rt.byCue[cueValue] = nowMs;
+        }
+
+        std::vector<CueCommandRow> rows = parseCueCommandRows(scteCfg.getRawValue("commandRows", "[]"));
+        if (rows.empty()) {
+            rows = {
+                {"BREAK", "START_BREAK"},
+                {"END_BREAK", "END_BREAK"},
+                {"LEGAL_ID", "LEGAL_ID"},
+                {"START_BREAK", "START_BREAK"},
+                {"END_BREAK_NOW", "END_BREAK_NOW"}
+            };
+        }
+
+        writeScteRuntime("lastScteReceived", cueValue);
+        std::string action = findMatchedAction(cueValue, rows);
+        if (action.empty()) {
+            log("SCTE TCP cue: No Matching Command for '" + cueValue + "'");
+            writeScteRuntime("lastScteRejected", "no-match");
+            return;
+        }
+
+        std::string passMode = lowerCopy(trimCopy(scteCfg.getString("passthroughMode", "pass-through")));
+        if (passMode == "off") {
+            log("SCTE TCP cue matched but passthrough OFF: " + cueValue + " -> " + action);
+            writeScteRuntime("lastScteRejected", "passthrough-off");
+            return;
+        }
+
+        if (executeControlCommand(action, "cue-tcp", eventId, cueValue)) {
+            log("SCTE TCP cue matched and executed: " + cueValue + " -> " + action);
+            writeScteRuntime("lastScteSent", action);
+        } else {
+            log("SCTE TCP cue matched but action unknown: " + cueValue + " -> " + action);
+            writeScteRuntime("lastScteRejected", "unknown-action");
+        }
+    };
+
+    while (m_running) {
+        simplejson::Object metaCfg = readJsonFile(m_cfgDir + "/metadata.json");
+        simplejson::Object scteCfg = metaCfg.getSubObject("scte");
+        simplejson::Object sysCfg = readJsonFile("/etc/MC/system.json");
+        bool globalEnabled = sysCfg.getBool("scteGlobalEnabled", true);
+        bool enabled = scteCfg.getBool("enabled", false) && scteCfg.getBool("listenEnabled", false) && globalEnabled;
+        std::string transport = lowerCopy(trimCopy(scteCfg.getString("listenTransport", "http")));
+        if (transport.empty()) transport = "http";
+        bool tcpEnabled = (transport == "tcp" || transport == "both");
+        int listenPort = scteCfg.getInt("listenPort", 9040 + m_idx);
+        listenPort = clampInt(listenPort, 1, 65535);
+        std::string framingRaw = lowerCopy(trimCopy(scteCfg.getString("tcpFraming", "newline")));
+        CueFraming framing = (framingRaw == "length-prefixed") ? CueFraming::LengthPrefixed : CueFraming::NewlineDelimited;
+
+        if (!(enabled && tcpEnabled)) {
+            if (m_cueListenerRunning.load()) {
+                log("SCTE TCP cue listener stopped");
+            }
+            closeSock();
+            m_cueListenerRunning = false;
+            publishStreamHealth();
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            continue;
+        }
+
+        if (listenSfd < 0 || activePort != listenPort) {
+            closeSock();
+            listenSfd = socket(AF_INET, SOCK_STREAM, 0);
+            if (listenSfd < 0) {
+                log("SCTE TCP cue listener socket() failed");
+                std::this_thread::sleep_for(std::chrono::milliseconds(700));
+                continue;
+            }
+            int opt = 1;
+#ifdef _WIN32
+            setsockopt(listenSfd, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
+#else
+            setsockopt(listenSfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+#endif
+            sockaddr_in addr{};
+            addr.sin_family = AF_INET;
+            addr.sin_addr.s_addr = htonl(INADDR_ANY);
+            addr.sin_port = htons(static_cast<uint16_t>(listenPort));
+            if (bind(listenSfd, (sockaddr*)&addr, sizeof(addr)) < 0) {
+                log("SCTE TCP cue listener bind() failed on port " + std::to_string(listenPort));
+                closeSock();
+                std::this_thread::sleep_for(std::chrono::milliseconds(900));
+                continue;
+            }
+            listen(listenSfd, 8);
+            activePort = listenPort;
+            m_cueListenerRunning = true;
+            publishStreamHealth();
+            log("SCTE TCP cue listener running on port " + std::to_string(listenPort)
+                + " framing=" + (framing == CueFraming::LengthPrefixed ? "length-prefixed" : "newline"));
+        }
+
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(listenSfd, &fds);
+        timeval tv{1, 0};
+        int sel = select(listenSfd + 1, &fds, nullptr, nullptr, &tv);
+        if (sel <= 0) continue;
+
+        int cfd = accept(listenSfd, nullptr, nullptr);
+        if (cfd < 0) continue;
+
+        std::string peerEp = makeSocketPeerEndpoint(cfd);
+        std::string peerIp = makeSocketPeerIp(cfd);
+        log("SCTE TCP cue client connected: " + peerEp);
+
+        std::string buf;
+        char chunk[4096];
+        while (m_running) {
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(cfd, &rfds);
+            timeval ctv{1, 0};
+            int rc = select(cfd + 1, &rfds, nullptr, nullptr, &ctv);
+            if (rc < 0) break;
+            if (rc == 0) continue;
+            ssize_t n = recv(cfd, chunk, sizeof(chunk), 0);
+            if (n <= 0) break;
+            buf.append(chunk, static_cast<size_t>(n));
+
+            std::vector<std::string> msgs;
+            parseFramedMessages(framing, buf, msgs);
+            if (msgs.empty()) continue;
+
+            simplejson::Object metaNow = readJsonFile(m_cfgDir + "/metadata.json");
+            simplejson::Object scteNow = metaNow.getSubObject("scte");
+            simplejson::Object sysNow = readJsonFile("/etc/MC/system.json");
+            for (const auto& m : msgs) {
+                processCueMessage(m, peerIp, peerEp, scteNow, sysNow);
+            }
+        }
+
+        if (!buf.empty() && framing == CueFraming::NewlineDelimited) {
+            simplejson::Object metaNow = readJsonFile(m_cfgDir + "/metadata.json");
+            simplejson::Object scteNow = metaNow.getSubObject("scte");
+            simplejson::Object sysNow = readJsonFile("/etc/MC/system.json");
+            std::string tail = trimCopy(buf);
+            if (!tail.empty()) processCueMessage(tail, peerIp, peerEp, scteNow, sysNow);
+        }
+
+        close_socket(cfd);
+        log("SCTE TCP cue client disconnected: " + peerEp);
+    }
+
+    closeSock();
+    m_cueListenerRunning = false;
     publishStreamHealth();
 }
 

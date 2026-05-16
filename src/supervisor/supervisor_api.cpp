@@ -11,12 +11,14 @@
 #include <fstream>
 #include <iostream>
 #include <iomanip>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <signal.h>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 #include <chrono>
 #include <ctime>
@@ -103,6 +105,14 @@ struct EncoderState {
 static std::mutex g_stateMutex;
 static EncoderState g_encoders[MAX_ENCODERS];
 
+struct CueRuntimeState {
+    std::deque<int64_t> recentCueTimesMs;
+    std::unordered_map<std::string, int64_t> lastByMatch;
+};
+
+static std::mutex g_cueStateMutex;
+static std::map<int, CueRuntimeState> g_cueStates;
+
 static std::string runtimeStatePath(int encoderOneBased) {
     return "/etc/encoder" + std::to_string(encoderOneBased) + "/runtime_state.json";
 }
@@ -119,6 +129,31 @@ static std::string nowIsoUtc() {
     char buf[32];
     strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm_utc);
     return std::string(buf);
+}
+
+static std::string envValue(const char* name) {
+#ifdef _WIN32
+    char* buf = nullptr;
+    size_t len = 0;
+    if (_dupenv_s(&buf, &len, name) != 0 || !buf) return "";
+    std::string out(buf);
+    free(buf);
+    return out;
+#else
+    const char* v = std::getenv(name);
+    return v ? std::string(v) : std::string();
+#endif
+}
+
+static std::string errnoMessage(int err) {
+#ifdef _WIN32
+    char buf[256] = {};
+    strerror_s(buf, sizeof(buf), err);
+    return std::string(buf);
+#else
+    const char* s = strerror(err);
+    return s ? std::string(s) : std::string("unknown error");
+#endif
 }
 
 static void appendSysLog(int encoderOneBased, const std::string& message) {
@@ -642,9 +677,13 @@ static std::string summarizeInputConfig(const simplejson::Object& o, const std::
         ss << "Audio Device: " << (audioDevice.empty() ? "Default" : audioDevice)
            << " @ " << sampleRate << " Hz, Gain " << gainDb << " dB";
     } else if (inputType == "srt") {
-        std::string host = o.getString("srtHost", "");
-        int port = o.getInt("srtPort", 0);
+          std::string host = o.getString(prefix + "SrtHost", o.getString("srtHost", ""));
+          int port = o.getInt(prefix + "SrtPort", o.getInt("srtPort", 0));
+          int latency = o.getInt(prefix + "SrtLatency", o.getInt("srtLatency", 120));
+          std::string mode = o.getString(prefix + "SrtMode", o.getString("srtMode", "caller"));
         ss << "SRT Input: " << (host.empty() ? "(host unset)" : host) << ":" << port
+              << ", mode=" << mode
+              << ", latency=" << latency << " ms"
            << ", Gain " << gainDb << " dB";
     } else {
         std::string tag = (inputType == "axia") ? "Axia/RTP" : "RTP";
@@ -658,10 +697,12 @@ static std::string summarizeInputConfig(const simplejson::Object& o, const std::
 
 static std::string uiAssetPath(const std::string& fileName) {
     std::vector<std::string> roots;
-    if (const char* envRoot = std::getenv("MULTICODER_UI_ROOT")) {
+    std::string envRoot = envValue("MULTICODER_UI_ROOT");
+    if (!envRoot.empty()) {
         roots.emplace_back(envRoot);
     }
-    if (const char* envRoot = std::getenv("MC_UI_ROOT")) {
+    envRoot = envValue("MC_UI_ROOT");
+    if (!envRoot.empty()) {
         roots.emplace_back(envRoot);
     }
     roots.emplace_back("/opt/multicoder/www");
@@ -788,6 +829,172 @@ static std::string jsonEscape(const std::string& in) {
         }
     }
     return out;
+}
+
+static std::string trimCopy(const std::string& s) {
+    size_t b = 0;
+    while (b < s.size() && std::isspace(static_cast<unsigned char>(s[b]))) ++b;
+    size_t e = s.size();
+    while (e > b && std::isspace(static_cast<unsigned char>(s[e - 1]))) --e;
+    return s.substr(b, e - b);
+}
+
+static std::string lowerCopy(const std::string& s) {
+    std::string out = s;
+    for (char& c : out) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return out;
+}
+
+static int64_t nowMsEpoch() {
+    return static_cast<int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
+}
+
+static std::string parseHeader(const std::string& req, const std::string& keyName) {
+    std::string needle = lowerCopy(keyName);
+    std::istringstream is(req);
+    std::string line;
+    std::getline(is, line); // request line
+    while (std::getline(is, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty()) break;
+        size_t colon = line.find(':');
+        if (colon == std::string::npos) continue;
+        std::string k = lowerCopy(trimCopy(line.substr(0, colon)));
+        if (k != needle) continue;
+        return trimCopy(line.substr(colon + 1));
+    }
+    return "";
+}
+
+static std::vector<std::string> parseJsonStringArray(const std::string& raw) {
+    std::vector<std::string> out;
+    std::string s = trimCopy(raw);
+    if (s.size() < 2 || s.front() != '[' || s.back() != ']') return out;
+    size_t i = 1;
+    while (i + 1 < s.size()) {
+        while (i + 1 < s.size() && (std::isspace(static_cast<unsigned char>(s[i])) || s[i] == ',')) ++i;
+        if (i + 1 >= s.size() || s[i] != '"') { ++i; continue; }
+        ++i;
+        std::string val;
+        while (i < s.size() && s[i] != '"') {
+            if (s[i] == '\\' && i + 1 < s.size()) {
+                ++i;
+                val.push_back(s[i]);
+                ++i;
+            } else {
+                val.push_back(s[i]);
+                ++i;
+            }
+        }
+        if (i < s.size() && s[i] == '"') ++i;
+        if (!val.empty()) out.push_back(val);
+    }
+    return out;
+}
+
+struct CueCommandRow {
+    std::string match;
+    std::string action;
+};
+
+static std::vector<CueCommandRow> parseCueCommandRows(const std::string& raw) {
+    std::vector<CueCommandRow> rows;
+    std::string s = trimCopy(raw);
+    if (s.size() < 2 || s.front() != '[' || s.back() != ']') return rows;
+
+    size_t i = 0;
+    while (i < s.size()) {
+        size_t start = s.find('{', i);
+        if (start == std::string::npos) break;
+        int depth = 0;
+        bool inStr = false;
+        size_t j = start;
+        for (; j < s.size(); ++j) {
+            char c = s[j];
+            if (c == '"' && (j == 0 || s[j - 1] != '\\')) inStr = !inStr;
+            if (inStr) continue;
+            if (c == '{') ++depth;
+            else if (c == '}') {
+                --depth;
+                if (depth == 0) { ++j; break; }
+            }
+        }
+        if (j <= start || j > s.size()) break;
+        simplejson::Object o;
+        if (o.parse(s.substr(start, j - start))) {
+            std::string match = o.getString("match", o.getString("command", o.getString("name", "")));
+            std::string action = o.getString("action", o.getString("target", ""));
+            if (!match.empty()) rows.push_back({match, action});
+        }
+        i = j;
+    }
+
+    return rows;
+}
+
+static bool parseIpv4(const std::string& ip, uint32_t& outHostOrder) {
+    in_addr addr{};
+    if (inet_pton(AF_INET, ip.c_str(), &addr) != 1) return false;
+    outHostOrder = ntohl(addr.s_addr);
+    return true;
+}
+
+static bool ipInCidr(const std::string& ip, const std::string& cidrOrIp) {
+    uint32_t ipVal = 0;
+    if (!parseIpv4(ip, ipVal)) return false;
+    size_t slash = cidrOrIp.find('/');
+    if (slash == std::string::npos) {
+        uint32_t single = 0;
+        return parseIpv4(cidrOrIp, single) && single == ipVal;
+    }
+    std::string netStr = cidrOrIp.substr(0, slash);
+    std::string bitsStr = cidrOrIp.substr(slash + 1);
+    int bits = 0;
+    try { bits = std::stoi(bitsStr); } catch (...) { return false; }
+    if (bits < 0 || bits > 32) return false;
+    uint32_t net = 0;
+    if (!parseIpv4(netStr, net)) return false;
+    uint32_t mask = bits == 0 ? 0u : (0xFFFFFFFFu << (32 - bits));
+    return (ipVal & mask) == (net & mask);
+}
+
+static bool isAllowedByWhitelist(const std::string& clientIp,
+                                 bool whitelistEnabled,
+                                 const std::vector<std::string>& entries) {
+    if (!whitelistEnabled) return true;
+    if (clientIp.empty()) return false;
+    for (const auto& e : entries) {
+        if (ipInCidr(clientIp, trimCopy(e))) return true;
+    }
+    return false;
+}
+
+static std::string extractCueValueFromXml(const std::string& xml,
+                                          const std::vector<std::string>& watchTags) {
+    for (const auto& tag : watchTags) {
+        if (tag.empty()) continue;
+        std::string open = "<" + tag + ">";
+        std::string close = "</" + tag + ">";
+        size_t p1 = xml.find(open);
+        if (p1 == std::string::npos) continue;
+        p1 += open.size();
+        size_t p2 = xml.find(close, p1);
+        if (p2 == std::string::npos) continue;
+        return xml.substr(p1, p2 - p1);
+    }
+    return "";
+}
+
+static std::string extractCueValueFromJson(const simplejson::Object& req) {
+    static const char* keys[] = {
+        "command", "cue", "action", "event", "eventName", "scte", "message", "name"
+    };
+    for (const char* k : keys) {
+        std::string v = req.getString(k, "");
+        if (!v.empty()) return v;
+    }
+    return "";
 }
 
 #ifdef _WIN32
@@ -1003,7 +1210,7 @@ static std::string parseBody(const std::string& raw) {
     return raw.substr(sep + 4);
 }
 
-static std::string handleReq(const std::string& raw) {
+static std::string handleReq(const std::string& raw, const std::string& clientIp) {
     const std::string method = parseMethod(raw);
     const std::string path = parsePath(raw);
     const std::string body = parseBody(raw);
@@ -1332,6 +1539,8 @@ static std::string handleReq(const std::string& raw) {
                 } else if (inputType == "srt") {
                     if (srtPort <= 0 || srtPort > 65535) {
                         validationError = "SRT input: port must be 1-65535, got " + std::to_string(srtPort);
+                    } else if (srtLatency < 0 || srtLatency > 90000) {
+                        validationError = "SRT input: latency must be 0-90000 ms, got " + std::to_string(srtLatency);
                     } else if (srtMode == "caller" && srtHost.empty()) {
                         validationError = "SRT input: host is required in caller mode";
                     }
@@ -1567,6 +1776,9 @@ static std::string handleReq(const std::string& raw) {
             std::string lastFmtMP3       = metaRt.getString("lastFormattedMP3", "");
             std::string lastFmtHLS       = metaRt.getString("lastFormattedHLS", "");
             std::string lastFmtSRT       = metaRt.getString("lastFormattedSRT", "");
+            std::string lastScteReceived = metaRt.getString("lastScteReceived", "");
+            std::string lastScteSent     = metaRt.getString("lastScteSent", "");
+            std::string lastScteRejected = metaRt.getString("lastScteRejected", "");
             std::string bodyResp = std::string("{\"listenerRunning\":") + (listenerRunning ? "true" : "false") +
                                    ",\"mode\":\"" + jsonEscape(mode) + "\"" +
                                    ",\"listenPort\":" + std::to_string(listenPort) +
@@ -1578,8 +1790,225 @@ static std::string handleReq(const std::string& raw) {
                                    ",\"lastFormattedAAC\":\"" + jsonEscape(lastFmtAAC) + "\"" +
                                    ",\"lastFormattedMP3\":\"" + jsonEscape(lastFmtMP3) + "\"" +
                                    ",\"lastFormattedHLS\":\"" + jsonEscape(lastFmtHLS) + "\"" +
-                                   ",\"lastFormattedSRT\":\"" + jsonEscape(lastFmtSRT) + "\"}";
+                                   ",\"lastFormattedSRT\":\"" + jsonEscape(lastFmtSRT) + "\"" +
+                                   ",\"lastScteReceived\":\"" + jsonEscape(lastScteReceived) + "\"" +
+                                   ",\"lastScteSent\":\"" + jsonEscape(lastScteSent) + "\"" +
+                                   ",\"lastScteRejected\":\"" + jsonEscape(lastScteRejected) + "\"" +
+                                   ",\"cueEndpoint\":\"/api/encoder/" + std::to_string(idx + 1) + "/cue\"}";
             return httpResp(200, "application/json", bodyResp);
+        }
+
+        if (method == "POST" && sub == "cue") {
+            const int enc = idx + 1;
+            simplejson::Object sysCfg = readJsonFile("/etc/MC/system.json");
+            bool globalEnabled = sysCfg.getBool("scteGlobalEnabled", true);
+            if (!globalEnabled) {
+                appendEncoderLog(enc, "SCTE cue rejected: global SCTE cue handling disabled");
+                return httpResp(403, "application/json", "{\"ok\":false,\"error\":\"SCTE disabled globally\"}");
+            }
+
+            simplejson::Object metaCfg = readJsonFile("/etc/encoder" + std::to_string(enc) + "/metadata.json");
+            simplejson::Object scte = metaCfg.getSubObject("scte");
+            bool encEnabled = scte.getBool("enabled", false);
+            bool listenEnabled = scte.getBool("listenEnabled", false);
+            std::string listenTransport = lowerCopy(scte.getString("listenTransport", "http"));
+            if (listenTransport.empty()) listenTransport = "http";
+            if (!encEnabled || !listenEnabled) {
+                appendEncoderLog(enc, "SCTE cue rejected: per-encoder SCTE listening disabled");
+                return httpResp(403, "application/json", "{\"ok\":false,\"error\":\"SCTE disabled for encoder\"}");
+            }
+            if (!(listenTransport == "http" || listenTransport == "both")) {
+                appendEncoderLog(enc, "SCTE cue rejected: HTTP ingest disabled by transport setting");
+                return httpResp(403, "application/json", "{\"ok\":false,\"error\":\"HTTP cue ingest disabled\"}");
+            }
+
+            bool whitelistEnabled = scte.getBool("whitelistEnabled", false);
+            std::vector<std::string> whitelistEntries = parseJsonStringArray(scte.getRawValue("whitelistEntries", "[]"));
+            if (!isAllowedByWhitelist(clientIp, whitelistEnabled, whitelistEntries)) {
+                appendEncoderLog(enc, "SCTE cue rejected: source not allowlisted: " + (clientIp.empty() ? std::string("(unknown)") : clientIp));
+                simplejson::Object metaRt = readJsonFile("/etc/encoder" + std::to_string(enc) + "/metadata_runtime.json");
+                metaRt.setString("lastScteRejected", "allowlist:" + (clientIp.empty() ? std::string("unknown") : clientIp));
+                std::ofstream mf("/etc/encoder" + std::to_string(enc) + "/metadata_runtime.json", std::ios::trunc);
+                mf << metaRt.serialize();
+                return httpResp(403, "application/json", "{\"ok\":false,\"error\":\"Source not allowlisted\"}");
+            }
+
+            int globalRateCount = sysCfg.getInt("scteGlobalRateLimitCount", 5);
+            int globalRateWindowSec = sysCfg.getInt("scteGlobalRateLimitWindowSec", 10);
+            int globalDedupeSec = sysCfg.getInt("scteGlobalDedupeSeconds", 30);
+            bool overrideRate = scte.getBool("overrideRateLimit", false);
+            bool overrideDedupe = scte.getBool("overrideDedupe", false);
+            int rateCount = overrideRate ? scte.getInt("rateLimitCount", globalRateCount) : globalRateCount;
+            int rateWindowSec = overrideRate ? scte.getInt("rateLimitWindowSec", globalRateWindowSec) : globalRateWindowSec;
+            int dedupeSec = overrideDedupe ? scte.getInt("dedupeSeconds", globalDedupeSec) : globalDedupeSec;
+            if (rateCount < 1) rateCount = 1;
+            if (rateWindowSec < 1) rateWindowSec = 1;
+            if (dedupeSec < 0) dedupeSec = 0;
+
+            std::string contentType = lowerCopy(parseHeader(raw, "Content-Type"));
+            std::string authToken = parseHeader(raw, "X-Cue-Token");
+
+            simplejson::Object req;
+            bool isJson = req.parse(body);
+            std::string cueValue;
+            std::string eventId;
+            std::string payloadToken;
+            std::string deliveryType = lowerCopy(scte.getString("cueDeliveryType", "json"));
+            if (deliveryType.empty()) deliveryType = "json";
+
+            if (isJson) {
+                cueValue = extractCueValueFromJson(req);
+                eventId = req.getString("eventId", req.getString("event_id", ""));
+                payloadToken = req.getString("token", "");
+            } else {
+                std::vector<std::string> watchTags = parseJsonStringArray(scte.getRawValue("watchTags", "[\"SCTE\",\"Event_ID\",\"Event_Duration\"]"));
+                cueValue = extractCueValueFromXml(body, watchTags);
+                eventId = extractCueValueFromXml(body, {"Event_ID"});
+                payloadToken = extractCueValueFromXml(body, {"Token"});
+            }
+            cueValue = trimCopy(cueValue);
+
+            bool requireEventId = scte.getBool("requireEventId", false);
+            bool requireToken = scte.getBool("requireToken", false);
+            std::string expectedToken = scte.getString("token", "");
+
+            std::string rejectReason;
+            if (cueValue.empty()) rejectReason = "No cue value found";
+            else if (requireEventId && trimCopy(eventId).empty()) rejectReason = "Event ID required";
+            else if (requireToken) {
+                std::string provided = !authToken.empty() ? authToken : payloadToken;
+                if (expectedToken.empty() || provided != expectedToken) rejectReason = "Token required/mismatch";
+            }
+
+            if (rejectReason.empty()) {
+                bool allowsJson = (deliveryType == "json" || deliveryType == "both");
+                bool allowsXml = (deliveryType == "xml" || deliveryType == "both");
+                if (isJson && !allowsJson) rejectReason = "JSON delivery disabled";
+                if (!isJson && !allowsXml) rejectReason = "XML delivery disabled";
+                if (!isJson && contentType.find("xml") == std::string::npos && deliveryType == "json") {
+                    rejectReason = "JSON delivery required";
+                }
+            }
+
+            if (!rejectReason.empty()) {
+                appendEncoderLog(enc, "SCTE cue rejected: " + rejectReason);
+                appendSysLog(enc, "SCTE cue rejected: " + rejectReason);
+                simplejson::Object metaRt = readJsonFile("/etc/encoder" + std::to_string(enc) + "/metadata_runtime.json");
+                metaRt.setString("lastScteRejected", rejectReason + " | payload=" + cueValue);
+                std::ofstream mf("/etc/encoder" + std::to_string(enc) + "/metadata_runtime.json", std::ios::trunc);
+                mf << metaRt.serialize();
+                return httpResp(400, "application/json", "{\"ok\":false,\"error\":\"" + jsonEscape(rejectReason) + "\"}");
+            }
+
+            int64_t nowMs = nowMsEpoch();
+            {
+                std::lock_guard<std::mutex> lk(g_cueStateMutex);
+                CueRuntimeState& cs = g_cueStates[enc];
+                int64_t floorMs = nowMs - static_cast<int64_t>(rateWindowSec) * 1000;
+                while (!cs.recentCueTimesMs.empty() && cs.recentCueTimesMs.front() < floorMs) {
+                    cs.recentCueTimesMs.pop_front();
+                }
+                if (static_cast<int>(cs.recentCueTimesMs.size()) >= rateCount) {
+                    appendEncoderLog(enc, "SCTE cue rejected: rate limit exceeded");
+                    appendSysLog(enc, "SCTE cue rejected: rate limit exceeded");
+                    simplejson::Object metaRt = readJsonFile("/etc/encoder" + std::to_string(enc) + "/metadata_runtime.json");
+                    metaRt.setString("lastScteRejected", "rate-limit | payload=" + cueValue);
+                    std::ofstream mf("/etc/encoder" + std::to_string(enc) + "/metadata_runtime.json", std::ios::trunc);
+                    mf << metaRt.serialize();
+                    return httpResp(429, "application/json", "{\"ok\":false,\"error\":\"Rate limit exceeded\"}");
+                }
+
+                auto itLast = cs.lastByMatch.find(cueValue);
+                if (itLast != cs.lastByMatch.end() && dedupeSec > 0) {
+                    int64_t ageMs = nowMs - itLast->second;
+                    if (ageMs < static_cast<int64_t>(dedupeSec) * 1000) {
+                        appendEncoderLog(enc, "SCTE cue deduped/replay-rejected: " + cueValue);
+                        appendSysLog(enc, "SCTE cue deduped/replay-rejected: " + cueValue);
+                        simplejson::Object metaRt = readJsonFile("/etc/encoder" + std::to_string(enc) + "/metadata_runtime.json");
+                        metaRt.setString("lastScteRejected", "dedupe | payload=" + cueValue);
+                        std::ofstream mf("/etc/encoder" + std::to_string(enc) + "/metadata_runtime.json", std::ios::trunc);
+                        mf << metaRt.serialize();
+                        return httpResp(200, "application/json", "{\"ok\":true,\"deduped\":true}");
+                    }
+                }
+            }
+
+            std::vector<CueCommandRow> rows = parseCueCommandRows(scte.getRawValue("commandRows", "[]"));
+            if (rows.empty()) {
+                rows = {
+                    {"BREAK", "START_BREAK"},
+                    {"END_BREAK", "END_BREAK"},
+                    {"LEGAL_ID", "LEGAL_ID"},
+                    {"START_BREAK", "START_BREAK"},
+                    {"END_BREAK_NOW", "END_BREAK_NOW"}
+                };
+            }
+
+            std::string matchedAction;
+            for (const auto& r : rows) {
+                if (r.match == cueValue) {
+                    matchedAction = r.action;
+                    break;
+                }
+            }
+
+            std::string logLevel = lowerCopy(sysCfg.getString("scteLogLevel", "info"));
+            if (logLevel.empty()) logLevel = "info";
+            appendEncoderLog(enc, "SCTE cue received: " + cueValue + " source=" + (clientIp.empty() ? std::string("unknown") : clientIp));
+            appendSysLog(enc, "SCTE cue received: " + cueValue + " source=" + (clientIp.empty() ? std::string("unknown") : clientIp));
+
+            simplejson::Object metaRt = readJsonFile("/etc/encoder" + std::to_string(enc) + "/metadata_runtime.json");
+            metaRt.setString("lastScteReceived", cueValue);
+
+            if (matchedAction.empty()) {
+                appendEncoderLog(enc, "SCTE cue rejected: No Matching Command for '" + cueValue + "'");
+                appendSysLog(enc, "SCTE cue rejected: No Matching Command for '" + cueValue + "'");
+                metaRt.setString("lastScteRejected", "no-match | payload=" + cueValue);
+                std::ofstream mf("/etc/encoder" + std::to_string(enc) + "/metadata_runtime.json", std::ios::trunc);
+                mf << metaRt.serialize();
+                return httpResp(200, "application/json", "{\"ok\":true,\"matched\":false,\"message\":\"No Matching Command\"}");
+            }
+
+            std::string passthrough = lowerCopy(scte.getString("passthroughMode", "pass-through"));
+            bool emitCommand = (passthrough == "pass-through" || passthrough == "generate-from-cues" || passthrough == "generate from cues");
+            bool sent = false;
+            std::string sendErr;
+            if (emitCommand) {
+                sent = sendWorkerControlCommand(enc, matchedAction, sendErr);
+            }
+
+            if (sent) {
+                appendEncoderLog(enc, "SCTE cue matched and sent: " + cueValue + " -> " + matchedAction);
+                appendSysLog(enc, "SCTE cue matched and sent: " + cueValue + " -> " + matchedAction);
+                metaRt.setString("lastScteSent", matchedAction);
+            } else {
+                if (!emitCommand) {
+                    appendEncoderLog(enc, "SCTE cue matched but passthrough is OFF: " + cueValue + " -> " + matchedAction);
+                    appendSysLog(enc, "SCTE cue matched but passthrough is OFF: " + cueValue + " -> " + matchedAction);
+                    metaRt.setString("lastScteRejected", "passthrough-off | matched=" + matchedAction);
+                } else {
+                    appendEncoderLog(enc, "SCTE cue matched but send failed: " + cueValue + " -> " + matchedAction + " (" + sendErr + ")");
+                    appendSysLog(enc, "SCTE cue matched but send failed: " + cueValue + " -> " + matchedAction + " (" + sendErr + ")");
+                    metaRt.setString("lastScteRejected", "send-failed | action=" + matchedAction);
+                }
+            }
+
+            {
+                std::lock_guard<std::mutex> lk(g_cueStateMutex);
+                CueRuntimeState& cs = g_cueStates[enc];
+                cs.recentCueTimesMs.push_back(nowMs);
+                cs.lastByMatch[cueValue] = nowMs;
+            }
+
+            {
+                std::ofstream mf("/etc/encoder" + std::to_string(enc) + "/metadata_runtime.json", std::ios::trunc);
+                mf << metaRt.serialize();
+            }
+
+            std::ostringstream resp;
+            resp << "{\"ok\":true,\"matched\":true,\"command\":\"" << jsonEscape(matchedAction)
+                 << "\",\"sent\":" << (sent ? "true" : "false") << "}";
+            return httpResp(200, "application/json", resp.str());
         }
 
         if (method == "GET" && sub.empty()) return httpResp(200, "application/json", encoderJson(idx));
@@ -1683,7 +2112,20 @@ static void handleClient(int fd) {
     char buf[16384] = {};
     ssize_t n = recv(fd, buf, sizeof(buf) - 1, 0);
     if (n > 0) {
-        std::string resp = handleReq(std::string(buf, n));
+        std::string clientIp;
+        sockaddr_storage peer{};
+        socklen_t plen = sizeof(peer);
+        if (getpeername(fd, reinterpret_cast<sockaddr*>(&peer), &plen) == 0) {
+            char ipbuf[INET6_ADDRSTRLEN] = {};
+            if (peer.ss_family == AF_INET) {
+                auto* a4 = reinterpret_cast<sockaddr_in*>(&peer);
+                if (inet_ntop(AF_INET, &a4->sin_addr, ipbuf, sizeof(ipbuf))) clientIp = ipbuf;
+            } else if (peer.ss_family == AF_INET6) {
+                auto* a6 = reinterpret_cast<sockaddr_in6*>(&peer);
+                if (inet_ntop(AF_INET6, &a6->sin6_addr, ipbuf, sizeof(ipbuf))) clientIp = ipbuf;
+            }
+        }
+        std::string resp = handleReq(std::string(buf, n), clientIp);
         send(fd, resp.c_str(), resp.size(), MSG_NOSIGNAL);
     }
     close_socket(fd);
@@ -1693,7 +2135,7 @@ void start_supervisor_api(int port) {
     initSocketsOnce();
     int sfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sfd < 0) {
-        std::cerr << "socket() failed: " << strerror(errno) << "\n";
+        std::cerr << "socket() failed: " << errnoMessage(errno) << "\n";
         return;
     }
     int opt = 1;
@@ -1709,7 +2151,7 @@ void start_supervisor_api(int port) {
     addr.sin_port = htons(static_cast<uint16_t>(port));
 
     if (bind(sfd, (sockaddr*)&addr, sizeof(addr)) < 0) {
-        std::cerr << "bind() failed on port " << port << ": " << strerror(errno) << "\n";
+        std::cerr << "bind() failed on port " << port << ": " << errnoMessage(errno) << "\n";
         close_socket(sfd);
         return;
     }

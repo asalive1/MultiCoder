@@ -39,7 +39,17 @@ private:
     void pollSinkProcesses();
     void listenControlPort();
     void listenMetaPort();
+    void listenCueTcpPort();
     void monitorInputLevels();
+    bool executeControlCommand(const std::string& cmd,
+                               const std::string& source,
+                               const std::string& eventId,
+                               const std::string& cueValue);
+    void emitScteSidecarEvent(const std::string& action,
+                              const std::string& eventId,
+                              const std::string& cueValue,
+                              const std::string& source,
+                              bool primaryPathLikelyAvailable);
 
     // Helper: retrieve input gain in dB (combines input.json rtpGain + session override)
     double getInputGainDb();
@@ -72,10 +82,12 @@ private:
     std::atomic<bool> m_hlsRunning{false};
     std::atomic<bool> m_srtRunning{false};
     std::atomic<bool> m_controlListenerRunning{false};
+    std::atomic<bool> m_cueListenerRunning{false};
     std::mutex m_rtMutex;  // guards all runtime_state.json reads and writes
 
     std::thread m_controlThread;
     std::thread m_metaThread;
+    std::thread m_cueThread;
     std::thread m_inputLevelThread;
 
     // Dedicated HLS HTTP playback server (serves /hls/* from the encoder's hls dir)
