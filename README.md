@@ -191,6 +191,16 @@ Example: `artist={artist} | title={title} | {stationId}`
 **Legacy mode:**  
 Select a separator and an ordered list of XML field names to concatenate.
 
+### HLS Metadata Profile Selector
+
+In the HLS metadata parser editor, select one profile:
+
+- `Orban` — preserves the current Orban-specific metadata behavior.
+- `Triton` — emits Triton-oriented EXT payloads and ID3/ID3v2 frame text.
+- `Universal Standard` — emits conservative standards-oriented metadata for broad audio-only HLS compatibility.
+
+The selected profile is stored in `hls.json` as `metaParser.profile`.
+
 ### Admin Settings
 
 Access via top-right "Admin Settings" link. Requires credentials.

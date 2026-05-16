@@ -6,6 +6,7 @@
     "metaEnabled": true,
     "iface": "",
     "metaParser": {
+        "profile": "orban",
         "method": "id3",
         "scope": "current",
         "tags": ["title", "artist", "category", "duration"]

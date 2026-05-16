@@ -248,8 +248,13 @@ Recognized token aliases include:
 ### HLS
 
 Metadata parser options in `hls.json`:
+- `metaParser.profile`:
+  - `orban` (preserves existing Orban-compatible behavior)
+  - `triton` (Triton-oriented EXT payload shape and ID3 frame output)
+  - `universal` (conservative standards-oriented output for broad audio-only HLS clients)
 - `metaParser.method`:
   - `id3` (default)
+  - `id3v2` (alias of `id3` output mode)
   - `ext`
   - `xmlPassthrough`
 - `metaParser.scope`:
@@ -257,7 +262,10 @@ Metadata parser options in `hls.json`:
   - `currentFuture`
 - `metaParser.tags[]` selects fields for frame/content construction.
 
-`ext` mode emits Orban-style JSON-compatible payload shape.
+`ext` mode output is profile-aware:
+- `orban`: Orban-style JSON payload.
+- `triton`: Triton-oriented `track` object payload.
+- `universal`: ATS-style free-form text (`Artist - Title`).
 
 ### SRT
 

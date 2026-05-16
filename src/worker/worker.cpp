@@ -584,7 +584,13 @@ static std::string hlsMetadataByParser(const std::string& xml, const simplejson:
                                        const std::string& title, const std::string& artist,
                                        const std::string& duration) {
     simplejson::Object parser = streamCfg.getSubObject("metaParser");
-    const std::string method = parser.getString("method", "id3");
+    std::string method = lowerCopy(parser.getString("method", "id3"));
+    if (method == "id3v2") method = "id3";
+
+    std::string profile = lowerCopy(parser.getString("profile", "orban"));
+    if (profile == "universal-standard" || profile == "universal standard") profile = "universal";
+    if (profile != "orban" && profile != "triton" && profile != "universal") profile = "orban";
+
     const std::string scope = parser.getString("scope", "current");
     const bool includeFuture = (scope == "currentFuture");
     const std::string stationId = streamCfg.getString("stationId", streamCfg.getString("streamId", ""));
@@ -630,6 +636,74 @@ static std::string hlsMetadataByParser(const std::string& xml, const simplejson:
     }
 
     if (method == "ext") {
+        if (profile == "universal") {
+            std::string out;
+            if (!artist.empty() && !title.empty()) out = artist + " - " + title;
+            else if (!title.empty()) out = title;
+            else if (!artist.empty()) out = artist;
+            else out = fieldValueWithAliases(currentBlock, "category", stationId);
+            if (out.empty()) out = singleLine(currentBlock);
+            return sanitizeForExtinf(out);
+        }
+
+        if (profile == "triton") {
+            auto toDurationSecs = [](const std::string& block) -> double {
+                std::string d = xmlField(block, {"duration", "length"});
+                if (d.empty()) return 0.0;
+                try {
+                    double v = std::stod(d);
+                    return (v > 1000.0) ? (v / 1000.0) : v;
+                } catch (...) {
+                    return 0.0;
+                }
+            };
+            auto tritonPropertiesObject = [&](const std::string& block) -> std::string {
+                std::string cueTitle = xmlField(block, {"title", "song", "name"});
+                std::string cueArtist = xmlField(block, {"artist", "performer"});
+                std::string trackId = xmlField(block, {"cart", "track_id"});
+                std::string isrc = xmlField(block, {"isrc", "IRSC", "track_isrc"});
+                std::string album = xmlField(block, {"trivia", "album"});
+                double dur = toDurationSecs(block);
+
+                std::ostringstream o;
+                o << std::fixed << std::setprecision(3);
+                o << "{";
+                o << "\"cue_title\":\"" << jsonEscapeCompact(cueTitle) << "\"";
+                o << ",\"track_artist_name\":\"" << jsonEscapeCompact(cueArtist) << "\"";
+                if (!trackId.empty()) {
+                    o << ",\"track_id\":\"" << jsonEscapeCompact(trackId) << "\"";
+                }
+                if (!isrc.empty()) {
+                    o << ",\"track_isrc\":\"" << jsonEscapeCompact(isrc) << "\"";
+                }
+                if (!album.empty()) {
+                    o << ",\"track_album_name\":\"" << jsonEscapeCompact(album) << "\"";
+                }
+                if (dur > 0.0) {
+                    o << ",\"cue_time_duration\":" << dur;
+                }
+                                o << "}";
+                return o.str();
+            };
+
+            if (!includeFuture || upcomingBlocks.empty()) {
+                                return std::string("{\"name\":\"track\",\"properties\":") +
+                                             tritonPropertiesObject(currentBlock) + "}";
+            }
+
+            std::ostringstream o;
+                        o << "{\"name\":\"track\",\"properties\":"
+                            << tritonPropertiesObject(currentBlock);
+            o << ",\"upcoming\":[";
+            for (size_t i = 0; i < upcomingBlocks.size(); ++i) {
+                if (i) o << ",";
+                                o << "{\"name\":\"track\",\"properties\":"
+                                    << tritonPropertiesObject(upcomingBlocks[i]) << "}";
+            }
+            o << "]}";
+            return o.str();
+        }
+
         // Produce Orban 5950HD-compatible EXT JSON matching the original encoder format.
         // Field mapping: media_typeâ†’"type", triviaâ†’"album", cartâ†’"id"
         // duration converted from milliseconds string â†’ float seconds.
@@ -724,7 +798,7 @@ static std::string hlsMetadataByParser(const std::string& xml, const simplejson:
         std::string frame = id3FrameForTag(tag, val);
         if (!frame.empty()) frames.push_back(frame);
     }
-    std::string out = "ID3:";
+    std::string out = (profile == "orban") ? "ID3:" : "";
     for (size_t i = 0; i < frames.size(); ++i) {
         if (i) out += ";";
         out += frames[i];

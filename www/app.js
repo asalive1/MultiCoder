@@ -1214,6 +1214,8 @@ async function renderHLSSection(cl, cr) {
 function renderHLSMetaEditor(container, cfg) {
     const hls = cfg.hls || {};
     const mp  = hls.metaParser || {};
+  const profileRaw = String(mp.profile || 'orban').toLowerCase();
+  const profile = (profileRaw === 'triton' || profileRaw === 'universal') ? profileRaw : 'orban';
     const builtInTagOptions = [
       { value: 'sched_time', label: 'sched_time' },
       { value: 'stack_pos', label: 'stack_position' },
@@ -1234,10 +1236,22 @@ function renderHLSMetaEditor(container, cfg) {
     container.innerHTML = `
     <h2>Metadata Parser Editor</h2>
     <div class="form-row">
+      <label>HLS Metadata Profile:</label>
+      <select id="hlsMetaProfile">
+        <option value="orban" ${profile==='orban'?'selected':''}>Orban</option>
+        <option value="triton" ${profile==='triton'?'selected':''}>Triton</option>
+        <option value="universal" ${profile==='universal'?'selected':''}>Universal Standard</option>
+      </select>
+    </div>
+    <p title="Orban preserves existing behavior. Triton targets Triton SST metadata expectations. Universal uses conservative audio-only HLS metadata conventions for broad client compatibility." style="font-size:10px;color:var(--muted);margin-top:-2px;margin-bottom:8px;line-height:1.4">
+      Tip: Choose <strong>Orban</strong> to keep current behavior, <strong>Triton</strong> for Triton SST workflows, or <strong>Universal Standard</strong> for broad audio-only HLS compatibility.
+    </p>
+    <div class="form-row">
       <label>Parsing Method:</label>
       <select id="hlsParseMethod">
         <option value="xmlPassthrough" ${mp.method==='xmlPassthrough'?'selected':''}>XML Pass Through</option>
         <option value="id3"            ${mp.method==='id3'           ?'selected':''}>ID3 tags</option>
+        <option value="id3v2"          ${mp.method==='id3v2'         ?'selected':''}>ID3v2 tags</option>
         <option value="ext"            ${mp.method==='ext'           ?'selected':''}>EXT Tags</option>
       </select>
     </div>
@@ -1261,8 +1275,9 @@ function renderHLSMetaEditor(container, cfg) {
       <input type="text" id="hlsCustomTags" value="${customTags.join(', ')}" placeholder="e.g. album, media_type"/>
     </div>
     <p style="font-size:10px;color:var(--muted);margin-top:6px">
-      XML Pass Through: emits raw XML. ID3: emits ID3-like frames (TIT2/TPE1/etc). EXT: emits compact JSON for EXT-style playlist metadata.
-      Scope controls whether only current item or current+future stack is emitted. stationId is read from the stream config, not from the XML payload.
+      <strong>Profiles:</strong> Orban preserves current Orban-compatible metadata payloads. Triton emits Triton-oriented EXT payloads and ID3/ID3v2 frame text. Universal Standard emits conservative standards-oriented values for broad HLS compatibility.<br/>
+      XML Pass Through emits raw XML. ID3/ID3v2 emits frame text (TIT2/TPE1/etc). EXT emits payload for playlist EXTINF metadata.
+      Scope controls whether only current item or current+future stack is emitted. stationId is read from stream config, not from XML.
     </p>
     <div class="action-row" style="margin-top:10px">
       <button class="btn btn-primary" id="hlsMetaSaveBtn">Save</button>
@@ -1278,6 +1293,7 @@ function renderHLSMetaEditor(container, cfg) {
               .filter(Boolean);
             const tags = Array.from(new Set([...checked, ...custom]));
             section.metaParser = {
+              profile: document.getElementById('hlsMetaProfile').value,
                 method: document.getElementById('hlsParseMethod').value,
                 scope:  document.getElementById('hlsEmbedScope').value,
                 tags,
