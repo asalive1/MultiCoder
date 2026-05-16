@@ -997,6 +997,67 @@ static std::string extractCueValueFromJson(const simplejson::Object& req) {
     return "";
 }
 
+static std::string extractLooseFieldFromBody(const std::string& body, const std::string& key) {
+    if (body.empty() || key.empty()) return "";
+    std::string lowBody = lowerCopy(body);
+    std::string lowKey = lowerCopy(key);
+
+    std::string pat1 = "\"" + lowKey + "\"";
+    std::string pat2 = "'" + lowKey + "'";
+    size_t p = lowBody.find(pat1);
+    if (p == std::string::npos) p = lowBody.find(pat2);
+    if (p == std::string::npos) p = lowBody.find(lowKey);
+    if (p == std::string::npos) return "";
+
+    size_t colon = lowBody.find(':', p);
+    if (colon == std::string::npos) return "";
+    size_t i = colon + 1;
+    while (i < body.size() && std::isspace(static_cast<unsigned char>(body[i]))) ++i;
+    if (i >= body.size()) return "";
+
+    if (body[i] == '"' || body[i] == '\'') {
+        char quote = body[i++];
+        std::string out;
+        bool esc = false;
+        for (; i < body.size(); ++i) {
+            char c = body[i];
+            if (esc) {
+                out.push_back(c);
+                esc = false;
+                continue;
+            }
+            if (c == '\\') {
+                esc = true;
+                continue;
+            }
+            if (c == quote) break;
+            out.push_back(c);
+        }
+        return trimCopy(out);
+    }
+
+    size_t j = i;
+    while (j < body.size()) {
+        char c = body[j];
+        if (c == ',' || c == '}' || c == '\r' || c == '\n') break;
+        ++j;
+    }
+    return trimCopy(body.substr(i, j - i));
+}
+
+static std::string extractCueValueFromLooseBody(const std::string& body) {
+    static const char* keys[] = {
+        "command", "cue", "action", "event", "eventName", "scte", "message", "name"
+    };
+    for (const char* k : keys) {
+        std::string v = extractLooseFieldFromBody(body, k);
+        if (!v.empty()) return v;
+    }
+    std::string t = trimCopy(body);
+    if (!t.empty() && t.front() != '{' && t.front() != '<') return t;
+    return "";
+}
+
 #ifdef _WIN32
 static std::string wideToUtf8(const wchar_t* w) {
     if (!w) return "";
@@ -1899,10 +1960,14 @@ static std::string handleReq(const std::string& raw, const std::string& clientIp
                 eventId = req.getString("eventId", req.getString("event_id", ""));
                 payloadToken = req.getString("token", "");
             } else {
+                cueValue = extractCueValueFromLooseBody(body);
+                eventId = extractLooseFieldFromBody(body, "eventId");
+                if (eventId.empty()) eventId = extractLooseFieldFromBody(body, "event_id");
+                payloadToken = extractLooseFieldFromBody(body, "token");
                 std::vector<std::string> watchTags = parseJsonStringArray(scte.getRawValue("watchTags", "[\"SCTE\",\"Event_ID\",\"Event_Duration\"]"));
-                cueValue = extractCueValueFromXml(body, watchTags);
-                eventId = extractCueValueFromXml(body, {"Event_ID"});
-                payloadToken = extractCueValueFromXml(body, {"Token"});
+                if (cueValue.empty()) cueValue = extractCueValueFromXml(body, watchTags);
+                if (eventId.empty()) eventId = extractCueValueFromXml(body, {"Event_ID"});
+                if (payloadToken.empty()) payloadToken = extractCueValueFromXml(body, {"Token"});
             }
             cueValue = trimCopy(cueValue);
 
