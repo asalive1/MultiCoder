@@ -3527,35 +3527,51 @@ bool Worker::executeControlCommand(const std::string& cmd,
                                    const std::string& source,
                                    const std::string& eventId,
                                    const std::string& cueValue) {
-    bool known = (cmd == "StartAAC" || cmd == "StopAAC" ||
-                  cmd == "StartMP3" || cmd == "StopMP3" ||
-                  cmd == "StartHLS" || cmd == "StopHLS" ||
-                  cmd == "StartSRT" || cmd == "StopSRT" ||
-                  cmd == "StartSRTInput" || cmd == "StopSRTInput");
-    if (!known) return false;
+    bool knownStream = (cmd == "StartAAC" || cmd == "StopAAC" ||
+                        cmd == "StartMP3" || cmd == "StopMP3" ||
+                        cmd == "StartHLS" || cmd == "StopHLS" ||
+                        cmd == "StartSRT" || cmd == "StopSRT" ||
+                        cmd == "StartSRTInput" || cmd == "StopSRTInput");
 
-    if      (cmd == "StartAAC")       startAAC();
-    else if (cmd == "StopAAC")        stopAAC();
-    else if (cmd == "StartMP3")       startMP3();
-    else if (cmd == "StopMP3")        stopMP3();
-    else if (cmd == "StartHLS")       startHLS();
-    else if (cmd == "StopHLS")        stopHLS();
-    else if (cmd == "StartSRT")       startSRT();
-    else if (cmd == "StopSRT")        stopSRT();
-    else if (cmd == "StartSRTInput")  startSRTInputRelay();
-    else if (cmd == "StopSRTInput")   stopSRTInputRelay();
+    if (knownStream) {
+        if      (cmd == "StartAAC")       startAAC();
+        else if (cmd == "StopAAC")        stopAAC();
+        else if (cmd == "StartMP3")       startMP3();
+        else if (cmd == "StopMP3")        stopMP3();
+        else if (cmd == "StartHLS")       startHLS();
+        else if (cmd == "StopHLS")        stopHLS();
+        else if (cmd == "StartSRT")       startSRT();
+        else if (cmd == "StopSRT")        stopSRT();
+        else if (cmd == "StartSRTInput")  startSRTInputRelay();
+        else if (cmd == "StopSRTInput")   stopSRTInputRelay();
+    }
 
     bool isScteAction = false;
     {
         simplejson::Object metaCfg = readJsonFile(m_cfgDir + "/metadata.json");
         simplejson::Object scte = metaCfg.getSubObject("scte");
         auto rows = parseCueCommandRows(scte.getRawValue("commandRows", "[]"));
+        if (rows.empty()) {
+            rows = {
+                {"BREAK", "START_BREAK"},
+                {"END_BREAK", "END_BREAK"},
+                {"LEGAL_ID", "LEGAL_ID"},
+                {"START_BREAK", "START_BREAK"},
+                {"END_BREAK_NOW", "END_BREAK_NOW"}
+            };
+        }
         for (const auto& r : rows) {
             if (trimCopy(r.action) == cmd) {
                 isScteAction = true;
                 break;
             }
         }
+    }
+
+    if (!knownStream && !isScteAction) return false;
+
+    if (isScteAction && !knownStream) {
+        log("SCTE action accepted: " + cmd + " source=" + source);
     }
 
     if (isScteAction) {
@@ -3802,21 +3818,14 @@ void Worker::listenControlPort() {
                 cmd.pop_back();
             log("Control command: " + cmd);
 
-            bool known = (cmd == "StartAAC" || cmd == "StopAAC" ||
-                          cmd == "StartMP3" || cmd == "StopMP3" ||
-                          cmd == "StartHLS" || cmd == "StopHLS" ||
-                          cmd == "StartSRT" || cmd == "StopSRT" ||
-                          cmd == "StartSRTInput" || cmd == "StopSRTInput");
+            simplejson::Object rt = readRuntimeState(m_cfgDir);
+            std::string ev = rt.getString("sessionScteEventId", "");
+            std::string cue = rt.getString("sessionScteCue", "");
+            bool handled = executeControlCommand(cmd, "control", ev, cue);
 
-            if (known) {
-                // ACK first so supervisor retries don't duplicate long-running start operations.
+            if (handled) {
                 const char* ack = "OK\n";
                 send(cfd, ack, 3, MSG_NOSIGNAL);
-
-                simplejson::Object rt = readRuntimeState(m_cfgDir);
-                std::string ev = rt.getString("sessionScteEventId", "");
-                std::string cue = rt.getString("sessionScteCue", "");
-                executeControlCommand(cmd, "control", ev, cue);
             } else {
                 log("Unknown control command: " + cmd);
                 const char* nack = "ERR\n";
