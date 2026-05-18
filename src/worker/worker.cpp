@@ -3570,11 +3570,20 @@ bool Worker::executeControlCommand(const std::string& cmd,
 
     if (!knownStream && !isScteAction) return false;
 
-    if (isScteAction && !knownStream) {
-        log("SCTE action accepted: " + cmd + " source=" + source);
-    }
-
     if (isScteAction) {
+        std::string eventForLog = singleLine(trimCopy(eventId));
+        if (eventForLog.empty()) eventForLog = "-";
+        std::string cueForLog = singleLine(trimCopy(cueValue));
+        if (cueForLog.empty()) cueForLog = "-";
+        if (cueForLog.size() > 240) cueForLog = cueForLog.substr(0, 240) + "...";
+
+        std::string lifecycleLine = "SCTE lifecycle execute: action=" + cmd +
+            " source=" + source +
+            " eventId=" + eventForLog +
+            " cue=" + cueForLog;
+        log(lifecycleLine);
+        logSys(lifecycleLine);
+
         simplejson::Object srtCfg = readJsonFile(m_cfgDir + "/srt.json");
         bool primaryLikelyAvailable = m_srtRunning.load() && srtCfg.getBool("scteEnabled", false);
         emitScteSidecarEvent(cmd, eventId, cueValue, source, primaryLikelyAvailable);
