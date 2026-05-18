@@ -9,11 +9,13 @@ on:
 jobs:
   build-and-test:
     runs-on: ubuntu-24.04
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     timeout-minutes: 30
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install build dependencies
         run: |
@@ -22,10 +24,17 @@ jobs:
             build-essential cmake ninja-build git pkg-config \
             libportaudio2 libportaudio-dev \
             libmp3lame-dev \
-            libfdk-aac-dev \
             libssl-dev \
             libcurl4-openssl-dev \
             libxml2-dev
+
+            # Ubuntu 24.04 runners may not provide this package in default repos.
+            # Keep CI green when unavailable; code paths requiring it are optional.
+            if apt-cache show libfdk-aac-dev >/dev/null 2>&1; then
+              sudo apt-get install -y --no-install-recommends libfdk-aac-dev
+            else
+              echo "libfdk-aac-dev not available on this runner image; continuing without it"
+            fi
 
       - name: Configure
         run: |
@@ -39,9 +48,19 @@ jobs:
       - name: Run unit tests
         run: ctest --test-dir build --output-on-failure -R "LivewireMapping|HLS"
 
-      - name: Upload test results
+      - name: Check test artifact directory
+        id: test_artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        run: |
+          if [ -d build/Testing ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload test results
+        if: always() && steps.test_artifacts.outputs.found == 'true'
+        uses: actions/upload-artifact@v5
         with:
           name: test-results-linux
           path: build/Testing/
