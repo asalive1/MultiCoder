@@ -3180,6 +3180,235 @@ static std::string formatUtcIso8601(std::chrono::system_clock::time_point tp) {
     return oss.str();
 }
 
+static int64_t parseUtcIso8601ToEpochMs(const std::string& raw) {
+    std::string s = trimCopy(isoToUtcZ(raw));
+    if (s.size() < 20) return 0;
+    if (s.back() == 'Z') s.pop_back();
+    try {
+        int yr = std::stoi(s.substr(0, 4));
+        int mo = std::stoi(s.substr(5, 2));
+        int dy = std::stoi(s.substr(8, 2));
+        int hr = std::stoi(s.substr(11, 2));
+        int mn = std::stoi(s.substr(14, 2));
+        int sc = std::stoi(s.substr(17, 2));
+        int millis = 0;
+        size_t dot = s.find('.', 19);
+        if (dot != std::string::npos) {
+            std::string frac = s.substr(dot + 1);
+            while (frac.size() < 3) frac.push_back('0');
+            if (frac.size() > 3) frac.resize(3);
+            millis = std::stoi(frac);
+        }
+        std::tm tm{};
+        tm.tm_year = yr - 1900;
+        tm.tm_mon = mo - 1;
+        tm.tm_mday = dy;
+        tm.tm_hour = hr;
+        tm.tm_min = mn;
+        tm.tm_sec = sc;
+#ifdef _WIN32
+        time_t epoch = _mkgmtime(&tm);
+#else
+        time_t epoch = timegm(&tm);
+#endif
+        if (epoch == static_cast<time_t>(-1)) return 0;
+        return static_cast<int64_t>(epoch) * 1000 + millis;
+    } catch (...) {
+        return 0;
+    }
+}
+
+static std::string escapeHlsQuotedString(const std::string& value) {
+    std::string out;
+    out.reserve(value.size() + 8);
+    for (char c : value) {
+        if (c == '\\' || c == '"') out.push_back('\\');
+        out.push_back(c);
+    }
+    return out;
+}
+
+static bool looksLikeScte35Payload(const std::string& raw) {
+    std::string s = trimCopy(raw);
+    if (s.size() < 16) return false;
+    if (s.rfind("0x", 0) == 0 || s.rfind("0X", 0) == 0) {
+        for (size_t i = 2; i < s.size(); ++i) {
+            if (!std::isxdigit(static_cast<unsigned char>(s[i]))) return false;
+        }
+        return true;
+    }
+    bool allHex = true;
+    for (char c : s) {
+        if (!std::isxdigit(static_cast<unsigned char>(c))) {
+            allHex = false;
+            break;
+        }
+    }
+    if (allHex && (s.size() % 2) == 0) return true;
+    bool hasBase64Signal = false;
+    for (char c : s) {
+        if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '+' || c == '/' || c == '=' || c == '-' || c == '_')) {
+            return false;
+        }
+        if (c == '+' || c == '/' || c == '=') hasBase64Signal = true;
+    }
+    return hasBase64Signal;
+}
+
+static HlsScteRangeState readHlsScteRangeState(const simplejson::Object& metaRt) {
+    HlsScteRangeState state;
+    state.active = metaRt.getBool("hlsScteActive", false);
+    state.id = trimCopy(metaRt.getString("hlsScteId", ""));
+    state.eventId = trimCopy(metaRt.getString("hlsScteEventId", ""));
+    state.actionOut = trimCopy(metaRt.getString("hlsScteActionOut", ""));
+    state.actionIn = trimCopy(metaRt.getString("hlsScteActionIn", ""));
+    state.cueOut = trimCopy(metaRt.getString("hlsScteCueOut", ""));
+    state.cueIn = trimCopy(metaRt.getString("hlsScteCueIn", ""));
+    state.startDateUtc = trimCopy(metaRt.getString("hlsScteStartDate", ""));
+    state.endDateUtc = trimCopy(metaRt.getString("hlsScteEndDate", ""));
+    try { state.startEpochMs = std::stoll(trimCopy(metaRt.getString("hlsScteStartEpochMs", "0"))); } catch (...) { state.startEpochMs = 0; }
+    try { state.endEpochMs = std::stoll(trimCopy(metaRt.getString("hlsScteEndEpochMs", "0"))); } catch (...) { state.endEpochMs = 0; }
+    if (state.startEpochMs <= 0 && !state.startDateUtc.empty()) state.startEpochMs = parseUtcIso8601ToEpochMs(state.startDateUtc);
+    if (state.endEpochMs <= 0 && !state.endDateUtc.empty()) state.endEpochMs = parseUtcIso8601ToEpochMs(state.endDateUtc);
+    return state;
+}
+
+static std::string buildHlsScteDateRangeLine(const HlsScteRangeState& state) {
+    if (state.id.empty() || state.startDateUtc.empty()) return "";
+    std::ostringstream oss;
+    oss << "#EXT-X-DATERANGE:ID=\"" << escapeHlsQuotedString(state.id) << "\"";
+    oss << ",CLASS=\"com.apple.hls.scte35\"";
+    oss << ",START-DATE=\"" << escapeHlsQuotedString(state.startDateUtc) << "\"";
+    if (!state.endDateUtc.empty()) {
+        oss << ",END-DATE=\"" << escapeHlsQuotedString(state.endDateUtc) << "\"";
+    }
+    if (state.startEpochMs > 0 && state.endEpochMs > state.startEpochMs) {
+        std::ostringstream dur;
+        dur << std::fixed << std::setprecision(3)
+            << (static_cast<double>(state.endEpochMs - state.startEpochMs) / 1000.0);
+        oss << ",DURATION=" << dur.str();
+    }
+    if (!state.eventId.empty()) oss << ",X-MULTICODER-EVENT-ID=\"" << escapeHlsQuotedString(state.eventId) << "\"";
+    if (!state.actionOut.empty()) oss << ",X-MULTICODER-OUT=\"" << escapeHlsQuotedString(state.actionOut) << "\"";
+    if (!state.actionIn.empty()) oss << ",X-MULTICODER-IN=\"" << escapeHlsQuotedString(state.actionIn) << "\"";
+    if (!state.cueOut.empty()) {
+        if (looksLikeScte35Payload(state.cueOut)) oss << ",SCTE35-OUT=\"" << escapeHlsQuotedString(state.cueOut) << "\"";
+        oss << ",X-MULTICODER-CUE-OUT=\"" << escapeHlsQuotedString(state.cueOut) << "\"";
+    }
+    if (!state.cueIn.empty()) {
+        if (looksLikeScte35Payload(state.cueIn)) oss << ",SCTE35-IN=\"" << escapeHlsQuotedString(state.cueIn) << "\"";
+        oss << ",X-MULTICODER-CUE-IN=\"" << escapeHlsQuotedString(state.cueIn) << "\"";
+    }
+    if (state.active) oss << ",END-ON-NEXT=YES";
+    return oss.str();
+}
+
+static void injectHlsScteDateRange(std::vector<std::string>& lines, const HlsScteRangeState& state) {
+    if (lines.empty()) return;
+    std::string daterange = buildHlsScteDateRangeLine(state);
+    if (daterange.empty()) return;
+
+    std::vector<std::pair<size_t, int64_t>> pdtLines;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        if (lines[i].rfind("#EXT-X-PROGRAM-DATE-TIME:", 0) != 0) continue;
+        int64_t epochMs = parseUtcIso8601ToEpochMs(lines[i].substr(25));
+        if (epochMs > 0) pdtLines.push_back({i, epochMs});
+    }
+    if (pdtLines.empty()) return;
+
+    int64_t firstMs = pdtLines.front().second;
+    int64_t lastMs = pdtLines.back().second;
+    if (!state.active && state.endEpochMs > 0 && state.endEpochMs < firstMs) return;
+    if (state.startEpochMs > lastMs) return;
+
+    size_t insertAt = pdtLines.front().first;
+    for (const auto& entry : pdtLines) {
+        if (state.startEpochMs <= 0 || entry.second >= state.startEpochMs) {
+            insertAt = entry.first;
+            break;
+        }
+    }
+    lines.insert(lines.begin() + static_cast<long long>(insertAt), daterange);
+}
+
+static void persistHlsScteRangeState(const std::string& cfgDir,
+                                     int encoderIdx,
+                                     const std::string& action,
+                                     const std::string& eventId,
+                                     const std::string& cueValue,
+                                     HlsScteRangeState* inMemoryState,
+                                     std::mutex* inMemoryMutex) {
+    const int64_t nowMs = nowMsEpoch();
+    const std::string nowIso = formatUtcIso8601(std::chrono::system_clock::now());
+
+    std::string runtimePath = cfgDir + "/metadata_runtime.json";
+    char resolvedBuf[MAX_PATH] = {};
+    if (_fullpath(resolvedBuf, runtimePath.c_str(), MAX_PATH)) {
+        runtimePath = resolvedBuf;
+    }
+
+    simplejson::Object metaRt = readJsonFile(runtimePath);
+    HlsScteRangeState state = readHlsScteRangeState(metaRt);
+
+    if (inMemoryState != nullptr && inMemoryMutex != nullptr) {
+        std::lock_guard<std::mutex> lk(*inMemoryMutex);
+        if (!inMemoryState->id.empty()) state = *inMemoryState;
+    }
+
+    if (action == "START_BREAK") {
+        state.active = true;
+        state.id = "scte-enc" + std::to_string(encoderIdx) + "-" + eventId;
+        state.eventId = eventId;
+        state.actionOut = action;
+        state.actionIn.clear();
+        state.cueOut = cueValue;
+        state.cueIn.clear();
+        state.startDateUtc = nowIso;
+        state.endDateUtc.clear();
+        state.startEpochMs = nowMs;
+        state.endEpochMs = 0;
+    } else if (action == "END_BREAK" || action == "END_BREAK_NOW") {
+        if (state.id.empty()) state.id = "scte-enc" + std::to_string(encoderIdx) + "-" + eventId;
+        if (state.startDateUtc.empty()) {
+            state.startDateUtc = nowIso;
+            state.startEpochMs = nowMs;
+        }
+        if (state.eventId.empty()) state.eventId = eventId;
+        if (state.actionOut.empty()) state.actionOut = "START_BREAK";
+        state.active = false;
+        state.actionIn = action;
+        if (!cueValue.empty()) state.cueIn = cueValue;
+        state.endDateUtc = nowIso;
+        state.endEpochMs = nowMs;
+    } else {
+        return;
+    }
+
+    metaRt.setBool("hlsScteActive", state.active);
+    metaRt.setString("hlsScteId", state.id);
+    metaRt.setString("hlsScteEventId", state.eventId);
+    metaRt.setString("hlsScteActionOut", state.actionOut);
+    metaRt.setString("hlsScteActionIn", state.actionIn);
+    metaRt.setString("hlsScteCueOut", state.cueOut);
+    metaRt.setString("hlsScteCueIn", state.cueIn);
+    metaRt.setString("hlsScteStartDate", state.startDateUtc);
+    metaRt.setString("hlsScteEndDate", state.endDateUtc);
+    metaRt.setString("hlsScteStartEpochMs", std::to_string(state.startEpochMs));
+    metaRt.setString("hlsScteEndEpochMs", std::to_string(state.endEpochMs));
+    metaRt.setString("hlsScteUpdatedUtc", nowIso);
+
+    std::string serialized = metaRt.serialize();
+    std::ofstream metaRtFile(runtimePath, std::ios::trunc);
+    metaRtFile << serialized;
+    metaRtFile.flush();
+    metaRtFile.close();
+
+    if (inMemoryState != nullptr && inMemoryMutex != nullptr) {
+        std::lock_guard<std::mutex> lk(*inMemoryMutex);
+        *inMemoryState = state;
+    }
+}
+
 // ---------- HLS HTTP playback server ----------
 // Minimal HTTP/1.0 server that serves the HLS playlist and segment files
 // from hlsDir on the configured playback port.
@@ -3314,15 +3543,16 @@ void Worker::serveHlsHttp(int port, const std::string& hlsDir) {
 
             // 1. Grab current metadata payload.
             std::string metaPayload;
+            simplejson::Object metaRt = readJsonFile(m_cfgDir + "/metadata_runtime.json");
             {
                 std::lock_guard<std::mutex> lk(m_hlsMetaMutex);
                 metaPayload = m_hlsLastMetaPayload;
             }
             if (metaPayload.empty()) {
-                simplejson::Object mrt = readJsonFile(m_cfgDir + "/metadata_runtime.json");
-                metaPayload = mrt.getString("lastFormattedHLS", "");
+                metaPayload = metaRt.getString("lastFormattedHLS", "");
             }
             if (!isSafeMetaForExtinf(metaPayload)) metaPayload = sanitizeForExtinf(metaPayload);
+            HlsScteRangeState hlsScteState = readHlsScteRangeState(metaRt);
 
             // 2. Read HLS config for startTimeOffset and segment cadence.
             int startOffset = -25;
@@ -3500,6 +3730,8 @@ void Worker::serveHlsHttp(int port, const std::string& hlsDir) {
                 plines.insert(plines.begin() + static_cast<long long>(idxVer + 1), tdLine);
             }
 
+            injectHlsScteDateRange(plines, hlsScteState);
+
             // 7. Rebuild.
             std::ostringstream rebuilt;
             for (const auto& ln : plines) {
@@ -3571,8 +3803,11 @@ bool Worker::executeControlCommand(const std::string& cmd,
     if (!knownStream && !isScteAction) return false;
 
     if (isScteAction) {
-        std::string eventForLog = singleLine(trimCopy(eventId));
-        if (eventForLog.empty()) eventForLog = "-";
+        std::string resolvedEventId = trimCopy(eventId);
+        if (resolvedEventId.empty()) {
+            resolvedEventId = "enc" + std::to_string(m_idx) + "-" + std::to_string(nowMsEpoch());
+        }
+        std::string eventForLog = singleLine(resolvedEventId);
         std::string cueForLog = singleLine(trimCopy(cueValue));
         if (cueForLog.empty()) cueForLog = "-";
         if (cueForLog.size() > 240) cueForLog = cueForLog.substr(0, 240) + "...";
@@ -3583,10 +3818,11 @@ bool Worker::executeControlCommand(const std::string& cmd,
             " cue=" + cueForLog;
         log(lifecycleLine);
         logSys(lifecycleLine);
+        persistHlsScteRangeState(m_cfgDir, m_idx, cmd, resolvedEventId, trimCopy(cueValue), &m_hlsScteRange, &m_hlsScteMutex);
 
         simplejson::Object srtCfg = readJsonFile(m_cfgDir + "/srt.json");
         bool primaryLikelyAvailable = m_srtRunning.load() && srtCfg.getBool("scteEnabled", false);
-        emitScteSidecarEvent(cmd, eventId, cueValue, source, primaryLikelyAvailable);
+        emitScteSidecarEvent(cmd, resolvedEventId, cueValue, source, primaryLikelyAvailable);
     }
 
     return true;

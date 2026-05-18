@@ -831,6 +831,16 @@ static std::string jsonEscape(const std::string& in) {
     return out;
 }
 
+static std::string escapeHlsQuotedString(const std::string& value) {
+    std::string out;
+    out.reserve(value.size() + 8);
+    for (char c : value) {
+        if (c == '\\' || c == '"') out.push_back('\\');
+        out.push_back(c);
+    }
+    return out;
+}
+
 static std::string trimCopy(const std::string& s) {
     size_t b = 0;
     while (b < s.size() && std::isspace(static_cast<unsigned char>(s[b]))) ++b;
@@ -848,6 +858,156 @@ static std::string lowerCopy(const std::string& s) {
 static int64_t nowMsEpoch() {
     return static_cast<int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count());
+}
+
+static int64_t parseUtcIso8601ToEpochMs(const std::string& raw) {
+    std::string s = trimCopy(raw);
+    if (s.size() < 20) return 0;
+    if (s.back() == 'Z') s.pop_back();
+    try {
+        int yr = std::stoi(s.substr(0, 4));
+        int mo = std::stoi(s.substr(5, 2));
+        int dy = std::stoi(s.substr(8, 2));
+        int hr = std::stoi(s.substr(11, 2));
+        int mn = std::stoi(s.substr(14, 2));
+        int sc = std::stoi(s.substr(17, 2));
+        int millis = 0;
+        size_t dot = s.find('.', 19);
+        if (dot != std::string::npos) {
+            std::string frac = s.substr(dot + 1);
+            while (frac.size() < 3) frac.push_back('0');
+            if (frac.size() > 3) frac.resize(3);
+            millis = std::stoi(frac);
+        }
+        std::tm tm{};
+        tm.tm_year = yr - 1900;
+        tm.tm_mon = mo - 1;
+        tm.tm_mday = dy;
+        tm.tm_hour = hr;
+        tm.tm_min = mn;
+        tm.tm_sec = sc;
+#ifdef _WIN32
+        time_t epoch = _mkgmtime(&tm);
+#else
+        time_t epoch = timegm(&tm);
+#endif
+        if (epoch == static_cast<time_t>(-1)) return 0;
+        return static_cast<int64_t>(epoch) * 1000 + millis;
+    } catch (...) {
+        return 0;
+    }
+}
+
+static bool looksLikeScte35Payload(const std::string& raw) {
+    std::string s = trimCopy(raw);
+    if (s.size() < 16) return false;
+    if (s.rfind("0x", 0) == 0 || s.rfind("0X", 0) == 0) {
+        for (size_t i = 2; i < s.size(); ++i) {
+            if (!std::isxdigit(static_cast<unsigned char>(s[i]))) return false;
+        }
+        return true;
+    }
+    bool allHex = true;
+    for (char c : s) {
+        if (!std::isxdigit(static_cast<unsigned char>(c))) {
+            allHex = false;
+            break;
+        }
+    }
+    if (allHex && (s.size() % 2) == 0) return true;
+    bool hasBase64Signal = false;
+    for (char c : s) {
+        if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '+' || c == '/' || c == '=' || c == '-' || c == '_')) {
+            return false;
+        }
+        if (c == '+' || c == '/' || c == '=') hasBase64Signal = true;
+    }
+    return hasBase64Signal;
+}
+
+struct HlsScteRangeState {
+    bool active = false;
+    std::string id;
+    std::string eventId;
+    std::string actionOut;
+    std::string actionIn;
+    std::string cueOut;
+    std::string cueIn;
+    std::string startDateUtc;
+    std::string endDateUtc;
+    int64_t startEpochMs = 0;
+    int64_t endEpochMs = 0;
+};
+
+static HlsScteRangeState readHlsScteRangeState(const simplejson::Object& metaRt) {
+    HlsScteRangeState state;
+    state.active = metaRt.getBool("hlsScteActive", false);
+    state.id = trimCopy(metaRt.getString("hlsScteId", ""));
+    state.eventId = trimCopy(metaRt.getString("hlsScteEventId", ""));
+    state.actionOut = trimCopy(metaRt.getString("hlsScteActionOut", ""));
+    state.actionIn = trimCopy(metaRt.getString("hlsScteActionIn", ""));
+    state.cueOut = trimCopy(metaRt.getString("hlsScteCueOut", ""));
+    state.cueIn = trimCopy(metaRt.getString("hlsScteCueIn", ""));
+    state.startDateUtc = trimCopy(metaRt.getString("hlsScteStartDate", ""));
+    state.endDateUtc = trimCopy(metaRt.getString("hlsScteEndDate", ""));
+    try { state.startEpochMs = std::stoll(trimCopy(metaRt.getString("hlsScteStartEpochMs", "0"))); } catch (...) { state.startEpochMs = 0; }
+    try { state.endEpochMs = std::stoll(trimCopy(metaRt.getString("hlsScteEndEpochMs", "0"))); } catch (...) { state.endEpochMs = 0; }
+    if (state.startEpochMs <= 0 && !state.startDateUtc.empty()) state.startEpochMs = parseUtcIso8601ToEpochMs(state.startDateUtc);
+    if (state.endEpochMs <= 0 && !state.endDateUtc.empty()) state.endEpochMs = parseUtcIso8601ToEpochMs(state.endDateUtc);
+    return state;
+}
+
+static std::string buildHlsScteDateRangeLine(const HlsScteRangeState& state) {
+    if (state.id.empty() || state.startDateUtc.empty()) return "";
+    std::ostringstream oss;
+    oss << "#EXT-X-DATERANGE:ID=\"" << escapeHlsQuotedString(state.id) << "\"";
+    oss << ",CLASS=\"com.apple.hls.scte35\"";
+    oss << ",START-DATE=\"" << escapeHlsQuotedString(state.startDateUtc) << "\"";
+    if (!state.endDateUtc.empty()) oss << ",END-DATE=\"" << escapeHlsQuotedString(state.endDateUtc) << "\"";
+    if (state.startEpochMs > 0 && state.endEpochMs > state.startEpochMs) {
+        std::ostringstream dur;
+        dur << std::fixed << std::setprecision(3)
+            << (static_cast<double>(state.endEpochMs - state.startEpochMs) / 1000.0);
+        oss << ",DURATION=" << dur.str();
+    }
+    if (!state.eventId.empty()) oss << ",X-MULTICODER-EVENT-ID=\"" << escapeHlsQuotedString(state.eventId) << "\"";
+    if (!state.actionOut.empty()) oss << ",X-MULTICODER-OUT=\"" << escapeHlsQuotedString(state.actionOut) << "\"";
+    if (!state.actionIn.empty()) oss << ",X-MULTICODER-IN=\"" << escapeHlsQuotedString(state.actionIn) << "\"";
+    if (!state.cueOut.empty()) {
+        if (looksLikeScte35Payload(state.cueOut)) oss << ",SCTE35-OUT=\"" << escapeHlsQuotedString(state.cueOut) << "\"";
+        oss << ",X-MULTICODER-CUE-OUT=\"" << escapeHlsQuotedString(state.cueOut) << "\"";
+    }
+    if (!state.cueIn.empty()) {
+        if (looksLikeScte35Payload(state.cueIn)) oss << ",SCTE35-IN=\"" << escapeHlsQuotedString(state.cueIn) << "\"";
+        oss << ",X-MULTICODER-CUE-IN=\"" << escapeHlsQuotedString(state.cueIn) << "\"";
+    }
+    if (state.active) oss << ",END-ON-NEXT=YES";
+    return oss.str();
+}
+
+static void injectHlsScteDateRange(std::vector<std::string>& lines, const HlsScteRangeState& state) {
+    if (lines.empty()) return;
+    std::string daterange = buildHlsScteDateRangeLine(state);
+    if (daterange.empty()) return;
+    std::vector<std::pair<size_t, int64_t>> pdtLines;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        if (lines[i].rfind("#EXT-X-PROGRAM-DATE-TIME:", 0) != 0) continue;
+        int64_t epochMs = parseUtcIso8601ToEpochMs(lines[i].substr(25));
+        if (epochMs > 0) pdtLines.push_back({i, epochMs});
+    }
+    if (pdtLines.empty()) return;
+    int64_t firstMs = pdtLines.front().second;
+    int64_t lastMs = pdtLines.back().second;
+    if (!state.active && state.endEpochMs > 0 && state.endEpochMs < firstMs) return;
+    if (state.startEpochMs > lastMs) return;
+    size_t insertAt = pdtLines.front().first;
+    for (const auto& entry : pdtLines) {
+        if (state.startEpochMs <= 0 || entry.second >= state.startEpochMs) {
+            insertAt = entry.first;
+            break;
+        }
+    }
+    lines.insert(lines.begin() + static_cast<long long>(insertAt), daterange);
 }
 
 static std::string parseHeader(const std::string& req, const std::string& keyName) {
@@ -1401,6 +1561,7 @@ static std::string handleReq(const std::string& raw, const std::string& clientIp
 
                     simplejson::Object metaRt = readJsonFile("/etc/encoder" + std::to_string(encIdx) + "/metadata_runtime.json");
                     std::string metaPayload = metaRt.getString("lastFormattedHLS", "");
+                    HlsScteRangeState hlsScteState = readHlsScteRangeState(metaRt);
                     for (char& c : metaPayload) {
                         if (c == '\r' || c == '\n') c = ' ';
                     }
@@ -1506,6 +1667,23 @@ static std::string handleReq(const std::string& raw, const std::string& clientIp
                             curEpoch += static_cast<double>(segSecs);
                         }
                         data = out.str();
+
+                        std::vector<std::string> rebuiltLines;
+                        {
+                            std::istringstream rebuiltIss(data);
+                            std::string rebuiltLine;
+                            while (std::getline(rebuiltIss, rebuiltLine)) {
+                                if (!rebuiltLine.empty() && rebuiltLine.back() == '\r') rebuiltLine.pop_back();
+                                rebuiltLines.push_back(rebuiltLine);
+                            }
+                        }
+                        injectHlsScteDateRange(rebuiltLines, hlsScteState);
+                        std::ostringstream rebuiltOut;
+                        for (const auto& rebuiltLine : rebuiltLines) {
+                            if (rebuiltLine.empty()) continue;
+                            rebuiltOut << rebuiltLine << "\n";
+                        }
+                        data = rebuiltOut.str();
                     }
                 }
 
@@ -2078,6 +2256,12 @@ static std::string handleReq(const std::string& raw, const std::string& clientIp
             std::string sendErr;
             if (emitCommand) {
                 sent = sendWorkerControlCommand(enc, matchedAction, sendErr);
+            }
+
+            // Re-read metadata_runtime.json to pick up any changes the worker made (e.g., hlsSct* fields)
+            if (sent) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));  // Give worker time to write
+                metaRt = readJsonFile("/etc/encoder" + std::to_string(enc) + "/metadata_runtime.json");
             }
 
             if (sent) {

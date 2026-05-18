@@ -1,6 +1,7 @@
 #pragma once
 #include <string>
 #include <atomic>
+#include <cstdint>
 #include <thread>
 #include <mutex>
 #include <fstream>
@@ -11,6 +12,20 @@
 #endif
 #include <windows.h>
 #endif
+
+struct HlsScteRangeState {
+    bool active{false};
+    std::string id;
+    std::string eventId;
+    std::string actionOut;
+    std::string actionIn;
+    std::string cueOut;
+    std::string cueIn;
+    std::string startDateUtc;
+    std::string endDateUtc;
+    int64_t startEpochMs{0};
+    int64_t endEpochMs{0};
+};
 
 /// Worker manages one encoder instance.
 /// It reads per-encoder JSON configs and starts/stops stream sub-processes.
@@ -104,6 +119,8 @@ private:
     // Current HLS metadata payload — injected into playlist at serve time.
     std::mutex  m_hlsMetaMutex;
     std::string m_hlsLastMetaPayload;
+    std::mutex m_hlsScteMutex;
+    HlsScteRangeState m_hlsScteRange;
 
     // FFmpeg subprocess handles — nullptr means not running.
     // Windows: stored as HANDLE cast to void*.
