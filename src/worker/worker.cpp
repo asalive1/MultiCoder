@@ -3342,10 +3342,12 @@ static void persistHlsScteRangeState(const std::string& cfgDir,
     const std::string nowIso = formatUtcIso8601(std::chrono::system_clock::now());
 
     std::string runtimePath = cfgDir + "/metadata_runtime.json";
+#ifdef _WIN32
     char resolvedBuf[MAX_PATH] = {};
     if (_fullpath(resolvedBuf, runtimePath.c_str(), MAX_PATH)) {
         runtimePath = resolvedBuf;
     }
+#endif
 
     simplejson::Object metaRt = readJsonFile(runtimePath);
     HlsScteRangeState state = readHlsScteRangeState(metaRt);
