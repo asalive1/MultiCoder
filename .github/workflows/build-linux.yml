@@ -46,7 +46,7 @@ jobs:
         run: cmake --build build --parallel
 
       - name: Run unit tests
-        run: ctest --test-dir build --output-on-failure -R "LivewireMapping|HLS"
+        run: ctest --test-dir build --output-on-failure --no-tests=ignore -R "LivewireMapping|HLS"
 
       - name: Check test artifact directory
         id: test_artifacts
@@ -64,3 +64,4 @@ jobs:
         with:
           name: test-results-linux
           path: build/Testing/
+          if-no-files-found: ignore
