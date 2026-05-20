@@ -456,6 +456,54 @@ static std::string singleLine(const std::string& s) {
     return out;
 }
 
+// Decode standard XML/HTML character entities in a plain-text field value.
+// Applied after tag extraction so that angle-bracket entities in the raw XML
+// stream never interfere with tag parsing.
+// Handles: &amp; &apos; &quot; &lt; &gt;
+// and decimal/hex numeric references: &#39; &#x27; etc.
+static std::string decodeXmlEntities(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ) {
+        if (s[i] != '&') { out.push_back(s[i++]); continue; }
+        size_t semi = s.find(';', i + 1);
+        if (semi == std::string::npos || semi - i > 10) { out.push_back(s[i++]); continue; }
+        std::string ent = s.substr(i + 1, semi - i - 1);
+        if      (ent == "amp")  { out.push_back('&');  i = semi + 1; }
+        else if (ent == "apos") { out.push_back('\''); i = semi + 1; }
+        else if (ent == "quot") { out.push_back('"');  i = semi + 1; }
+        else if (ent == "lt")   { out.push_back('<');  i = semi + 1; }
+        else if (ent == "gt")   { out.push_back('>');  i = semi + 1; }
+        else if (!ent.empty() && ent[0] == '#') {
+            // Numeric character reference: &#NNN; or &#xHH;
+            try {
+                unsigned long cp = 0;
+                if (ent.size() > 1 && (ent[1] == 'x' || ent[1] == 'X'))
+                    cp = std::stoul(ent.substr(2), nullptr, 16);
+                else
+                    cp = std::stoul(ent.substr(1), nullptr, 10);
+                // Encode as UTF-8
+                if (cp < 0x80) {
+                    out.push_back(static_cast<char>(cp));
+                } else if (cp < 0x800) {
+                    out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+                    out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+                } else if (cp < 0x10000) {
+                    out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+                    out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+                    out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+                } else {
+                    out.push_back(s[i++]); continue; // outside BMP — leave as-is
+                }
+                i = semi + 1;
+            } catch (...) { out.push_back(s[i++]); }
+        } else {
+            out.push_back(s[i++]); // unknown entity — leave as-is
+        }
+    }
+    return out;
+}
+
 static std::string xmlField(const std::string& xml, const std::vector<std::string>& tags) {
     std::string lowerXml = xml;
     std::transform(lowerXml.begin(), lowerXml.end(), lowerXml.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
@@ -470,7 +518,7 @@ static std::string xmlField(const std::string& xml, const std::vector<std::strin
         b += open.size();
         size_t e = lowerXml.find(close, b);
         if (e == std::string::npos || e <= b) continue;
-        return xml.substr(b, e - b);
+        return decodeXmlEntities(xml.substr(b, e - b));
     }
     return "";
 }
