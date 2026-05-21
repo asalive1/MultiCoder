@@ -1518,6 +1518,15 @@ static bool openWasapiInput(WasapiInputMeter& m, const std::string& deviceToken,
     }
 
     if (!selected) {
+        // If the user explicitly selected a device, do not silently fall back to
+        // the system default endpoint. That would make the VU meter show audio
+        // from a different source than the selected input.
+        if (!preferredName.empty()) {
+            errMsg = "WASAPI: requested capture endpoint not found: " + preferredName;
+            safeRelease(coll);
+            safeRelease(enumerator);
+            return false;
+        }
         hr = enumerator->GetDefaultAudioEndpoint(eCapture, eConsole, &selected);
         if (FAILED(hr) || !selected) {
             errMsg = "WASAPI: default capture endpoint not available";
@@ -4545,8 +4554,10 @@ void Worker::monitorInputLevels() {
     WasapiInputMeter wasapiMeter;
 #endif
     bool lastConnected = false;
+    bool inputLossActive = false;
     std::string lastFailure;
     std::string lastUnsupportedMode;
+    std::string meterWarning;
     auto lastDataAt = std::chrono::steady_clock::now();
     auto lastNoDataLogAt = std::chrono::steady_clock::now() - std::chrono::seconds(10);
     auto lastMeterUpdateAt = std::chrono::steady_clock::now() - std::chrono::seconds(10);
@@ -4604,9 +4615,23 @@ void Worker::monitorInputLevels() {
                 " port=" + std::to_string(rtpPort) +
                 (iface.empty() ? "" : " iface=" + iface) +
                 " gain=" + std::to_string(gainDb) + "dB");
+            inputLossActive = false;
+            meterWarning.clear();
         }
         if (!connected && lastConnected) {
-            log("Input disconnected by UI");
+            std::string disconnectSummary;
+            if (activeInputType == "audio") {
+                disconnectSummary = "audio:" + std::string(activeAudioDevice.empty() ? "default" : activeAudioDevice);
+            } else {
+                disconnectSummary = (activeInputType.empty() ? inType : activeInputType) + ":" +
+                    (activeAddr.empty() ? rtpAddr : activeAddr) + ":" +
+                    std::to_string((activePort > 0) ? activePort : rtpPort) +
+                    ((activeIface.empty() ? iface : activeIface).empty() ? "" : (" iface=" + (activeIface.empty() ? iface : activeIface)));
+            }
+            log("Input disconnected by UI; previous source=" + disconnectSummary +
+                " lastMeterL=" + std::to_string(lastMeterL) + "dB lastMeterR=" + std::to_string(lastMeterR) + "dB");
+            meterWarning = "Input disconnected";
+            inputLossActive = false;
         }
         lastConnected = connected;
 
@@ -4657,19 +4682,22 @@ void Worker::monitorInputLevels() {
                         log("Audio input connect failed: invalid audio device id '" + audioDevice + "'");
                         lastUnsupportedMode = mode;
                     }
+                    meterWarning = "Selected audio device is unavailable: " + audioDevice;
                 } else if (!waveMeter.open || activeAudioDevice != audioDevice || activeSampleRate != sampleRate) {
                     std::string waveErr;
                     if (!openWaveInput(waveMeter, devId, sampleRate, waveErr)) {
                         if (lastUnsupportedMode != mode) {
-                            log("Audio input connect failed (waveIn): " + waveErr + " â€” will attempt WASAPI");
+                            log("Audio input connect failed (waveIn): " + waveErr + " - will attempt WASAPI");
                             lastUnsupportedMode = mode;
                         }
+                        meterWarning = "Audio device open failed (waveIn): " + waveErr;
                     } else {
                         activeAudioDevice = audioDevice;
                         activeSampleRate = sampleRate;
                         lastUnsupportedMode.clear();
                         log("Audio input meter attached to device '" + std::string(audioDevice.empty() ? "default" : audioDevice) +
                             "' @ " + std::to_string(sampleRate) + " Hz");
+                        meterWarning.clear();
                     }
                 }
 
@@ -4684,8 +4712,10 @@ void Worker::monitorInputLevels() {
                         if (openWasapiInput(wasapiMeter, audioDevice, wasapiErr)) {
                             log("WASAPI fallback capture enabled on endpoint: " +
                                 std::string(wasapiMeter.endpointName.empty() ? "(unknown)" : wasapiMeter.endpointName));
+                            meterWarning.clear();
                         } else {
                             log("WASAPI fallback open failed: " + wasapiErr);
+                            meterWarning = "Audio device open failed (WASAPI): " + wasapiErr;
                         }
                     }
                 } else if (!wasapiMeter.open && (validDevId || audioDevice.empty())) {
@@ -4694,11 +4724,13 @@ void Worker::monitorInputLevels() {
                     if (openWasapiInput(wasapiMeter, audioDevice, wasapiErr)) {
                         log("WASAPI direct capture enabled on endpoint: " +
                             std::string(wasapiMeter.endpointName.empty() ? "(unknown)" : wasapiMeter.endpointName));
+                        meterWarning.clear();
                     } else {
                         if (lastUnsupportedMode != mode) {
                             log("WASAPI direct open failed: " + wasapiErr);
                             lastUnsupportedMode = mode;
                         }
+                        meterWarning = "Audio device open failed (WASAPI): " + wasapiErr;
                     }
                 }
 
@@ -4721,6 +4753,12 @@ void Worker::monitorInputLevels() {
                     lastMeterUpdateAt = lastDataAt;
                     lastMeterL = left;
                     lastMeterR = right;
+                    if (inputLossActive) {
+                        log("Input recovered: type=audio device='" + std::string(audioDevice.empty() ? "default" : audioDevice) +
+                            "' sampleRate=" + std::to_string(sampleRate));
+                        inputLossActive = false;
+                    }
+                    meterWarning.clear();
                 } else {
                     auto now = std::chrono::steady_clock::now();
                     if ((now - lastMeterUpdateAt) <= std::chrono::milliseconds(800)) {
@@ -4728,8 +4766,13 @@ void Worker::monitorInputLevels() {
                         right = lastMeterR;
                     }
                     if ((now - lastDataAt) > std::chrono::seconds(3) && (now - lastNoDataLogAt) > std::chrono::seconds(5)) {
-                        log("No PCM frames received from selected audio device");
+                        log("Input lost: no PCM frames from audio device '" + std::string(audioDevice.empty() ? "default" : audioDevice) +
+                            "' sampleRate=" + std::to_string(sampleRate));
                         lastNoDataLogAt = now;
+                    }
+                    if ((now - lastDataAt) > std::chrono::seconds(3)) {
+                        inputLossActive = true;
+                        meterWarning = "No audio frames from selected device";
                     }
                 }
 
@@ -4738,6 +4781,7 @@ void Worker::monitorInputLevels() {
                     simplejson::Object rt = readRuntimeState(m_cfgDir);
                     rt.setInt("inputLevelL", left);
                     rt.setInt("inputLevelR", right);
+                    rt.setString("inputWarning", meterWarning);
                     stampHealth(rt);
                     writeRuntimeState(m_cfgDir, rt);
                 }
@@ -4751,6 +4795,7 @@ void Worker::monitorInputLevels() {
                     log("Audio-device input selected, but direct audio capture telemetry is currently implemented on Windows only.");
                     lastUnsupportedMode = mode;
                 }
+                meterWarning = "Audio telemetry for this platform is not available";
             }
 #endif
 
@@ -4759,6 +4804,7 @@ void Worker::monitorInputLevels() {
                 simplejson::Object rt = readRuntimeState(m_cfgDir);
                 rt.setInt("inputLevelL", -60);
                 rt.setInt("inputLevelR", -60);
+                rt.setString("inputWarning", connected ? meterWarning : "Input disconnected");
                 stampHealth(rt);
                 writeRuntimeState(m_cfgDir, rt);
             }
@@ -4779,6 +4825,7 @@ void Worker::monitorInputLevels() {
                     simplejson::Object rt = readRuntimeState(m_cfgDir);
                     rt.setInt("inputLevelL", -60);
                     rt.setInt("inputLevelR", -60);
+                    rt.setString("inputWarning", openErr.empty() ? "Input source unavailable" : openErr);
                     stampHealth(rt);
                     writeRuntimeState(m_cfgDir, rt);
                 }
@@ -4786,11 +4833,14 @@ void Worker::monitorInputLevels() {
                     log("Input connect failed: " + openErr);
                     lastFailure = openErr;
                 }
+                meterWarning = openErr.empty() ? "Input source unavailable" : openErr;
                 std::this_thread::sleep_for(std::chrono::milliseconds(300));
                 continue;
             }
             lastFailure.clear();
             lastDataAt = std::chrono::steady_clock::now();
+            inputLossActive = false;
+            meterWarning.clear();
             log("Input meter attached to " + inType + " source " + rtpAddr + ":" + std::to_string(rtpPort)
                 + (iface.empty() ? "" : (" via " + iface)));
         }
@@ -4823,6 +4873,12 @@ void Worker::monitorInputLevels() {
                     lastMeterUpdateAt = lastDataAt;
                     lastMeterL = left;
                     lastMeterR = right;
+                    if (inputLossActive) {
+                        log("Input recovered: type=" + inType + " source=" + activeAddr + ":" + std::to_string(activePort) +
+                            (activeIface.empty() ? "" : (" iface=" + activeIface)));
+                        inputLossActive = false;
+                    }
+                    meterWarning.clear();
                 }
             }
         } else {
@@ -4832,8 +4888,14 @@ void Worker::monitorInputLevels() {
                 right = lastMeterR;
             }
             if (connected && (now - lastDataAt) > std::chrono::seconds(3) && (now - lastNoDataLogAt) > std::chrono::seconds(5)) {
-                log("No RTP packets received from " + activeAddr + ":" + std::to_string(activePort));
+                log("Input lost: no packets from " + activeAddr + ":" + std::to_string(activePort) +
+                    (activeIface.empty() ? "" : (" iface=" + activeIface)) +
+                    " type=" + inType);
                 lastNoDataLogAt = now;
+            }
+            if (connected && (now - lastDataAt) > std::chrono::seconds(3)) {
+                inputLossActive = true;
+                meterWarning = "No packets received from active input";
             }
         }
 
@@ -4842,6 +4904,7 @@ void Worker::monitorInputLevels() {
             simplejson::Object rt = readRuntimeState(m_cfgDir);
             rt.setInt("inputLevelL", left);
             rt.setInt("inputLevelR", right);
+            rt.setString("inputWarning", connected ? meterWarning : "Input disconnected");
             stampHealth(rt);
             writeRuntimeState(m_cfgDir, rt);
         }

@@ -1943,6 +1943,9 @@ static std::string handleReq(const std::string& raw, const std::string& clientIp
             } else {
                 // Stop the SRT relay if one was active before disconnecting
                 simplejson::Object rtDis = readRuntimeState(idx + 1);
+                std::string disconnectSource = summarizeInputConfig(rtDis, "session");
+                int lastL = rtDis.getInt("inputLevelL", -60);
+                int lastR = rtDis.getInt("inputLevelR", -60);
                 std::string prevType = rtDis.getString("sessionInputType", "");
                 if (prevType == "srt") {
                     std::string srtErr;
@@ -1954,6 +1957,8 @@ static std::string handleReq(const std::string& raw, const std::string& clientIp
                     atomicWriteRuntimeState(idx + 1, rtDis);
                 }
                 setRuntimeInputConnected(idx + 1, false);
+                appendEncoderLog(idx + 1, "Input disconnect requested by UI; source=" + disconnectSource +
+                    " lastMeterL=" + std::to_string(lastL) + "dB lastMeterR=" + std::to_string(lastR) + "dB");
             }
             std::string bodyResp = std::string("{\"ok\":true,\"inputConnected\":") +
                                    (connected ? "true" : "false") + "}";
@@ -2003,6 +2008,9 @@ static std::string handleReq(const std::string& raw, const std::string& clientIp
         if (method == "GET" && sub == "input/levels") {
             simplejson::Object runtime = readRuntimeState(idx + 1);
             bool connected = runtime.getBool("inputConnected", false);
+            std::string inputType = runtime.getString("sessionInputType", "");
+            std::string sourceLabel = connected ? summarizeInputConfig(runtime, "session") : "Disconnected";
+            std::string warning = runtime.getString("inputWarning", connected ? "" : "Input disconnected");
             // Real levels are expected from worker telemetry; return silence defaults until available.
             int left = runtime.getInt("inputLevelL", -60);
             int right = runtime.getInt("inputLevelR", -60);
@@ -2012,7 +2020,10 @@ static std::string handleReq(const std::string& raw, const std::string& clientIp
             }
             std::string bodyResp = std::string("{\"connected\":") + (connected ? "true" : "false") +
                                    ",\"leftDb\":" + std::to_string(left) +
-                                   ",\"rightDb\":" + std::to_string(right) + "}";
+                                   ",\"rightDb\":" + std::to_string(right) +
+                                   ",\"inputType\":\"" + jsonEscape(inputType) + "\"" +
+                                   ",\"sourceLabel\":\"" + jsonEscape(sourceLabel) + "\"" +
+                                   ",\"warning\":\"" + jsonEscape(warning) + "\"}";
             return httpResp(200, "application/json", bodyResp);
         }
 

@@ -20,6 +20,8 @@ let availableAudioInputs = [];
 let vuHandle = null;
 let vuLastRaw = { leftDb: -60, rightDb: -60, connected: false };
 let inputConnectedState = false;
+let inputWarningLastText = '';
+let inputWarningSince = null;
 let gainPreviewTimer = null;
 let inputStatusTimer = null;
 let metadataStatusTimer = null;
@@ -417,11 +419,12 @@ async function renderInputSection(cl, cr) {
     cl.innerHTML = `
     <h2>Input Configuration</h2>
     <div class="vu-container">
-      <div class="vu-title">Line Input</div>
+      <div class="vu-title" id="inputVuTitle">Input (Disconnected)</div>
       <div class="vu-bar-wrap">
         <div class="vu-channel"><span class="vu-label">L</span><div class="vu-track"><div class="vu-fill" id="vuL"></div></div></div>
         <div class="vu-channel"><span class="vu-label">R</span><div class="vu-track"><div class="vu-fill" id="vuR"></div></div></div>
       </div>
+      <div id="inputWarningLine" style="display:none;margin-top:6px;font-size:11px;color:#ff8a80;"></div>
     </div>
 
     <div class="form-row">
@@ -466,6 +469,7 @@ async function renderInputSection(cl, cr) {
 
     // VU meters start silent until input is connected.
     updateVUFromLevels({ connected: false, leftDb: -60, rightDb: -60 });
+    updateInputWarning({ connected: false, warning: 'Input disconnected' });
 
     // Gain slider sync
     const slider = document.getElementById('gainSlider');
@@ -529,8 +533,15 @@ async function renderInputSection(cl, cr) {
     });
 
     document.getElementById('disconnectBtn').addEventListener('click', async () => {
-      await apiPost(`/api/encoder/${selectedEncoder}/input/disconnect`, {});
-      showBanner(`Encoder ${selectedEncoder}: input disconnected`, 'warn');
+      updateVUFromLevels({ connected: false, leftDb: -60, rightDb: -60 });
+      updateInputVuTitle({ connected: false });
+      updateInputWarning({ connected: false, warning: 'Input disconnected' });
+      try {
+        await apiPost(`/api/encoder/${selectedEncoder}/input/disconnect`, {});
+        showBanner(`Encoder ${selectedEncoder}: input disconnected`, 'warn');
+      } catch (e) {
+        showBanner('Input disconnect failed: ' + e.message, 'error');
+      }
       await refreshInputLevels();
       await refreshInputStatusLine();
     });
@@ -705,6 +716,14 @@ function dbToPercent(db) {
   return ((clamped + 60) / 72) * 100;
 }
 
+function formatShortTime(ts) {
+  if (!(ts instanceof Date) || Number.isNaN(ts.getTime())) return '';
+  const hh = String(ts.getHours()).padStart(2, '0');
+  const mm = String(ts.getMinutes()).padStart(2, '0');
+  const ss = String(ts.getSeconds()).padStart(2, '0');
+  return `${hh}:${mm}:${ss}`;
+}
+
 function updateVUFromLevels(levels) {
   vuLastRaw = levels || { connected: false, leftDb: -60, rightDb: -60 };
   inputConnectedState = !!(vuLastRaw && vuLastRaw.connected);
@@ -721,13 +740,53 @@ function updateVUFromLevels(levels) {
   R.style.width = `${dbToPercent(vuLastRaw.rightDb ?? -60)}%`;
 }
 
+function updateInputVuTitle(levels) {
+  const el = document.getElementById('inputVuTitle');
+  if (!el) return;
+  if (!levels || !levels.connected) {
+    el.textContent = 'Input (Disconnected)';
+    return;
+  }
+  const source = (levels.sourceLabel || '').trim();
+  if (source) {
+    el.textContent = `Input: ${source}`;
+    return;
+  }
+  const type = (levels.inputType || '').trim();
+  el.textContent = type ? `Input: ${type}` : 'Input (Connected)';
+}
+
+function updateInputWarning(levels) {
+  const el = document.getElementById('inputWarningLine');
+  if (!el) return;
+  const warning = (levels && levels.warning) ? String(levels.warning).trim() : '';
+  if (!warning) {
+    inputWarningLastText = '';
+    inputWarningSince = null;
+    el.style.display = 'none';
+    el.textContent = '';
+    return;
+  }
+  if (warning !== inputWarningLastText || !inputWarningSince) {
+    inputWarningLastText = warning;
+    inputWarningSince = new Date();
+  }
+  const t = formatShortTime(inputWarningSince);
+  el.style.display = '';
+  el.textContent = t ? `[${t}] ${warning}` : warning;
+}
+
 async function refreshInputLevels() {
   if (!selectedEncoder || selectedSection !== 'input') return;
   try {
     const levels = await apiGet(`/api/encoder/${selectedEncoder}/input/levels`);
     updateVUFromLevels(levels);
+    updateInputVuTitle(levels);
+    updateInputWarning(levels);
   } catch {
     updateVUFromLevels({ connected: false, leftDb: -60, rightDb: -60 });
+    updateInputVuTitle({ connected: false });
+    updateInputWarning({ connected: false, warning: 'Input telemetry unavailable' });
   }
 }
 
