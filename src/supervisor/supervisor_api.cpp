@@ -94,6 +94,7 @@ static HANDLE getOrCreateJobObject() {
 // ---------------------------------------------------------
 
 static std::string readFile(const std::string& path);
+static bool atomicWriteTextFile(const std::string& path, const std::string& content, std::string* errOut);
 
 struct EncoderState {
     bool aac_running = false;
@@ -115,6 +116,10 @@ static std::map<int, CueRuntimeState> g_cueStates;
 
 static std::string runtimeStatePath(int encoderOneBased) {
     return "/etc/encoder" + std::to_string(encoderOneBased) + "/runtime_state.json";
+}
+
+static std::string inputSessionPath(int encoderOneBased) {
+    return "/etc/encoder" + std::to_string(encoderOneBased) + "/input_session.json";
 }
 
 static std::string nowIsoUtc() {
@@ -242,6 +247,13 @@ static simplejson::Object readRuntimeState(int encoderOneBased) {
     return o;
 }
 
+static simplejson::Object readInputSessionState(int encoderOneBased) {
+    simplejson::Object o;
+    std::string txt = readFile(inputSessionPath(encoderOneBased));
+    if (!txt.empty()) o.parse(txt);
+    return o;
+}
+
 // Convert a Unix-style /etc/... path to a Windows absolute path with backslashes.
 // On Windows, std::filesystem and CreateFileW may not resolve leading '/' paths
 // the same way as the CRT fopen/ofstream does.  MoveFileExW requires the resolved
@@ -309,6 +321,11 @@ static void setRuntimeInputConnected(int encoderOneBased, bool connected) {
     simplejson::Object o = readRuntimeState(encoderOneBased);
     o.setBool("inputConnected", connected);
     atomicWriteRuntimeState(encoderOneBased, o);
+}
+
+static void atomicWriteInputSessionState(int encoderOneBased, const simplejson::Object& o) {
+    std::string err;
+    atomicWriteTextFile(inputSessionPath(encoderOneBased), o.serialize(), &err);
 }
 
 static bool atomicWriteTextFile(const std::string& path, const std::string& content, std::string* errOut = nullptr) {
@@ -1909,6 +1926,24 @@ static std::string handleReq(const std::string& raw, const std::string& clientIp
                 fs::create_directories(dir);
                 atomicWriteRuntimeState(idx + 1, rt);
 
+                simplejson::Object session;
+                session.setBool("inputConnected", true);
+                session.setString("sessionInputType", inputType);
+                session.setString("sessionRtpAddress", rtpAddress);
+                session.setInt("sessionRtpPort", rtpPort);
+                session.setString("sessionRtpInterface", iface);
+                session.setString("sessionAudioDevice", audioDevice);
+                session.setInt("sessionSampleRate", sampleRate);
+                session.setRaw("sessionGainDb", std::to_string(gainDb));
+                session.setString("sessionSrtMode", srtMode);
+                session.setString("sessionSrtHost", srtHost);
+                session.setInt("sessionSrtPort", srtPort);
+                session.setInt("sessionSrtLatency", srtLatency);
+                session.setString("sessionSrtStreamId", srtStreamId);
+                session.setInt("sessionSrtPbkeylen", srtPbkeylen);
+                session.setString("sessionSrtPass", srtPass);
+                atomicWriteInputSessionState(idx + 1, session);
+
                 // For SRT input, tell the worker to start its SRT relay immediately
                 // so the SRT port is bound/connected as soon as the user clicks Connect.
                 if (inputType == "srt") {
@@ -1957,6 +1992,9 @@ static std::string handleReq(const std::string& raw, const std::string& clientIp
                     atomicWriteRuntimeState(idx + 1, rtDis);
                 }
                 setRuntimeInputConnected(idx + 1, false);
+                simplejson::Object session = readInputSessionState(idx + 1);
+                session.setBool("inputConnected", false);
+                atomicWriteInputSessionState(idx + 1, session);
                 appendEncoderLog(idx + 1, "Input disconnect requested by UI; source=" + disconnectSource +
                     " lastMeterL=" + std::to_string(lastL) + "dB lastMeterR=" + std::to_string(lastR) + "dB");
             }
@@ -1972,6 +2010,9 @@ static std::string handleReq(const std::string& raw, const std::string& clientIp
             simplejson::Object rt = readRuntimeState(idx + 1);
             rt.setRaw("sessionGainDb", std::to_string(gainDb));
             atomicWriteRuntimeState(idx + 1, rt);
+            simplejson::Object session = readInputSessionState(idx + 1);
+            session.setRaw("sessionGainDb", std::to_string(gainDb));
+            atomicWriteInputSessionState(idx + 1, session);
             return httpResp(200, "application/json", "{\"ok\":true}");
         }
 
@@ -1983,6 +2024,9 @@ static std::string handleReq(const std::string& raw, const std::string& clientIp
             simplejson::Object rt = readRuntimeState(idx + 1);
             rt.setRaw("sessionGainDb", std::to_string(gainDb));
             atomicWriteRuntimeState(idx + 1, rt);
+            simplejson::Object session = readInputSessionState(idx + 1);
+            session.setRaw("sessionGainDb", std::to_string(gainDb));
+            atomicWriteInputSessionState(idx + 1, session);
 
             // Force active outputs to re-open FFmpeg with the new gain filter.
             // This runs only on settled UI changes (not slider ticks).
@@ -2007,9 +2051,12 @@ static std::string handleReq(const std::string& raw, const std::string& clientIp
 
         if (method == "GET" && sub == "input/levels") {
             simplejson::Object runtime = readRuntimeState(idx + 1);
-            bool connected = runtime.getBool("inputConnected", false);
-            std::string inputType = runtime.getString("sessionInputType", "");
-            std::string sourceLabel = connected ? summarizeInputConfig(runtime, "session") : "Disconnected";
+            simplejson::Object session = readInputSessionState(idx + 1);
+            bool connected = session.getBool("inputConnected", runtime.getBool("inputConnected", false));
+            std::string inputType = session.getString("sessionInputType", runtime.getString("sessionInputType", ""));
+            simplejson::Object activeSource = session;
+            if (activeSource.getString("sessionInputType", "").empty()) activeSource = runtime;
+            std::string sourceLabel = connected ? summarizeInputConfig(activeSource, "session") : "Disconnected";
             std::string warning = runtime.getString("inputWarning", connected ? "" : "Input disconnected");
             // Real levels are expected from worker telemetry; return silence defaults until available.
             int left = runtime.getInt("inputLevelL", -60);
@@ -2029,10 +2076,13 @@ static std::string handleReq(const std::string& raw, const std::string& clientIp
 
         if (method == "GET" && sub == "input/status") {
             simplejson::Object runtime = readRuntimeState(idx + 1);
+            simplejson::Object session = readInputSessionState(idx + 1);
             simplejson::Object saved = readJsonFile("/etc/encoder" + std::to_string(idx + 1) + "/input.json");
-            bool connected = runtime.getBool("inputConnected", false);
+            bool connected = session.getBool("inputConnected", runtime.getBool("inputConnected", false));
+            simplejson::Object activeSource = session;
+            if (activeSource.getString("sessionInputType", "").empty()) activeSource = runtime;
 
-            std::string active = connected ? summarizeInputConfig(runtime, "session") : "Disconnected (no active session input)";
+            std::string active = connected ? summarizeInputConfig(activeSource, "session") : "Disconnected (no active session input)";
             std::string savedSummary = summarizeInputConfig(saved, "");
 
             std::string bodyResp = std::string("{\"connected\":") + (connected ? "true" : "false") +

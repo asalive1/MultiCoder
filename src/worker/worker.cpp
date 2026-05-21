@@ -317,6 +317,13 @@ static simplejson::Object readRuntimeState(const std::string& cfgDir) {
     return readJsonFile(cfgDir + "/runtime_state.json");
 }
 
+static simplejson::Object readInputSessionState(const std::string& cfgDir) {
+    simplejson::Object o = readJsonFile(cfgDir + "/input_session.json");
+    std::string raw = readTextFile(cfgDir + "/input_session.json");
+    if (!raw.empty()) return o;
+    return readRuntimeState(cfgDir);
+}
+
 static std::string toWindowsPath(const std::string& p) {
 #ifdef _WIN32
     char resolved[MAX_PATH] = {};
@@ -4584,14 +4591,15 @@ void Worker::monitorInputLevels() {
 
     while (m_running && !g_workerShutdown) {
         // Read session config (no lock needed - supervisor/UI writes, worker only reads here)
-        simplejson::Object cfg = readRuntimeState(m_cfgDir);
-        bool connected = cfg.getBool("inputConnected", false);
+        simplejson::Object cfg = readInputSessionState(m_cfgDir);
+        simplejson::Object runtime = readRuntimeState(m_cfgDir);
+        bool connected = cfg.getBool("inputConnected", runtime.getBool("inputConnected", false));
 
         simplejson::Object inCfg = readJsonFile(m_cfgDir + "/input.json");
         std::string inType = cfg.getString("sessionInputType", inCfg.getString("inputType", "rtp"));
         std::string rtpAddr = cfg.getString("sessionRtpAddress", inCfg.getString("rtpAddress", ""));
         int rtpPort = cfg.getInt("sessionRtpPort", inCfg.getInt("rtpPort", 5004));
-        double gainDb = cfg.getDouble("sessionGainDb", inCfg.getDouble("rtpGain", 0.0));
+        double gainDb = cfg.getDouble("sessionGainDb", runtime.getDouble("sessionGainDb", inCfg.getDouble("rtpGain", 0.0)));
         std::string iface = cfg.getString("sessionRtpInterface", inCfg.getString("rtpInterface", ""));
         std::string audioDevice = cfg.getString("sessionAudioDevice", inCfg.getString("audioDevice", ""));
         int sampleRate = cfg.getInt("sessionSampleRate", inCfg.getInt("sampleRate", 48000));
@@ -4601,9 +4609,9 @@ void Worker::monitorInputLevels() {
         // from the relay's UDP multicast rather than RTP. Override rtpAddr/rtpPort
         // so the existing socket-open and select() path is reused; the packet
         // parsing branch is chosen below based on srtRelayActive.
-        bool srtRelayActive = (inType == "srt") && cfg.getBool("srtRelayActive", false);
-        int  srtRelayPort   = cfg.getInt("srtRelayPort", 0);
-        std::string srtRelayAddr = cfg.getString("srtRelayAddr", "239.255.127.1");
+        bool srtRelayActive = (inType == "srt") && runtime.getBool("srtRelayActive", false);
+        int  srtRelayPort   = runtime.getInt("srtRelayPort", 0);
+        std::string srtRelayAddr = runtime.getString("srtRelayAddr", "239.255.127.1");
         if (srtRelayActive && srtRelayPort > 0) {
             rtpAddr = srtRelayAddr;
             rtpPort = srtRelayPort;
