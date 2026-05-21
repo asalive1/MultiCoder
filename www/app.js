@@ -24,6 +24,7 @@ let inputWarningLastText = '';
 let inputWarningSince = null;
 let gainPreviewTimer = null;
 let inputStatusTimer = null;
+let inputDiagTimer = null;
 let metadataStatusTimer = null;
 let metaPanelTimer = null;
 let metaLastEventCount = 0;
@@ -367,6 +368,7 @@ async function loadSection(section) {
     if (logTimer) { clearInterval(logTimer); logTimer = null; }
   if (vuHandle) { clearInterval(vuHandle); vuHandle = null; }
   if (inputStatusTimer) { clearInterval(inputStatusTimer); inputStatusTimer = null; }
+  if (inputDiagTimer) { clearInterval(inputDiagTimer); inputDiagTimer = null; }
   if (metadataStatusTimer) { clearInterval(metadataStatusTimer); metadataStatusTimer = null; }
   setMainLayout(section === 'log' ? 'log' : 'default');
   // Panel 4 is relevant for metadata + stream sections.
@@ -465,7 +467,15 @@ async function renderInputSection(cl, cr) {
       <button class="btn btn-danger"  id="disconnectBtn">Disconnect</button>
       <button class="btn"             id="inputSaveBtn">Save</button>
     </div>
-    <div id="inputStatusLine" style="margin-top:8px;font-size:11px;color:var(--muted);"></div>`;
+    <div id="inputStatusLine" style="margin-top:8px;font-size:11px;color:var(--muted);"></div>
+
+    <div id="inputDiagPanel" style="margin-top:10px;padding:8px;border:1px solid #3a3a3a;border-radius:6px;background:#1a1a1a;color:#ddd;font-size:11px;">
+      <div style="font-weight:700;margin-bottom:6px;">Input Diagnostics (Live)</div>
+      <div id="inputDiagSyncLine">Sync: checking...</div>
+      <div id="inputDiagConnectedLine">Connected: runtime=?, session=?</div>
+      <div id="inputDiagTypeLine">Type: runtime=?, session=?</div>
+      <div id="inputDiagSourceLine">Source: runtime=?, session=?</div>
+    </div>`;
 
     // VU meters start silent until input is connected.
     updateVUFromLevels({ connected: false, leftDb: -60, rightDb: -60 });
@@ -548,8 +558,10 @@ async function renderInputSection(cl, cr) {
 
     await refreshInputStatusLine();
     await refreshInputLevels();
+    await refreshInputDiagnostics();
     vuHandle = setInterval(refreshInputLevels, 250);
     inputStatusTimer = setInterval(refreshInputStatusLine, 1500);
+    inputDiagTimer = setInterval(refreshInputDiagnostics, 1000);
 }
 
 function renderInputTypeFields(type, inp) {
@@ -820,6 +832,47 @@ async function refreshInputStatusLine() {
     el.innerHTML = `<strong>Active session input (temporary):</strong> ${escapeHtml(s.activeSessionInput || '')}<br><strong>Saved profile input:</strong> ${escapeHtml(s.savedProfileInput || '')}`;
   } catch {
     el.textContent = 'Input status unavailable';
+  }
+}
+
+function setInputDiagnosticsUi(diag, errMsg) {
+  const panel = document.getElementById('inputDiagPanel');
+  const syncLine = document.getElementById('inputDiagSyncLine');
+  const connectedLine = document.getElementById('inputDiagConnectedLine');
+  const typeLine = document.getElementById('inputDiagTypeLine');
+  const sourceLine = document.getElementById('inputDiagSourceLine');
+  if (!panel || !syncLine || !connectedLine || !typeLine || !sourceLine) return;
+
+  if (errMsg) {
+    panel.style.borderColor = '#d9534f';
+    panel.style.background = '#2a1414';
+    syncLine.textContent = `Sync: diagnostics unavailable (${errMsg})`;
+    connectedLine.textContent = 'Connected: runtime=?, session=?';
+    typeLine.textContent = 'Type: runtime=?, session=?';
+    sourceLine.textContent = 'Source: runtime=?, session=?';
+    return;
+  }
+
+  const cmp = (diag && diag.comparison) ? diag.comparison : {};
+  const connectedInSync = !!cmp.connectedInSync;
+  const sourceInSync = !!cmp.sourceInSync;
+  const ok = connectedInSync && sourceInSync;
+
+  panel.style.borderColor = ok ? '#2e7d32' : '#d9534f';
+  panel.style.background = ok ? '#14221a' : '#2a1414';
+  syncLine.textContent = ok ? 'Sync: OK' : 'Sync: MISMATCH DETECTED';
+  connectedLine.textContent = `Connected: runtime=${cmp.runtimeConnected ? 'true' : 'false'}, session=${cmp.sessionConnected ? 'true' : 'false'}`;
+  typeLine.textContent = `Type: runtime=${cmp.runtimeInputType || '(none)'}, session=${cmp.sessionInputType || '(none)'}`;
+  sourceLine.textContent = `Source: runtime=${cmp.runtimeSourceSummary || '(none)'}, session=${cmp.sessionSourceSummary || '(none)'}`;
+}
+
+async function refreshInputDiagnostics() {
+  if (!selectedEncoder || selectedSection !== 'input') return;
+  try {
+    const diag = await apiGet(`/api/encoder/${selectedEncoder}/input/diagnostics`);
+    setInputDiagnosticsUi(diag, '');
+  } catch (e) {
+    setInputDiagnosticsUi(null, e && e.message ? e.message : 'request failed');
   }
 }
 

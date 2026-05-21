@@ -2092,6 +2092,37 @@ static std::string handleReq(const std::string& raw, const std::string& clientIp
             return httpResp(200, "application/json", bodyResp);
         }
 
+        if (method == "GET" && sub == "input/diagnostics") {
+            simplejson::Object runtime = readRuntimeState(idx + 1);
+            simplejson::Object session = readInputSessionState(idx + 1);
+
+            bool runtimeConnected = runtime.getBool("inputConnected", false);
+            bool sessionConnected = session.getBool("inputConnected", runtimeConnected);
+            std::string runtimeType = runtime.getString("sessionInputType", "");
+            std::string sessionType = session.getString("sessionInputType", runtimeType);
+            std::string runtimeSource = summarizeInputConfig(runtime, "session");
+            std::string sessionSource = summarizeInputConfig(session, "session");
+
+            bool connectedInSync = (runtimeConnected == sessionConnected);
+            bool sourceInSync = (runtimeType == sessionType) && (runtimeSource == sessionSource);
+
+            std::string bodyResp = std::string("{") +
+                "\"runtimeState\":" + runtime.serialize() +
+                ",\"inputSession\":" + session.serialize() +
+                ",\"comparison\":{" +
+                    std::string("\"runtimeConnected\":") + (runtimeConnected ? "true" : "false") +
+                    ",\"sessionConnected\":" + (sessionConnected ? "true" : "false") +
+                    ",\"runtimeInputType\":\"" + jsonEscape(runtimeType) + "\"" +
+                    ",\"sessionInputType\":\"" + jsonEscape(sessionType) + "\"" +
+                    ",\"runtimeSourceSummary\":\"" + jsonEscape(runtimeSource) + "\"" +
+                    ",\"sessionSourceSummary\":\"" + jsonEscape(sessionSource) + "\"" +
+                    ",\"connectedInSync\":" + (connectedInSync ? "true" : "false") +
+                    ",\"sourceInSync\":" + (sourceInSync ? "true" : "false") +
+                "}" +
+            "}";
+            return httpResp(200, "application/json", bodyResp);
+        }
+
         // Metadata ingestion mode control: exactly one mode active at a time.
         if (method == "POST" && (sub == "metadata/start" || sub == "metadata/stop")) {
             bool start = (sub == "metadata/start");
