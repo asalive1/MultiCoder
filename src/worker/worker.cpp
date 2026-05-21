@@ -4565,6 +4565,7 @@ void Worker::monitorInputLevels() {
     std::string lastFailure;
     std::string lastUnsupportedMode;
     std::string meterWarning;
+    std::string activeSessionKey;
     auto lastDataAt = std::chrono::steady_clock::now();
     auto lastNoDataLogAt = std::chrono::steady_clock::now() - std::chrono::seconds(10);
     auto lastMeterUpdateAt = std::chrono::steady_clock::now() - std::chrono::seconds(10);
@@ -4617,6 +4618,37 @@ void Worker::monitorInputLevels() {
             rtpPort = srtRelayPort;
             iface   = "127.0.0.1"; // loopback interface for multicast join
         }
+
+        std::string sessionKey;
+        if (!connected) {
+            sessionKey = "disconnected";
+        } else if (inType == "audio") {
+            sessionKey = "audio:" + audioDevice + ":" + std::to_string(sampleRate);
+        } else {
+            sessionKey = inType + ":" + rtpAddr + ":" + std::to_string(rtpPort) + ":" + iface;
+        }
+        if (!activeSessionKey.empty() && sessionKey != activeSessionKey) {
+            if (levelSocket >= 0) {
+                close_socket(levelSocket);
+                levelSocket = -1;
+            }
+            activeAddr.clear();
+            activePort = 0;
+            activeIface.clear();
+#ifdef _WIN32
+            if (waveMeter.open) closeWaveInput(waveMeter);
+            if (wasapiMeter.open) closeWasapiInput(wasapiMeter);
+            activeAudioDevice.clear();
+            activeSampleRate = 48000;
+#endif
+            lastMeterL = -60;
+            lastMeterR = -60;
+            lastMeterUpdateAt = std::chrono::steady_clock::now() - std::chrono::seconds(10);
+            lastDataAt = std::chrono::steady_clock::now() - std::chrono::seconds(10);
+            meterWarning = connected ? "Input session changed; waiting for fresh telemetry" : "Input disconnected";
+            log("Input session changed: " + activeSessionKey + " -> " + sessionKey);
+        }
+        activeSessionKey = sessionKey;
 
         if (connected && !lastConnected) {
             log("Input connect requested: type=" + inType + " addr=" + rtpAddr +
@@ -4789,6 +4821,7 @@ void Worker::monitorInputLevels() {
                     simplejson::Object rt = readRuntimeState(m_cfgDir);
                     rt.setInt("inputLevelL", left);
                     rt.setInt("inputLevelR", right);
+                    rt.setInt("inputLevelEpoch", static_cast<int>(std::time(nullptr)));
                     rt.setString("inputWarning", meterWarning);
                     stampHealth(rt);
                     writeRuntimeState(m_cfgDir, rt);
@@ -4812,6 +4845,7 @@ void Worker::monitorInputLevels() {
                 simplejson::Object rt = readRuntimeState(m_cfgDir);
                 rt.setInt("inputLevelL", -60);
                 rt.setInt("inputLevelR", -60);
+                rt.setInt("inputLevelEpoch", static_cast<int>(std::time(nullptr)));
                 rt.setString("inputWarning", connected ? meterWarning : "Input disconnected");
                 stampHealth(rt);
                 writeRuntimeState(m_cfgDir, rt);
@@ -4833,6 +4867,7 @@ void Worker::monitorInputLevels() {
                     simplejson::Object rt = readRuntimeState(m_cfgDir);
                     rt.setInt("inputLevelL", -60);
                     rt.setInt("inputLevelR", -60);
+                    rt.setInt("inputLevelEpoch", static_cast<int>(std::time(nullptr)));
                     rt.setString("inputWarning", openErr.empty() ? "Input source unavailable" : openErr);
                     stampHealth(rt);
                     writeRuntimeState(m_cfgDir, rt);
@@ -4912,6 +4947,7 @@ void Worker::monitorInputLevels() {
             simplejson::Object rt = readRuntimeState(m_cfgDir);
             rt.setInt("inputLevelL", left);
             rt.setInt("inputLevelR", right);
+            rt.setInt("inputLevelEpoch", static_cast<int>(std::time(nullptr)));
             rt.setString("inputWarning", connected ? meterWarning : "Input disconnected");
             stampHealth(rt);
             writeRuntimeState(m_cfgDir, rt);

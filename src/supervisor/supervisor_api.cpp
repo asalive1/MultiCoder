@@ -1916,6 +1916,10 @@ static std::string handleReq(const std::string& raw, const std::string& clientIp
                 rt.setString("sessionSrtStreamId", srtStreamId);
                 rt.setInt("sessionSrtPbkeylen", srtPbkeylen);
                 rt.setString("sessionSrtPass", srtPass);
+                rt.setInt("inputLevelL", -60);
+                rt.setInt("inputLevelR", -60);
+                rt.setInt("inputLevelEpoch", static_cast<int>(std::time(nullptr)));
+                rt.setString("inputWarning", "Input session changed; waiting for fresh telemetry");
 
                 appendEncoderLog(idx + 1, "Input connect confirmed: type=" + inputType + 
                                  (inputType != "audio" ? " addr=" + rtpAddress + ":" + std::to_string(rtpPort) +
@@ -1992,6 +1996,12 @@ static std::string handleReq(const std::string& raw, const std::string& clientIp
                     atomicWriteRuntimeState(idx + 1, rtDis);
                 }
                 setRuntimeInputConnected(idx + 1, false);
+                simplejson::Object rtNow = readRuntimeState(idx + 1);
+                rtNow.setInt("inputLevelL", -60);
+                rtNow.setInt("inputLevelR", -60);
+                rtNow.setInt("inputLevelEpoch", static_cast<int>(std::time(nullptr)));
+                rtNow.setString("inputWarning", "Input disconnected");
+                atomicWriteRuntimeState(idx + 1, rtNow);
                 simplejson::Object session = readInputSessionState(idx + 1);
                 session.setBool("inputConnected", false);
                 atomicWriteInputSessionState(idx + 1, session);
@@ -2061,9 +2071,22 @@ static std::string handleReq(const std::string& raw, const std::string& clientIp
             // Real levels are expected from worker telemetry; return silence defaults until available.
             int left = runtime.getInt("inputLevelL", -60);
             int right = runtime.getInt("inputLevelR", -60);
+            int nowEpoch = static_cast<int>(std::time(nullptr));
+            int hbEpoch = runtime.getInt("workerHeartbeatEpoch", 0);
+            int levelEpoch = runtime.getInt("inputLevelEpoch", 0);
+            bool workerFresh = hbEpoch > 0 && (nowEpoch - hbEpoch) <= 8;
+            bool levelFresh = levelEpoch > 0 && (nowEpoch - levelEpoch) <= 3;
             if (!connected) {
                 left = -60;
                 right = -60;
+            } else if (!workerFresh || !levelFresh) {
+                left = -60;
+                right = -60;
+                if (warning.empty()) {
+                    warning = !workerFresh
+                        ? "Worker telemetry stale (worker offline or restarting)"
+                        : "Input levels stale; waiting for fresh telemetry";
+                }
             }
             std::string bodyResp = std::string("{\"connected\":") + (connected ? "true" : "false") +
                                    ",\"leftDb\":" + std::to_string(left) +
