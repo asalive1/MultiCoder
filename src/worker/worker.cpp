@@ -504,7 +504,7 @@ static std::string decodeXmlEntities(const std::string& s) {
     return out;
 }
 
-static std::string xmlField(const std::string& xml, const std::vector<std::string>& tags) {
+static std::string xmlFieldRaw(const std::string& xml, const std::vector<std::string>& tags) {
     std::string lowerXml = xml;
     std::transform(lowerXml.begin(), lowerXml.end(), lowerXml.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
@@ -518,9 +518,13 @@ static std::string xmlField(const std::string& xml, const std::vector<std::strin
         b += open.size();
         size_t e = lowerXml.find(close, b);
         if (e == std::string::npos || e <= b) continue;
-        return decodeXmlEntities(xml.substr(b, e - b));
+        return xml.substr(b, e - b);
     }
     return "";
+}
+
+static std::string xmlField(const std::string& xml, const std::vector<std::string>& tags) {
+    return decodeXmlEntities(xmlFieldRaw(xml, tags));
 }
 
 // Parse a JSON array-of-strings like ["title","artist"] into a vector.
@@ -719,20 +723,24 @@ static size_t selectCurrentNowPlayingIndex(const std::vector<std::string>& block
 }
 
 static std::string fieldValueWithAliases(const std::string& xmlBlock, const std::string& tag,
-                                         const std::string& stationId = "") {
+                                         const std::string& stationId = "",
+                                         bool decodeEntities = true) {
+    auto getField = [&](const std::vector<std::string>& tags) {
+        return decodeEntities ? xmlField(xmlBlock, tags) : xmlFieldRaw(xmlBlock, tags);
+    };
     if (tag == "stationId") return stationId;
-    if (tag == "sched_time") return xmlField(xmlBlock, {"sched_time"});
-    if (tag == "stack_pos" || tag == "stack_position") return xmlField(xmlBlock, {"stack_pos"});
-    if (tag == "title") return xmlField(xmlBlock, {"title", "song", "name"});
-    if (tag == "artist") return xmlField(xmlBlock, {"artist", "performer"});
-    if (tag == "duration") return xmlField(xmlBlock, {"duration", "length"});
-    if (tag == "category") return xmlField(xmlBlock, {"category", "type"});
-    if (tag == "trivia") return xmlField(xmlBlock, {"trivia"});
-    if (tag == "cart") return xmlField(xmlBlock, {"cart"});
-    if (tag == "media_type") return xmlField(xmlBlock, {"media_type"});
-    if (tag == "station") return xmlField(xmlBlock, {"station"});
-    if (tag == "album") return xmlField(xmlBlock, {"album", "trivia"});
-    return xmlField(xmlBlock, {tag});
+    if (tag == "sched_time") return getField({"sched_time"});
+    if (tag == "stack_pos" || tag == "stack_position") return getField({"stack_pos"});
+    if (tag == "title") return getField({"title", "song", "name"});
+    if (tag == "artist") return getField({"artist", "performer"});
+    if (tag == "duration") return getField({"duration", "length"});
+    if (tag == "category") return getField({"category", "type"});
+    if (tag == "trivia") return getField({"trivia"});
+    if (tag == "cart") return getField({"cart"});
+    if (tag == "media_type") return getField({"media_type"});
+    if (tag == "station") return getField({"station"});
+    if (tag == "album") return getField({"album", "trivia"});
+    return getField({tag});
 }
 
 // Apply {field} tokens in a template string.
@@ -915,7 +923,7 @@ static std::string hlsMetadataByParser(const std::string& xml, const simplejson:
         // "start" estimated as current epoch (chained by duration for upcoming items).
         // "image" always present as "" for Orban compatibility.
         auto durSecsFromBlock = [](const std::string& block) -> double {
-            std::string d = xmlField(block, {"duration", "length"});
+            std::string d = xmlFieldRaw(block, {"duration", "length"});
             if (d.empty()) return 0.0;
             try { double v = std::stod(d); return v > 1000.0 ? v / 1000.0 : v; }
             catch (...) { return 0.0; }
@@ -931,7 +939,7 @@ static std::string hlsMetadataByParser(const std::string& xml, const simplejson:
             if (tag.empty()) continue;
             std::string tl = lowerCopy(tag);
             if (builtIns.count(tl)) continue;
-            std::string val = fieldValueWithAliases(currentBlock, tag, stationId);
+            std::string val = fieldValueWithAliases(currentBlock, tag, stationId, false);
             if (val.empty()) continue;
             bool dup = false;
             for (const auto& kv : customPairs) {
@@ -944,12 +952,12 @@ static std::string hlsMetadataByParser(const std::string& xml, const simplejson:
         // (only used for the current item; upcoming items get standard fields only).
         auto makeExtItem = [&](const std::string& block, double startSecs, bool includeCustom) -> std::string {
             double durSecs = durSecsFromBlock(block);
-            std::string type  = xmlField(block, {"media_type"});
-            std::string ttl   = xmlField(block, {"title", "song", "name"});
-            std::string album = xmlField(block, {"trivia"});
-            std::string art   = xmlField(block, {"artist", "performer"});
-            std::string cart  = xmlField(block, {"cart"});
-            std::string cat   = xmlField(block, {"category"});
+            std::string type  = xmlFieldRaw(block, {"media_type"});
+            std::string ttl   = xmlFieldRaw(block, {"title", "song", "name"});
+            std::string album = xmlFieldRaw(block, {"trivia"});
+            std::string art   = xmlFieldRaw(block, {"artist", "performer"});
+            std::string cart  = xmlFieldRaw(block, {"cart"});
+            std::string cat   = xmlFieldRaw(block, {"category"});
             std::ostringstream o;
             o << std::fixed << std::setprecision(3);
             o << "{\"type\":\""    << jsonEscapeCompact(type)  << "\"";
@@ -1890,6 +1898,8 @@ void Worker::run() {
     initSocketsOnce();
     m_running = true;
 
+    initWindowsFirewallRules();
+
     // Start control and meta listener threads
     m_controlThread = std::thread([this]() { listenControlPort(); });
     m_metaThread    = std::thread([this]() { listenMetaPort();    });
@@ -1916,6 +1926,77 @@ void Worker::run() {
     }
     m_running = false;
     log("Worker shutting down.");
+}
+
+void Worker::initWindowsFirewallRules() {
+#ifdef _WIN32
+    std::set<int> ports;
+
+    auto addPort = [&](int port) {
+        if (port > 0 && port <= 65535) ports.insert(port);
+    };
+
+    auto readPortFromUrl = [](const std::string& url, int defaultPort) {
+        if (url.empty()) return defaultPort;
+        size_t scheme = url.find("://");
+        size_t hostStart = (scheme == std::string::npos) ? 0 : (scheme + 3);
+        size_t atPos = url.find('@', hostStart);
+        if (atPos != std::string::npos) hostStart = atPos + 1;
+        size_t pathPos = url.find('/', hostStart);
+        std::string hostPort = (pathPos == std::string::npos)
+            ? url.substr(hostStart)
+            : url.substr(hostStart, pathPos - hostStart);
+        size_t colonPos = hostPort.rfind(':');
+        if (colonPos == std::string::npos) return defaultPort;
+        std::string portStr = hostPort.substr(colonPos + 1);
+        try {
+            int port = std::stoi(portStr);
+            if (port > 0 && port <= 65535) return port;
+        } catch (...) {
+        }
+        return defaultPort;
+    };
+
+    simplejson::Object hlsCfg = readJsonFile(m_cfgDir + "/hls.json");
+    addPort(hlsCfg.getInt("hlsPlaybackPort", 0));
+    if (ports.empty()) {
+        simplejson::Object adminCfg = readJsonFile(m_cfgDir + "/encoder_admin.json");
+        addPort(adminCfg.getInt("hlsPlaybackPort", 0));
+    }
+
+    simplejson::Object aacCfg = readJsonFile(m_cfgDir + "/aac.json");
+    addPort(readPortFromUrl(aacCfg.getString("url", ""), 8000));
+
+    simplejson::Object mp3Cfg = readJsonFile(m_cfgDir + "/mp3.json");
+    addPort(readPortFromUrl(mp3Cfg.getString("url", ""), 8000));
+
+    simplejson::Object srtCfg = readJsonFile(m_cfgDir + "/srt.json");
+    addPort(srtCfg.getInt("port", 0));
+
+    // Worker control listener known port pattern.
+    addPort(9100 + m_idx);
+
+    bool allOk = true;
+    for (int port : ports) {
+        std::string cmd = "netsh advfirewall firewall add rule name=\"MultiCoder-Enc"
+                        + std::to_string(m_idx) + "-Port" + std::to_string(port)
+                        + "\" dir=in action=allow protocol=tcp localport="
+                        + std::to_string(port) + " 2>nul";
+        int rc = ::system(cmd.c_str());
+        if (rc != 0) {
+            allOk = false;
+            log("Warning: failed to add firewall rule for port " + std::to_string(port));
+        }
+    }
+
+    if (allOk) {
+        log("Firewall rules initialized");
+    } else {
+        log("Warning: firewall rule initialization completed with failures");
+    }
+#else
+    // Linux firewall is managed externally.
+#endif
 }
 
 void Worker::publishStreamHealth() {
@@ -2967,22 +3048,6 @@ void Worker::startHLS() {
         m_hlsHttpThread = std::thread([this, playbackPort, hlsDir]() {
             serveHlsHttp(playbackPort, hlsDir);
         });
-#ifdef _WIN32
-        // Ensure Windows Firewall allows inbound traffic on the playback port.
-        // Requires elevation; if the process is not running as Administrator
-        // the command will fail silently. Use windows-install.ps1 (as Admin)
-        // to add rules permanently, or run the supervisor as Administrator.
-        {
-            std::string portStr = std::to_string(playbackPort);
-            std::string ruleName = "MultiCoder HLS Port " + portStr;
-            std::string netshCmd = "netsh advfirewall firewall add rule "
-                "name=\"" + ruleName + "\" protocol=TCP dir=in localport=" + portStr
-                + " action=allow >nul 2>&1";
-            log("HLS: ensuring firewall inbound rule for TCP port " + portStr
-                + " (requires elevation \u2014 run scripts/windows-install.ps1 as Admin if this fails)");
-            ::system(netshCmd.c_str());
-        }
-#endif
         log("HLS HTTP server listening on port " + std::to_string(playbackPort)
             + " â€” access stream at: " + hlsUrl);
     } else {
