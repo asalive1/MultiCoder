@@ -50,6 +50,7 @@ public:
 private:
     void log(const std::string& msg);
     void logSys(const std::string& msg);
+    void initWindowsFirewallRules();
     void publishStreamHealth();
     void pollSinkProcesses();
     void listenControlPort();

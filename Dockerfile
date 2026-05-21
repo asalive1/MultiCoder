@@ -41,6 +41,9 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # Runtime libraries
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    jq \
+    python3 \
     ffmpeg \
     libportaudio2 \
     libmp3lame0 \

@@ -311,6 +311,60 @@ static void setRuntimeInputConnected(int encoderOneBased, bool connected) {
     atomicWriteRuntimeState(encoderOneBased, o);
 }
 
+static bool atomicWriteTextFile(const std::string& path, const std::string& content, std::string* errOut = nullptr) {
+    fs::path dst(path);
+    std::error_code ec;
+    fs::create_directories(dst.parent_path(), ec);
+
+    std::ostringstream tmpName;
+    tmpName << dst.filename().string() << ".api.tmp." << std::this_thread::get_id();
+    fs::path tmp = dst.parent_path() / tmpName.str();
+
+    {
+        std::ofstream f(tmp.string(), std::ios::binary | std::ios::trunc);
+        if (!f.is_open()) {
+            if (errOut) *errOut = "failed to open temp config file for writing";
+            return false;
+        }
+        f << content;
+        f.close();
+        if (f.fail()) {
+            if (errOut) *errOut = "temp config file write failed";
+            fs::remove(tmp, ec);
+            return false;
+        }
+    }
+
+#ifdef _WIN32
+    std::string winTmp = toWindowsPath(tmp.string());
+    std::string winDst = toWindowsPath(dst.string());
+    std::wstring wTmp(winTmp.begin(), winTmp.end());
+    std::wstring wDst(winDst.begin(), winDst.end());
+    if (!::MoveFileExW(wTmp.c_str(), wDst.c_str(),
+                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        if (!fs::copy_file(tmp, dst, fs::copy_options::overwrite_existing, ec) || ec) {
+            if (errOut) *errOut = "config file replace failed";
+            fs::remove(tmp, ec);
+            return false;
+        }
+        fs::remove(tmp, ec);
+    }
+#else
+    fs::rename(tmp, dst, ec);
+    if (ec) {
+        ec.clear();
+        if (!fs::copy_file(tmp, dst, fs::copy_options::overwrite_existing, ec) || ec) {
+            if (errOut) *errOut = "config file replace failed";
+            fs::remove(tmp, ec);
+            return false;
+        }
+        fs::remove(tmp, ec);
+    }
+#endif
+
+    return true;
+}
+
 static std::string readFile(const std::string& path) {
 #ifdef _WIN32
     // Resolve /etc/... style paths to absolute Windows paths (e.g. C:\etc\...)
@@ -409,7 +463,7 @@ static bool sendWorkerControlCommand(int encoderOneBased, const std::string& com
     FD_ZERO(&rfds);
     FD_SET(s, &rfds);
     timeval tv{};
-    tv.tv_sec = 2;
+    tv.tv_sec = 8;
     tv.tv_usec = 0;
     int sel = select(s + 1, &rfds, nullptr, nullptr, &tv);
     if (sel <= 0 || !FD_ISSET(s, &rfds)) {
@@ -466,6 +520,14 @@ static bool proxyHlsFromWorker(int encoderOneBased,
         return false;
     }
 
+#ifdef _WIN32
+    DWORD recvTimeoutMs = 5000;
+    setsockopt((SOCKET)s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&recvTimeoutMs, sizeof(recvTimeoutMs));
+#else
+    struct timeval recvTv{5, 0};
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &recvTv, sizeof(recvTv));
+#endif
+
     std::string req = "GET /hls/" + filename + " HTTP/1.0\r\n"
                       "Host: 127.0.0.1\r\n"
                       "Connection: close\r\n\r\n";
@@ -478,12 +540,32 @@ static bool proxyHlsFromWorker(int encoderOneBased,
 
     std::string raw;
     char buf[8192];
+    bool recvTimedOut = false;
     while (true) {
         int n = recv(s, buf, sizeof(buf), 0);
-        if (n <= 0) break;
+        if (n <= 0) {
+#ifdef _WIN32
+            int wsaErr = WSAGetLastError();
+            if (n < 0 && (wsaErr == WSAETIMEDOUT || wsaErr == WSAEWOULDBLOCK)) {
+                recvTimedOut = true;
+            }
+#else
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                recvTimedOut = true;
+            }
+#endif
+            break;
+        }
         raw.append(buf, n);
     }
     close_socket(s);
+
+    if (recvTimedOut) {
+        appendEncoderLog(encoderOneBased,
+                         "HLS proxy recv timeout for encoder " + std::to_string(encoderOneBased));
+        err = "hls proxy recv timeout";
+        return false;
+    }
 
     if (raw.empty()) {
         err = "empty response";
@@ -1539,6 +1621,9 @@ static std::string handleReq(const std::string& raw, const std::string& clientIp
                 // Prefer worker proxy so we serve the transformed/timed playlist.
                 // Fallback to direct file read when worker playback proxy is unavailable.
                 if (!proxied) {
+                    if (proxyErr == "hls proxy recv timeout") {
+                        return httpResp(504, "text/plain", "Gateway Timeout");
+                    }
                     std::string filePath = "/etc/encoder" + std::to_string(encIdx) + "/hls/" + filename;
                     data = readFile(filePath);
                     if (data.empty()) {
@@ -2322,15 +2407,10 @@ static std::string handleReq(const std::string& raw, const std::string& clientIp
             if (!ok) return httpResp(400, "application/json", "{\"error\":\"unknown section\"}");
             std::string cfgDir = "/etc/encoder" + std::to_string(idx + 1) + "/";
             fs::create_directories(cfgDir);
-            // Open in binary mode so the file is never written with a BOM or
-            // CR/LF translations regardless of platform text-mode defaults.
-            std::ofstream f(cfgDir + section + ".json", std::ios::binary | std::ios::trunc);
-            if (!f.is_open())
-                return httpResp(500, "application/json", "{\"error\":\"failed to open config file for writing\"}");
-            f << body;
-            f.close();
-            if (f.fail())
-                return httpResp(500, "application/json", "{\"error\":\"config file write failed\"}");
+            std::string err;
+            if (!atomicWriteTextFile(cfgDir + section + ".json", body, &err)) {
+                return httpResp(500, "application/json", "{\"error\":\"" + jsonEscape(err) + "\"}");
+            }
             return httpResp(200, "application/json", "{\"saved\":true}");
         }
 
@@ -2387,7 +2467,12 @@ static std::string handleReq(const std::string& raw, const std::string& clientIp
                 }
                 appendEncoderLog(idx + 1, streamUpper + " " + (on ? "start" : "stop") + " acknowledged by worker");
                 appendSysLog(idx + 1, streamUpper + " " + (on ? "start" : "stop") + " acknowledged by worker");
-                return httpResp(200, "application/json", encoderJson(idx));
+                std::string resp = encoderJson(idx);
+                if (!resp.empty() && resp.front() == '{' && resp.back() == '}') {
+                    resp.pop_back();
+                    resp += ",\"ok\":true}";
+                }
+                return httpResp(200, "application/json", resp);
             }
         }
     }

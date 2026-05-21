@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# smoke-test.sh — Basic health + start/stop smoke tests against a running MultiCoder instance.
+# smoke-test.sh ? Basic health + start/stop smoke tests against a running MultiCoder instance.
 # Requires: curl, jq
 # Usage:  ./scripts/smoke-test.sh [host] [port]
 #         defaults: localhost 8050
@@ -15,9 +15,9 @@ FAIL=0
 check() {
     local desc="$1"; local expect="$2"; local actual="$3"
     if [[ "$actual" == *"$expect"* ]]; then
-        echo "  PASS: $desc"; ((PASS++))
+        echo "  PASS: $desc"; ((PASS+=1))
     else
-        echo "  FAIL: $desc — expected '$expect', got '$actual'"; ((FAIL++))
+        echo "  FAIL: $desc ? expected '$expect', got '$actual'"; ((FAIL+=1))
     fi
 }
 
@@ -66,9 +66,9 @@ check "Encoder 1 HLS not started" '"hls":false' "$body"
 body=$(curl -sf "$BASE/api/encoder/1/log" || echo "CURL_FAILED")
 # Response should be text (may be empty or a message)
 if [[ "$body" != "CURL_FAILED" ]]; then
-    echo "  PASS: /api/encoder/1/log accessible"; ((PASS++))
+    echo "  PASS: /api/encoder/1/log accessible"; ((PASS+=1))
 else
-    echo "  FAIL: /api/encoder/1/log not accessible"; ((FAIL++))
+    echo "  FAIL: /api/encoder/1/log not accessible"; ((FAIL+=1))
 fi
 
 # 10. Config save + read round-trip
@@ -113,6 +113,89 @@ check "Input status includes effective SRT latency" 'latency=500 ms' "$body"
 
 curl -sf -X POST "$BASE/api/encoder/1/input/disconnect" -H "Content-Type: application/json" -d '{}' > /dev/null
 
+echo "--- Critical stability checks ---"
+
+# TEST 2 (both platforms): StartHLS ACK should return within 3 seconds.
+curl -sf -X POST "$BASE/api/encoder/1/hls/stop" > /dev/null || true
+start_ms=$(date +%s%3N)
+start_hls_body=$(curl -s -X POST "$BASE/api/encoder/1/hls/start")
+end_ms=$(date +%s%3N)
+ack_ms=$((end_ms - start_ms))
+if [[ "$start_hls_body" == *"\"ok\":true"* && "$ack_ms" -le 3000 ]]; then
+    echo "  PASS: StartHLS ACK within 3 seconds (${ack_ms} ms)"; ((PASS+=1))
+else
+    echo "  FAIL: StartHLS ACK exceeded 3 seconds or returned error (${ack_ms} ms, body=${start_hls_body})"; ((FAIL+=1))
+fi
+
+# TEST 3 (both platforms): optional delayed StartHLS ACK validation.
+# Enable by setting MC_ENABLE_SLOW_ACK_TEST=1 and using a test build that injects ~5s delay at startHLS().
+if [[ "${MC_ENABLE_SLOW_ACK_TEST:-0}" == "1" ]]; then
+    curl -sf -X POST "$BASE/api/encoder/1/hls/stop" > /dev/null || true
+    slow_start_ms=$(date +%s%3N)
+    slow_body=$(curl -s -X POST "$BASE/api/encoder/1/hls/start")
+    slow_end_ms=$(date +%s%3N)
+    slow_ack_ms=$((slow_end_ms - slow_start_ms))
+    if [[ "$slow_body" == *"\"ok\":true"* && "$slow_ack_ms" -ge 4000 && "$slow_ack_ms" -le 8000 ]]; then
+        echo "  PASS: Slow StartHLS ACK succeeded within extended timeout (${slow_ack_ms} ms)"; ((PASS+=1))
+    else
+        echo "  FAIL: Slow StartHLS ACK validation failed (${slow_ack_ms} ms, body=${slow_body})"; ((FAIL+=1))
+    fi
+else
+    echo "  WARN: Skipping delayed-ACK test (set MC_ENABLE_SLOW_ACK_TEST=1 with delay-instrumented build)"
+fi
+
+# TEST 4 (both platforms): HLS proxy timeout should return 504 around recv timeout window.
+admin_cfg="/etc/encoder1/encoder_admin.json"
+admin_backup="${admin_cfg}.bak.smoke"
+dummy_pid=""
+if [[ -f "$admin_cfg" ]]; then
+    cp "$admin_cfg" "$admin_backup"
+    dummy_port=18991
+    jq --argjson p "$dummy_port" '.hlsPlaybackPort = $p' "$admin_cfg" > "${admin_cfg}.tmp"
+    mv "${admin_cfg}.tmp" "$admin_cfg"
+
+    python3 - "$dummy_port" <<'PY' &
+import socket
+import sys
+import time
+
+port = int(sys.argv[1])
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", port))
+s.listen(1)
+conn, _ = s.accept()
+time.sleep(12)
+conn.close()
+s.close()
+PY
+    dummy_pid=$!
+    sleep 1
+
+    proxy_start_ms=$(date +%s%3N)
+    proxy_code=$(curl -s -o /tmp/mc_proxy_timeout.out -w "%{http_code}" --max-time 15 "$BASE/encoder/1/hls/index.m3u8" || echo "000")
+    proxy_end_ms=$(date +%s%3N)
+    proxy_ms=$((proxy_end_ms - proxy_start_ms))
+
+    if [[ "$proxy_code" == "504" && "$proxy_ms" -le 10000 ]]; then
+        echo "  PASS: HLS proxy timeout returned 504 in ${proxy_ms} ms"; ((PASS+=1))
+    else
+        echo "  FAIL: HLS proxy timeout check failed (status=${proxy_code}, elapsed=${proxy_ms} ms)"; ((FAIL+=1))
+    fi
+else
+    echo "  WARN: Missing ${admin_cfg}; skipping HLS proxy timeout check"
+fi
+
+if [[ -n "$dummy_pid" ]]; then
+    kill "$dummy_pid" >/dev/null 2>&1 || true
+fi
+if [[ -f "$admin_backup" ]]; then
+    mv "$admin_backup" "$admin_cfg"
+fi
+
 echo ""
 echo "=== Results: ${PASS} passed, ${FAIL} failed ==="
-[[ "$FAIL" -eq 0 ]]
+if [[ "$FAIL" -eq 0 ]]; then
+    exit 0
+fi
+exit 1
