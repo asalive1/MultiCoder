@@ -581,7 +581,7 @@ static std::string jsonEscapeCompact(const std::string& s) {
     return out;
 }
 
-static bool isSafeMetaForExtinf(const std::string& s, size_t maxLen = 1024) {
+static bool isSafeMetaForExtinf(const std::string& s, size_t maxLen = 8192) {
     if (s.empty()) return false;
     if (s.size() > maxLen) return false;
     for (unsigned char c : s) {
@@ -591,7 +591,7 @@ static bool isSafeMetaForExtinf(const std::string& s, size_t maxLen = 1024) {
     return true;
 }
 
-static std::string sanitizeForExtinf(const std::string& in, size_t maxLen = 1024) {
+static std::string sanitizeForExtinf(const std::string& in, size_t maxLen = 8192) {
     std::string out;
     out.reserve((std::min)(maxLen, in.size()));
     for (char c : in) {
@@ -5065,7 +5065,7 @@ void Worker::listenMetaPort() {
                 simplejson::Object parser = hlsCfg.getSubObject("metaParser");
                 std::string scope = parser.getString("scope", "current");
                 log("HLS playlist metadata injected (scope=" + scope + ")");
-            } else if (injectErr != "playlist not found" && injectErr != "playlist empty") {
+            } else {
                 log("HLS playlist metadata injection skipped: " + injectErr);
             }
         }
