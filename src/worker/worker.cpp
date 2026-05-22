@@ -2017,12 +2017,59 @@ void Worker::initWindowsFirewallRules() {
 
 void Worker::publishStreamHealth() {
     std::lock_guard<std::mutex> lk(m_rtMutex);
+
+    auto lower = [](std::string s) {
+        for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return s;
+    };
+
+    auto hasFreshHlsOutput = [&](int maxAgeSec) {
+        std::error_code ec;
+        fs::path hlsDir = fs::path(m_cfgDir) / "hls";
+        fs::path playlist = hlsDir / "index.m3u8";
+        if (!fs::exists(playlist, ec) || ec) return false;
+        auto sz = fs::file_size(playlist, ec);
+        if (ec || sz == 0) return false;
+
+        auto now = fs::file_time_type::clock::now();
+        auto plTime = fs::last_write_time(playlist, ec);
+        if (ec || (now - plTime) > std::chrono::seconds(maxAgeSec)) return false;
+
+        fs::path segDir = hlsDir / "segments";
+        if (!fs::exists(segDir, ec) || ec) return false;
+
+        for (const auto& e : fs::directory_iterator(segDir, ec)) {
+            if (ec) break;
+            std::string ext = lower(e.path().extension().string());
+            if (ext != ".aac" && ext != ".ts" && ext != ".m4s") continue;
+            auto t = fs::last_write_time(e.path(), ec);
+            if (!ec && (now - t) <= std::chrono::seconds(maxAgeSec)) return true;
+        }
+        return false;
+    };
+
     simplejson::Object rt = readRuntimeState(m_cfgDir);
+    std::string inputWarning = lower(rt.getString("inputWarning", ""));
+    bool inputConnected = rt.getBool("inputConnected", false);
+    bool inputLikelyFlowing = true;
+    if (inputConnected) {
+        if (inputWarning.find("no packets") != std::string::npos ||
+            inputWarning.find("unavailable") != std::string::npos ||
+            inputWarning.find("disconnected") != std::string::npos) {
+            inputLikelyFlowing = false;
+        }
+    }
+
+    bool aacLive = m_aacRunning.load() && (!inputConnected || inputLikelyFlowing);
+    bool mp3Live = m_mp3Running.load() && (!inputConnected || inputLikelyFlowing);
+    bool hlsLive = m_hlsRunning.load() && hasFreshHlsOutput(25) && (!inputConnected || inputLikelyFlowing);
+    bool srtLive = m_srtRunning.load() && (!inputConnected || inputLikelyFlowing);
+
     rt.setInt("workerHeartbeatEpoch", static_cast<int>(std::time(nullptr)));
-    rt.setBool("workerAacRunning", m_aacRunning.load());
-    rt.setBool("workerMp3Running", m_mp3Running.load());
-    rt.setBool("workerHlsRunning", m_hlsRunning.load());
-    rt.setBool("workerSrtRunning", m_srtRunning.load());
+    rt.setBool("workerAacRunning", aacLive);
+    rt.setBool("workerMp3Running", mp3Live);
+    rt.setBool("workerHlsRunning", hlsLive);
+    rt.setBool("workerSrtRunning", srtLive);
     rt.setBool("controlListenerRunning", m_controlListenerRunning.load());
     rt.setBool("cueListenerRunning", m_cueListenerRunning.load());
     writeRuntimeState(m_cfgDir, rt);
