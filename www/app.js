@@ -1979,12 +1979,22 @@ function renderLogSection(cl, cr) {
 async function refreshStatus() {
     try {
         const data = await apiGet('/api/encoders');
+    const asBool = (value) => {
+      if (typeof value === 'boolean') return value;
+      if (typeof value === 'number') return value !== 0;
+      if (typeof value === 'string') {
+        const v = value.trim().toLowerCase();
+        if (v === 'true' || v === '1' || v === 'yes' || v === 'on') return true;
+        if (v === 'false' || v === '0' || v === 'no' || v === 'off' || v === '') return false;
+      }
+      return false;
+    };
         encoders = data.map(e => ({
             id: e.id,
-            aac: !!e.aac,
-            mp3: !!e.mp3,
-            hls: !!e.hls,
-            srt: !!e.srt,
+      aac: asBool(e.aac),
+      mp3: asBool(e.mp3),
+      hls: asBool(e.hls),
+      srt: asBool(e.srt),
         }));
         renderEncoderCards();
     } catch (e) {
