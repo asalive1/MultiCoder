@@ -946,7 +946,7 @@ static std::string hlsMetadataByParser(const std::string& xml, const simplejson:
             if (tag.empty()) continue;
             std::string tl = lowerCopy(tag);
             if (builtIns.count(tl)) continue;
-            std::string val = fieldValueWithAliases(currentBlock, tag, stationId, false);
+            std::string val = fieldValueWithAliases(currentBlock, tag, stationId);
             if (val.empty()) continue;
             bool dup = false;
             for (const auto& kv : customPairs) {
@@ -959,12 +959,12 @@ static std::string hlsMetadataByParser(const std::string& xml, const simplejson:
         // (only used for the current item; upcoming items get standard fields only).
         auto makeExtItem = [&](const std::string& block, double startSecs, bool includeCustom) -> std::string {
             double durSecs = durSecsFromBlock(block);
-            std::string type  = xmlFieldRaw(block, {"media_type"});
-            std::string ttl   = xmlFieldRaw(block, {"title", "song", "name"});
-            std::string album = xmlFieldRaw(block, {"trivia"});
-            std::string art   = xmlFieldRaw(block, {"artist", "performer"});
-            std::string cart  = xmlFieldRaw(block, {"cart"});
-            std::string cat   = xmlFieldRaw(block, {"category"});
+            std::string type  = xmlField(block, {"media_type"});
+            std::string ttl   = xmlField(block, {"title", "song", "name"});
+            std::string album = xmlField(block, {"trivia"});
+            std::string art   = xmlField(block, {"artist", "performer"});
+            std::string cart  = xmlField(block, {"cart"});
+            std::string cat   = xmlField(block, {"category"});
             std::ostringstream o;
             o << std::fixed << std::setprecision(3);
             o << "{\"type\":\""    << jsonEscapeCompact(type)  << "\"";
