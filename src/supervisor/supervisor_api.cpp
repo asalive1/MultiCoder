@@ -14,6 +14,7 @@
 #include <deque>
 #include <map>
 #include <mutex>
+#include <cstdio>
 #include <signal.h>
 #include <sstream>
 #include <string>
@@ -43,6 +44,7 @@ typedef int ssize_t;
 #else
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <unistd.h>
 #endif
@@ -95,6 +97,9 @@ static HANDLE getOrCreateJobObject() {
 
 static std::string readFile(const std::string& path);
 static bool atomicWriteTextFile(const std::string& path, const std::string& content, std::string* errOut);
+static std::string trimCopy(const std::string& s);
+static std::string tailSysLog(int lines);
+static std::string tailLog(int encoderIdx, int lines);
 
 struct EncoderState {
     bool aac_running = false;
@@ -333,6 +338,257 @@ static bool testTcpConnect(const std::string& host, int port, std::string& err) 
     freeaddrinfo(res);
     if (!ok && err.empty()) err = "connect timeout";
     return ok;
+}
+
+static std::string runCommandCapture(const std::string& cmd) {
+    std::string out;
+#ifdef _WIN32
+    FILE* pipe = _popen(cmd.c_str(), "r");
+#else
+    FILE* pipe = popen(cmd.c_str(), "r");
+#endif
+    if (!pipe) return "";
+    char buf[256];
+    while (fgets(buf, sizeof(buf), pipe)) out += buf;
+#ifdef _WIN32
+    _pclose(pipe);
+#else
+    pclose(pipe);
+#endif
+    return out;
+}
+
+static bool isSafeRouteProbeTarget(const std::string& text) {
+    if (text.empty()) return false;
+    for (char c : text) {
+        if (!(std::isdigit(static_cast<unsigned char>(c)) || c == '.')) return false;
+    }
+    return true;
+}
+
+static bool parseIpv4(const std::string& text, in_addr* out) {
+    if (!out) return false;
+    in_addr a{};
+    if (inet_pton(AF_INET, text.c_str(), &a) != 1) return false;
+    *out = a;
+    return true;
+}
+
+static bool isIpv4Multicast(const std::string& addr) {
+    in_addr a{};
+    if (!parseIpv4(addr, &a)) return false;
+    uint32_t raw = ntohl(a.s_addr);
+    return (raw >= 0xE0000000u && raw <= 0xEFFFFFFFu);
+}
+
+static bool looksLikeIpv4(const std::string& text) {
+    in_addr a{};
+    return parseIpv4(text, &a);
+}
+
+static std::string extractRouteDevice(const std::string& routeOutput) {
+    size_t pos = routeOutput.find(" dev ");
+    if (pos == std::string::npos) return "";
+    pos += 5;
+    size_t end = pos;
+    while (end < routeOutput.size() && !std::isspace(static_cast<unsigned char>(routeOutput[end]))) ++end;
+    return trimCopy(routeOutput.substr(pos, end - pos));
+}
+
+static bool resolveDnsHost(const std::string& host, int* addrCountOut, std::string* errOut) {
+    if (addrCountOut) *addrCountOut = 0;
+    if (host.empty()) {
+        if (errOut) *errOut = "empty host";
+        return false;
+    }
+
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo* res = nullptr;
+    int rc = getaddrinfo(host.c_str(), nullptr, &hints, &res);
+    if (rc != 0 || !res) {
+        if (errOut) *errOut = "DNS lookup failed";
+        return false;
+    }
+
+    int count = 0;
+    for (addrinfo* p = res; p; p = p->ai_next) ++count;
+    freeaddrinfo(res);
+    if (addrCountOut) *addrCountOut = count;
+    return count > 0;
+}
+
+struct MulticastProbeResult {
+    bool socketCreated{false};
+    bool bindOk{false};
+    bool joinOk{false};
+    bool packetReceived{false};
+    int bytesReceived{0};
+    std::string error;
+};
+
+static MulticastProbeResult runMulticastProbe(const std::string& group,
+                                              int port,
+                                              const std::string& iface) {
+    MulticastProbeResult result;
+
+    int s = static_cast<int>(socket(AF_INET, SOCK_DGRAM, 0));
+    if (s < 0) {
+        result.error = "socket() failed";
+        return result;
+    }
+    result.socketCreated = true;
+
+    int reuse = 1;
+#ifdef _WIN32
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+    DWORD timeoutMs = 1500;
+    setsockopt((SOCKET)s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeoutMs), sizeof(timeoutMs));
+#else
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    timeval tv{};
+    tv.tv_sec = 1;
+    tv.tv_usec = 500000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+
+    sockaddr_in bindAddr{};
+    bindAddr.sin_family = AF_INET;
+    bindAddr.sin_addr.s_addr = htonl(INADDR_ANY);
+    bindAddr.sin_port = htons(static_cast<uint16_t>(port));
+    if (bind(s, reinterpret_cast<sockaddr*>(&bindAddr), sizeof(bindAddr)) != 0) {
+        result.error = "bind() failed";
+        close_socket(s);
+        return result;
+    }
+    result.bindOk = true;
+
+#ifndef _WIN32
+    if (!iface.empty() && !looksLikeIpv4(iface)) {
+        setsockopt(s, SOL_SOCKET, SO_BINDTODEVICE, iface.c_str(), static_cast<socklen_t>(iface.size()));
+    }
+#endif
+
+    ip_mreq mreq{};
+    if (inet_pton(AF_INET, group.c_str(), &mreq.imr_multiaddr) != 1) {
+        result.error = "invalid multicast group";
+        close_socket(s);
+        return result;
+    }
+    mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+    if (!iface.empty() && looksLikeIpv4(iface)) {
+        parseIpv4(iface, &mreq.imr_interface);
+    }
+
+    if (setsockopt(s, IPPROTO_IP, IP_ADD_MEMBERSHIP,
+                   reinterpret_cast<const char*>(&mreq), sizeof(mreq)) != 0) {
+        result.error = "IP_ADD_MEMBERSHIP failed";
+        close_socket(s);
+        return result;
+    }
+    result.joinOk = true;
+
+    char pkt[2048];
+    int n = recv(s, pkt, sizeof(pkt), 0);
+    if (n > 0) {
+        result.packetReceived = true;
+        result.bytesReceived = n;
+    } else {
+#ifdef _WIN32
+        int wsaErr = WSAGetLastError();
+        if (wsaErr == WSAETIMEDOUT || wsaErr == WSAEWOULDBLOCK) {
+            result.error = "recv timeout";
+        } else {
+            result.error = "recv failed";
+        }
+#else
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            result.error = "recv timeout";
+        } else {
+            result.error = "recv failed";
+        }
+#endif
+    }
+
+    close_socket(s);
+    return result;
+}
+
+static std::string diagnosticsHistoryPath(int encoderOneBased) {
+    return "/etc/encoder" + std::to_string(encoderOneBased) + "/diagnostics_history.jsonl";
+}
+
+static std::mutex g_diagHistoryMutex;
+
+static void appendDiagnosticsHistoryEntry(int encoderOneBased, const std::string& jsonLine) {
+    std::lock_guard<std::mutex> lk(g_diagHistoryMutex);
+    std::error_code ec;
+    fs::path p(diagnosticsHistoryPath(encoderOneBased));
+    fs::create_directories(p.parent_path(), ec);
+    std::ofstream out(p.string(), std::ios::app);
+    if (!out.is_open()) return;
+    out << jsonLine << "\n";
+}
+
+static std::string readDiagnosticsHistoryArrayJson(int encoderOneBased, int maxItems) {
+    if (maxItems < 1) maxItems = 1;
+    if (maxItems > 200) maxItems = 200;
+    std::deque<std::string> rows;
+    std::ifstream in(diagnosticsHistoryPath(encoderOneBased));
+    std::string line;
+    while (std::getline(in, line)) {
+        std::string t = trimCopy(line);
+        if (t.empty()) continue;
+        if (rows.size() >= static_cast<size_t>(maxItems)) rows.pop_front();
+        rows.push_back(t);
+    }
+    std::ostringstream ss;
+    ss << "[";
+    bool first = true;
+    for (const auto& r : rows) {
+        if (!first) ss << ",";
+        first = false;
+        ss << r;
+    }
+    ss << "]";
+    return ss.str();
+}
+
+static std::string buildSupportBundleText(int encoderOneBased) {
+    std::ostringstream out;
+    out << "MultiCoder Support Bundle\n";
+    out << "Generated: " << nowIsoUtc() << "\n";
+    out << "Encoder: " << encoderOneBased << "\n\n";
+
+    out << "=== Admin Config (/etc/MC/system.json) ===\n";
+    {
+        std::string cfg = readFile("/etc/MC/system.json");
+        out << (cfg.empty() ? "{}" : cfg) << "\n\n";
+    }
+
+    out << "=== Encoder Input Config ===\n";
+    {
+        std::string cfg = readFile("/etc/encoder" + std::to_string(encoderOneBased) + "/input.json");
+        out << (cfg.empty() ? "{}" : cfg) << "\n\n";
+    }
+
+    out << "=== Runtime State ===\n";
+    {
+        std::string runtime = readFile(runtimeStatePath(encoderOneBased));
+        out << (runtime.empty() ? "{}" : runtime) << "\n\n";
+    }
+
+    out << "=== Diagnostics History (latest 50) ===\n";
+    out << readDiagnosticsHistoryArrayJson(encoderOneBased, 50) << "\n\n";
+
+    out << "=== Tail System Log ===\n";
+    out << tailSysLog(200) << "\n\n";
+
+    out << "=== Tail Encoder Log ===\n";
+    out << tailLog(encoderOneBased - 1, 200) << "\n";
+
+    return out.str();
 }
 
 static simplejson::Object readRuntimeState(int encoderOneBased) {
@@ -1712,6 +1968,284 @@ static std::string handleReq(const std::string& raw, const std::string& clientIp
             return httpResp(500, "application/json", "{\"saved\":false,\"error\":\"failed to write system config\"}");
         }
         return httpResp(200, "application/json", "{\"saved\":true}");
+    }
+
+    if (method == "POST" && path == "/api/admin/diagnostics/run") {
+        simplejson::Object req;
+        if (!body.empty()) req.parse(body);
+
+        int encoder = req.getInt("encoder", 1);
+        if (encoder < 1) encoder = 1;
+        if (encoder > MAX_ENCODERS) encoder = MAX_ENCODERS;
+
+        simplejson::Object inputCfg = readJsonFile("/etc/encoder" + std::to_string(encoder) + "/input.json");
+        simplejson::Object runtime = readRuntimeState(encoder);
+
+        std::string mcastAddr = req.getString("multicastAddress", req.getString("rtpAddress", inputCfg.getString("rtpAddress", "")));
+        int mcastPort = req.getInt("multicastPort", req.getInt("rtpPort", inputCfg.getInt("rtpPort", 5004)));
+        std::string mcastIface = req.getString("multicastInterface", req.getString("rtpInterface", inputCfg.getString("rtpInterface", "")));
+        std::string unicastHost = req.getString("unicastHost", req.getString("srtHost", inputCfg.getString("srtHost", "")));
+        int unicastPort = req.getInt("unicastPort", req.getInt("srtPort", inputCfg.getInt("srtPort", 0)));
+        std::string dnsHost = req.getString("dnsHost", unicastHost);
+
+        std::vector<std::string> reasons;
+        bool overallOk = true;
+        auto addReason = [&](const std::string& code,
+                             const std::string& severity,
+                             const std::string& message,
+                             const std::string& remediation) {
+            if (severity == "error") overallOk = false;
+            std::ostringstream item;
+            item << "{"
+                 << "\"code\":\"" << jsonEscape(code) << "\"," 
+                 << "\"severity\":\"" << jsonEscape(severity) << "\"," 
+                 << "\"message\":\"" << jsonEscape(message) << "\"," 
+                 << "\"remediation\":\"" << jsonEscape(remediation) << "\""
+                 << "}";
+            reasons.push_back(item.str());
+        };
+
+        bool mcastAddrValid = isIpv4Multicast(mcastAddr);
+        bool mcastPortValid = mcastPort > 0 && mcastPort <= 65535;
+
+        if (!mcastAddrValid) {
+            addReason("MCAST_INVALID_ADDRESS", "error",
+                      "Multicast address is invalid or not in 224.0.0.0/4.",
+                      "Use a valid multicast group such as 239.x.x.x and save input settings.");
+        } else {
+            addReason("MCAST_ADDRESS_VALID", "info",
+                      "Multicast group address format is valid.",
+                      "No action required.");
+        }
+
+        if (!mcastPortValid) {
+            addReason("MCAST_INVALID_PORT", "error",
+                      "Multicast UDP port is outside valid range.",
+                      "Use a port in the range 1-65535.");
+        } else {
+            addReason("MCAST_PORT_VALID", "info",
+                      "Multicast UDP port is valid.",
+                      "No action required.");
+        }
+
+#ifdef _WIN32
+        if (!mcastIface.empty()) {
+            addReason("IFACE_SELECTED", "info",
+                      "Interface value provided for probe.",
+                      "No action required.");
+        } else {
+            addReason("IFACE_AUTO", "warning",
+                      "No interface selected; OS auto-selection will be used.",
+                      "Select a specific interface when host has multiple NICs.");
+        }
+        addReason("ROUTE_CHECK_SKIPPED", "info",
+                  "Route-to-group check is not enabled on Windows build.",
+                  "Validate route manually with route tools if needed.");
+#else
+        if (!mcastIface.empty() && !looksLikeIpv4(mcastIface)) {
+            fs::path ifacePath = fs::path("/sys/class/net") / mcastIface;
+            if (!fs::exists(ifacePath)) {
+                addReason("IFACE_NOT_FOUND", "error",
+                          "Configured network interface was not found.",
+                          "Pick an interface name that exists on the host.");
+            } else {
+                std::string oper = trimCopy(readFile((ifacePath / "operstate").string()));
+                if (!(oper == "up" || oper == "unknown")) {
+                    addReason("IFACE_DOWN", "error",
+                              "Configured interface exists but is down.",
+                              "Bring the interface up and confirm link connectivity.");
+                } else {
+                    addReason("IFACE_OK", "info",
+                              "Configured interface exists and appears up.",
+                              "No action required.");
+                }
+            }
+        } else if (mcastIface.empty()) {
+            addReason("IFACE_AUTO", "warning",
+                      "No interface selected; OS auto-selection will be used.",
+                      "Select a specific interface when host has multiple NICs.");
+        } else {
+            addReason("IFACE_IP", "info",
+                      "Interface override is set as IPv4 address.",
+                      "No action required.");
+        }
+
+        if (mcastAddrValid && isSafeRouteProbeTarget(mcastAddr)) {
+            std::string routeOut = runCommandCapture("ip route get " + mcastAddr + " 2>/dev/null");
+            std::string routeDev = extractRouteDevice(routeOut);
+            if (routeOut.empty()) {
+                addReason("ROUTE_LOOKUP_FAILED", "warning",
+                          "Route lookup for multicast group returned no result.",
+                          "Install iproute2 tools and verify host multicast routing.");
+            } else if (!mcastIface.empty() && !looksLikeIpv4(mcastIface) && !routeDev.empty() && routeDev != mcastIface) {
+                addReason("ROUTE_INTERFACE_MISMATCH", "error",
+                          "Route to multicast group resolves to a different interface.",
+                          "Update route so group uses selected interface (ip route replace <group>/32 dev <iface>)."
+                );
+            } else if (!routeDev.empty()) {
+                addReason("ROUTE_OK", "info",
+                          "Kernel route lookup for multicast group succeeded on interface " + routeDev + ".",
+                          "No action required.");
+            } else {
+                addReason("ROUTE_DEV_UNKNOWN", "warning",
+                          "Route lookup succeeded but device could not be parsed.",
+                          "Run 'ip route get <group>' manually and verify dev output.");
+            }
+        }
+#endif
+
+        bool probeSocket = false;
+        bool probeBind = false;
+        bool probeJoin = false;
+        bool probeRecv = false;
+        int probeBytes = 0;
+        std::string probeError;
+        if (mcastAddrValid && mcastPortValid) {
+            MulticastProbeResult probe = runMulticastProbe(mcastAddr, mcastPort, mcastIface);
+            probeSocket = probe.socketCreated;
+            probeBind = probe.bindOk;
+            probeJoin = probe.joinOk;
+            probeRecv = probe.packetReceived;
+            probeBytes = probe.bytesReceived;
+            probeError = probe.error;
+
+            if (!probe.socketCreated) {
+                addReason("MCAST_SOCKET_FAILED", "error",
+                          "Unable to create UDP socket for multicast probe.",
+                          "Confirm container/host permissions and network stack health.");
+            } else if (!probe.bindOk) {
+                addReason("MCAST_BIND_FAILED", "error",
+                          "Failed to bind UDP probe socket on configured port.",
+                          "Ensure port is available and not blocked by policy.");
+            } else if (!probe.joinOk) {
+                addReason("MCAST_JOIN_FAILED", "error",
+                          "Socket bind succeeded but multicast group join failed.",
+                          "Check IGMP/multicast policy, interface selection, and host route rules.");
+            } else if (probe.packetReceived) {
+                addReason("MCAST_PACKETS_RECEIVED", "info",
+                          "Multicast probe received UDP payload on socket.",
+                          "No action required.");
+            } else {
+                addReason("MCAST_NO_PACKETS", "warning",
+                          "Multicast join succeeded but no packets arrived during probe window.",
+                          "Verify source is active, VLAN allows multicast, and host firewall accepts UDP.");
+            }
+        }
+
+        std::string runtimeWarning = runtime.getString("inputWarning", "");
+        std::string warningLower = lowerCopy(runtimeWarning);
+        if (!runtimeWarning.empty() && warningLower.find("parse") != std::string::npos) {
+            addReason("PAYLOAD_PARSE_MISMATCH", "warning",
+                      "Runtime warning suggests packets are present but payload parsing may not match expected format.",
+                      "Verify RTP payload type/format from source and update input settings accordingly.");
+        }
+
+        int dnsAddrCount = 0;
+        std::string dnsErr;
+        bool dnsOk = false;
+        if (dnsHost.empty()) {
+            addReason("DNS_SKIPPED", "warning",
+                      "DNS test skipped because no hostname was provided.",
+                      "Enter a business-network hostname to validate DNS resolution.");
+        } else {
+            dnsOk = resolveDnsHost(dnsHost, &dnsAddrCount, &dnsErr);
+            if (dnsOk) {
+                addReason("DNS_OK", "info",
+                          "DNS resolved host to " + std::to_string(dnsAddrCount) + " address(es).",
+                          "No action required.");
+            } else {
+                addReason("DNS_RESOLVE_FAILED", "error",
+                          "DNS resolution failed for host.",
+                          "Check DNS server, search domain, and host spelling.");
+            }
+        }
+
+        bool unicastOk = false;
+        std::string unicastErr;
+        if (unicastHost.empty() || unicastPort <= 0 || unicastPort > 65535) {
+            addReason("UNICAST_SKIPPED", "warning",
+                      "Unicast TCP test skipped because host/port was incomplete.",
+                      "Provide a target host and port for business-network reachability testing.");
+        } else {
+            unicastOk = testTcpConnect(unicastHost, unicastPort, unicastErr);
+            if (unicastOk) {
+                addReason("UNICAST_CONNECT_OK", "info",
+                          "Unicast TCP connection succeeded.",
+                          "No action required.");
+            } else {
+                addReason("UNICAST_CONNECT_FAILED", "error",
+                          "Unicast TCP connection failed.",
+                          "Check route, ACL/firewall, NAT, and remote service listener.");
+            }
+        }
+
+        std::ostringstream checks;
+        checks << "{"
+               << "\"multicast\":{"
+               << "\"address\":\"" << jsonEscape(mcastAddr) << "\"," 
+               << "\"port\":" << mcastPort << ","
+               << "\"interface\":\"" << jsonEscape(mcastIface) << "\"," 
+               << "\"socketCreated\":" << (probeSocket ? "true" : "false") << ","
+               << "\"bindOk\":" << (probeBind ? "true" : "false") << ","
+               << "\"joinOk\":" << (probeJoin ? "true" : "false") << ","
+               << "\"packetReceived\":" << (probeRecv ? "true" : "false") << ","
+               << "\"bytesReceived\":" << probeBytes << ","
+               << "\"error\":\"" << jsonEscape(probeError) << "\""
+               << "},"
+               << "\"dns\":{"
+               << "\"host\":\"" << jsonEscape(dnsHost) << "\"," 
+               << "\"ok\":" << (dnsOk ? "true" : "false") << ","
+               << "\"addressCount\":" << dnsAddrCount << ","
+               << "\"error\":\"" << jsonEscape(dnsErr) << "\""
+               << "},"
+               << "\"unicast\":{"
+               << "\"host\":\"" << jsonEscape(unicastHost) << "\"," 
+               << "\"port\":" << unicastPort << ","
+               << "\"ok\":" << (unicastOk ? "true" : "false") << ","
+               << "\"error\":\"" << jsonEscape(unicastErr) << "\""
+               << "}"
+               << "}";
+
+        std::ostringstream reasonsJson;
+        reasonsJson << "[";
+        for (size_t i = 0; i < reasons.size(); ++i) {
+            if (i) reasonsJson << ",";
+            reasonsJson << reasons[i];
+        }
+        reasonsJson << "]";
+
+        std::ostringstream result;
+        result << "{"
+               << "\"ok\":" << (overallOk ? "true" : "false") << ","
+               << "\"encoder\":" << encoder << ","
+               << "\"timestamp\":\"" << jsonEscape(nowIsoUtc()) << "\"," 
+               << "\"checks\":" << checks.str() << ","
+               << "\"reasons\":" << reasonsJson.str()
+               << "}";
+
+        appendDiagnosticsHistoryEntry(encoder, result.str());
+        appendEncoderLog(encoder, std::string("Network diagnostics run: ") + (overallOk ? "PASS" : "FAIL") +
+                                   " reasons=" + std::to_string(reasons.size()));
+
+        return httpResp(200, "application/json", result.str());
+    }
+
+    if (method == "GET" && path.rfind("/api/admin/diagnostics/history/", 0) == 0) {
+        std::string encStr = path.substr(std::string("/api/admin/diagnostics/history/").size());
+        int encoder = atoi(encStr.c_str());
+        if (encoder < 1 || encoder > MAX_ENCODERS) encoder = 1;
+        std::string arr = readDiagnosticsHistoryArrayJson(encoder, 50);
+        std::string resp = "{\"encoder\":" + std::to_string(encoder) + ",\"items\":" + arr + "}";
+        return httpResp(200, "application/json", resp);
+    }
+
+    if (method == "POST" && path == "/api/admin/diagnostics/export") {
+        simplejson::Object req;
+        if (!body.empty()) req.parse(body);
+        int encoder = req.getInt("encoder", 1);
+        if (encoder < 1 || encoder > MAX_ENCODERS) encoder = 1;
+        std::string bundle = buildSupportBundleText(encoder);
+        return httpResp(200, "text/plain; charset=utf-8", bundle);
     }
 
     const std::string prefix = "/api/encoder/";

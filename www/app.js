@@ -2051,6 +2051,7 @@ function renderAdminNav() {
     const sections = [
         { id: 'application', label: 'Application Settings'  },
         { id: 'interfaces',  label: 'Network Interfaces'    },
+      { id: 'diagnostics', label: 'Network Diagnostics'   },
         { id: 'encoders',    label: 'Encoder Configuration' },
     { id: 'log',         label: 'Tail System Log'       },
     ];
@@ -2075,6 +2076,7 @@ async function selectAdminSection(section) {
     switch (section) {
         case 'application': await renderAdminAppSettings(cl);         break;
         case 'interfaces':  await renderAdminInterfaces(cl);          break;
+      case 'diagnostics': await renderAdminDiagnostics(cl);         break;
         case 'encoders':    await renderAdminEncoderList(cl, cr);     break;
     case 'log':         renderTailLogSection(cl, '/api/syslog', 'System Log'); break;
     }
@@ -2231,6 +2233,198 @@ async function renderAdminInterfaces(cl) {
         st.textContent = 'Network interfaces saved.';
         st.style.color = 'var(--success)';
     });
+}
+
+// ------ Network Diagnostics ------
+async function renderAdminDiagnostics(cl) {
+    await ensureInterfacesLoaded(false);
+
+    let cfg = {};
+    try { cfg = await apiGet('/api/admin/config'); } catch {}
+    const maxCount = cfg.encoderCount !== undefined ? cfg.encoderCount : (encoders.length || 2);
+
+    cl.innerHTML = `
+    <h2>Network Diagnostics</h2>
+    <p style="font-size:11px;color:var(--muted);margin-bottom:10px;">
+      Phase 1 includes multicast socket/route/interface checks. Phase 2 includes DNS and unicast business-network checks,
+      per-encoder diagnostics history, and support bundle export.
+    </p>
+    <div class="form-row">
+      <label>Encoder:</label>
+      <select id="diagEncoderSel" style="width:120px;">
+        ${Array.from({ length: maxCount }, (_, i) => `<option value="${i + 1}">Encoder ${i + 1}</option>`).join('')}
+      </select>
+    </div>
+    <div class="form-row">
+      <label>Multicast Address:</label>
+      <input type="text" id="diagMcastAddr" value="" placeholder="239.192.78.245" style="width:180px"/>
+    </div>
+    <div class="form-row">
+      <label>Multicast Port:</label>
+      <input type="number" id="diagMcastPort" value="5004" min="1" max="65535" style="width:100px"/>
+    </div>
+    <div class="form-row">
+      <label>Interface:</label>
+      <select id="diagIfaceSel" style="width:220px">${interfaceOptions('')}</select>
+    </div>
+    <div class="form-row">
+      <label>Unicast Host:</label>
+      <input type="text" id="diagUnicastHost" value="" placeholder="10.0.0.25 or host.example.com" style="width:220px"/>
+    </div>
+    <div class="form-row">
+      <label>Unicast Port:</label>
+      <input type="number" id="diagUnicastPort" value="0" min="1" max="65535" style="width:100px"/>
+    </div>
+    <div class="form-row">
+      <label>DNS Host:</label>
+      <input type="text" id="diagDnsHost" value="" placeholder="metadata.company.local" style="width:220px"/>
+    </div>
+    <div class="action-row" style="margin-top:10px;gap:8px;display:flex;flex-wrap:wrap;">
+      <button class="btn btn-primary" id="diagRunBtn">Run Diagnostics</button>
+      <button class="btn" id="diagRefreshHistoryBtn">Refresh History</button>
+      <button class="btn" id="diagExportBtn">Export Support Bundle</button>
+    </div>
+    <p id="diagRunStatus" style="margin-top:8px;color:var(--muted);"></p>
+
+    <h3 style="margin-top:14px;">Latest Result</h3>
+    <div id="diagResultPanel" style="border:1px solid #3a3a3a;border-radius:6px;padding:8px;background:#1a1a1a;color:#ddd;font-size:11px;">
+      Run diagnostics to see reason codes and remediation.
+    </div>
+
+    <h3 style="margin-top:14px;">History (Per Encoder)</h3>
+    <div id="diagHistoryPanel" style="max-height:260px;overflow:auto;border:1px solid #3a3a3a;border-radius:6px;padding:8px;background:#111;color:#ddd;font-size:11px;">
+      No history loaded.
+    </div>`;
+
+    const encoderSel = document.getElementById('diagEncoderSel');
+    const statusEl = document.getElementById('diagRunStatus');
+    const resultEl = document.getElementById('diagResultPanel');
+    const historyEl = document.getElementById('diagHistoryPanel');
+
+    const renderReasons = (payload) => {
+      if (!payload || !Array.isArray(payload.reasons)) {
+        resultEl.textContent = 'No diagnostics response.';
+        return;
+      }
+      const rows = payload.reasons.map(r => {
+        const sev = String((r && r.severity) || 'info').toLowerCase();
+        const color = sev === 'error' ? '#ff6b6b' : (sev === 'warning' ? '#f0c674' : '#86e57f');
+        return `<div style="border-left:3px solid ${color};padding:6px 8px;margin-bottom:6px;background:#161616;">
+          <div><strong>${escapeHtml((r && r.code) || 'UNKNOWN')}</strong> <span style="color:${color}">(${escapeHtml(sev)})</span></div>
+          <div style="margin-top:2px;">${escapeHtml((r && r.message) || '')}</div>
+          <div style="margin-top:2px;color:var(--muted);">Remediation: ${escapeHtml((r && r.remediation) || '')}</div>
+        </div>`;
+      }).join('');
+
+      const checks = payload.checks || {};
+      const m = checks.multicast || {};
+      const d = checks.dns || {};
+      const u = checks.unicast || {};
+      const summary = `<div style="margin-bottom:8px;"><strong>Overall:</strong> ${payload.ok ? '<span style="color:#86e57f;">PASS</span>' : '<span style="color:#ff6b6b;">FAIL</span>'}</div>
+        <div style="margin-bottom:8px;color:var(--muted);">Multicast recv: ${m.packetReceived ? 'yes' : 'no'} | DNS: ${d.ok ? 'ok' : 'fail/skip'} | Unicast: ${u.ok ? 'ok' : 'fail/skip'}</div>`;
+      resultEl.innerHTML = summary + rows;
+    };
+
+    const renderHistory = (historyPayload) => {
+      const items = (historyPayload && Array.isArray(historyPayload.items)) ? historyPayload.items : [];
+      if (!items.length) {
+        historyEl.textContent = 'No diagnostics history for this encoder yet.';
+        return;
+      }
+      const html = items.slice().reverse().map(it => {
+        const ts = (it && it.timestamp) ? String(it.timestamp) : '';
+        const ok = !!(it && it.ok);
+        const reasonsCount = (it && Array.isArray(it.reasons)) ? it.reasons.length : 0;
+        return `<div style="padding:6px 8px;margin-bottom:6px;border:1px solid #333;border-radius:4px;background:#171717;">
+          <div><strong>${escapeHtml(ts || 'unknown time')}</strong> <span style="color:${ok ? '#86e57f' : '#ff6b6b'}">${ok ? 'PASS' : 'FAIL'}</span></div>
+          <div style="color:var(--muted);">Reason codes: ${reasonsCount}</div>
+        </div>`;
+      }).join('');
+      historyEl.innerHTML = html;
+    };
+
+    const loadDefaults = async () => {
+      const enc = parseInt(encoderSel.value, 10) || 1;
+      try {
+        const encCfg = await apiGet(`/api/encoder/${enc}/config`);
+        const inp = encCfg.input || {};
+        document.getElementById('diagMcastAddr').value = inp.rtpAddress || '';
+        document.getElementById('diagMcastPort').value = inp.rtpPort || 5004;
+        document.getElementById('diagIfaceSel').value = inp.rtpInterface || '';
+        document.getElementById('diagUnicastHost').value = inp.srtHost || '';
+        document.getElementById('diagUnicastPort').value = inp.srtPort || 0;
+        document.getElementById('diagDnsHost').value = inp.srtHost || '';
+      } catch {
+      }
+    };
+
+    const refreshHistory = async () => {
+      const enc = parseInt(encoderSel.value, 10) || 1;
+      try {
+        const payload = await apiGet(`/api/admin/diagnostics/history/${enc}`);
+        renderHistory(payload);
+      } catch {
+        historyEl.textContent = 'Failed to load diagnostics history.';
+      }
+    };
+
+    encoderSel.addEventListener('change', async () => {
+      await loadDefaults();
+      await refreshHistory();
+    });
+
+    document.getElementById('diagRefreshHistoryBtn').addEventListener('click', refreshHistory);
+
+    document.getElementById('diagRunBtn').addEventListener('click', async () => {
+      const enc = parseInt(encoderSel.value, 10) || 1;
+      const payload = {
+        encoder: enc,
+        multicastAddress: document.getElementById('diagMcastAddr').value,
+        multicastPort: parseInt(document.getElementById('diagMcastPort').value, 10) || 0,
+        multicastInterface: document.getElementById('diagIfaceSel').value,
+        unicastHost: document.getElementById('diagUnicastHost').value,
+        unicastPort: parseInt(document.getElementById('diagUnicastPort').value, 10) || 0,
+        dnsHost: document.getElementById('diagDnsHost').value,
+      };
+      statusEl.textContent = 'Running diagnostics...';
+      try {
+        const result = await apiPost('/api/admin/diagnostics/run', payload);
+        renderReasons(result);
+        statusEl.textContent = `Diagnostics completed for Encoder ${enc}.`;
+        await refreshHistory();
+      } catch (e) {
+        statusEl.textContent = 'Diagnostics failed to run: ' + e.message;
+      }
+    });
+
+    document.getElementById('diagExportBtn').addEventListener('click', async () => {
+      const enc = parseInt(encoderSel.value, 10) || 1;
+      statusEl.textContent = 'Generating support bundle...';
+      try {
+        const r = await fetch('/api/admin/diagnostics/export', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ encoder: enc }),
+        });
+        if (!r.ok) throw new Error(`export failed (${r.status})`);
+        const txt = await r.text();
+        const blob = new Blob([txt], { type: 'text/plain' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `multicoder-support-encoder${enc}-${Date.now()}.txt`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+        statusEl.textContent = `Support bundle exported for Encoder ${enc}.`;
+      } catch (e) {
+        statusEl.textContent = 'Support bundle export failed: ' + e.message;
+      }
+    });
+
+    await loadDefaults();
+    await refreshHistory();
 }
 
 // ------ Encoder Configuration ------
