@@ -2099,8 +2099,8 @@ async function renderAdminAppSettings(cl) {
       </select>
     </div>
     <div class="form-row">
-      <label>Log Rotation:</label>
-      <input type="number" id="cfgLogRotSize" value="${cfg.logRotSize !== undefined ? cfg.logRotSize : 5}" min="1" style="width:80px"/>
+      <label>Log Max Size (MB):</label>
+      <input type="number" id="cfgLogMaxSizeMb" value="${cfg.logMaxSizeMb !== undefined ? cfg.logMaxSizeMb : (cfg.logRotSize !== undefined ? cfg.logRotSize : 10)}" min="1" style="width:80px"/>
     </div>
     <div class="form-row">
       <label>Log Retention (days):</label>
@@ -2166,7 +2166,8 @@ async function renderAdminAppSettings(cl) {
         const data = Object.assign({}, existing, {
             uiPort:       parseInt(document.getElementById('cfgUIPort').value),
             logLevel:     document.getElementById('cfgLogLevel').value,
-            logRotSize:   parseInt(document.getElementById('cfgLogRotSize').value),
+          logMaxSizeMb: parseInt(document.getElementById('cfgLogMaxSizeMb').value),
+          logRotSize:   parseInt(document.getElementById('cfgLogMaxSizeMb').value),
             logRetention: parseInt(document.getElementById('cfgLogRetention').value),
             encoderCount: parseInt(document.getElementById('cfgEncoderCount').value),
           scteGlobalEnabled: document.getElementById('cfgScteGlobalEnabled').value === 'true',

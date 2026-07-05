@@ -1,6 +1,7 @@
 {
     "uiPort": 8050,
     "logLevel": "info",
+    "logMaxSizeMb": 10,
     "logRotSize": 10,
     "logRetention": 14,
     "encoderCount": 5,

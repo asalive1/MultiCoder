@@ -55,6 +55,113 @@ constexpr int kIcecastFailureTimeoutUs = 60 * 1000 * 1000;
 std::mutex g_sidecarDedupMutex;
 std::unordered_map<std::string, int64_t> g_sidecarRecentIds;
 
+struct LogPolicy {
+    int maxSizeMb{10};
+    int retentionDays{14};
+};
+
+LogPolicy loadLogPolicyFromSystem() {
+    LogPolicy policy;
+    simplejson::Object cfg;
+    {
+        std::ifstream f("/etc/MC/system.json");
+        if (f.is_open()) {
+            std::string txt{std::istreambuf_iterator<char>(f), {}};
+            if (!txt.empty()) cfg.parse(txt);
+        }
+    }
+    int maxMb = cfg.getInt("logMaxSizeMb", cfg.getInt("logRotSize", 10));
+    int retention = cfg.getInt("logRetention", 14);
+    if (maxMb < 1) maxMb = 1;
+    if (maxMb > 10240) maxMb = 10240;
+    if (retention < 1) retention = 1;
+    if (retention > 3650) retention = 3650;
+    policy.maxSizeMb = maxMb;
+    policy.retentionDays = retention;
+    return policy;
+}
+
+std::string makeUtcCompactStamp() {
+    auto now = std::chrono::system_clock::now();
+    auto t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm_utc{};
+#ifdef _WIN32
+    gmtime_s(&tm_utc, &t);
+#else
+    gmtime_r(&t, &tm_utc);
+#endif
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y%m%dT%H%M%SZ", &tm_utc);
+    return std::string(buf);
+}
+
+fs::path makeRotatedLogPath(const fs::path& logPath) {
+    std::string base = logPath.string() + "." + makeUtcCompactStamp();
+    fs::path candidate(base);
+    std::error_code ec;
+    int suffix = 1;
+    while (fs::exists(candidate, ec)) {
+        candidate = fs::path(base + "." + std::to_string(suffix++));
+    }
+    return candidate;
+}
+
+void pruneRotatedLogsByRetention(const fs::path& logPath, int retentionDays) {
+    std::error_code ec;
+    fs::path parent = logPath.parent_path();
+    if (parent.empty() || !fs::exists(parent, ec)) return;
+
+    const std::string rotatedPrefix = logPath.filename().string() + ".";
+    const auto cutoff = fs::file_time_type::clock::now() - std::chrono::hours(24 * retentionDays);
+    for (const auto& entry : fs::directory_iterator(parent, ec)) {
+        if (ec) break;
+        if (!entry.is_regular_file(ec)) continue;
+        const std::string name = entry.path().filename().string();
+        if (name.rfind(rotatedPrefix, 0) != 0) continue;
+        auto wt = fs::last_write_time(entry.path(), ec);
+        if (ec) continue;
+        if (wt < cutoff) {
+            fs::remove(entry.path(), ec);
+        }
+    }
+}
+
+void applyLogRotationIfNeeded(std::ofstream& stream, const std::string& logPathStr, const LogPolicy& policy) {
+    if (!stream.is_open()) return;
+    auto pos = stream.tellp();
+    if (pos < 0) return;
+    const std::streamoff maxBytes = static_cast<std::streamoff>(policy.maxSizeMb) * 1024 * 1024;
+    if (pos < maxBytes) return;
+
+    stream.close();
+    std::error_code ec;
+    fs::path logPath(logPathStr);
+    fs::path rotatedPath = makeRotatedLogPath(logPath);
+    fs::rename(logPath, rotatedPath, ec);
+    stream.open(logPathStr, std::ios::app);
+    pruneRotatedLogsByRetention(logPath, policy.retentionDays);
+}
+
+void appendLineWithPolicy(const std::string& logPath, const std::string& line, const LogPolicy& policy) {
+    fs::path lp(logPath);
+    std::error_code ec;
+    fs::create_directories(lp.parent_path(), ec);
+    std::ofstream out(logPath, std::ios::app);
+    if (!out.is_open()) return;
+    out << line << "\n";
+    out.flush();
+    auto pos = out.tellp();
+    if (pos >= 0) {
+        const std::streamoff maxBytes = static_cast<std::streamoff>(policy.maxSizeMb) * 1024 * 1024;
+        if (pos >= maxBytes) {
+            out.close();
+            fs::path rotatedPath = makeRotatedLogPath(lp);
+            fs::rename(lp, rotatedPath, ec);
+        }
+    }
+    pruneRotatedLogsByRetention(lp, policy.retentionDays);
+}
+
 std::string trimCopy(const std::string& value) {
     size_t first = value.find_first_not_of(" \t\r\n");
     if (first == std::string::npos) return "";
@@ -1883,28 +1990,24 @@ Worker::~Worker() {
 }
 
 void Worker::logSys(const std::string& msg) {
-    fs::create_directories("/etc/MC");
-    std::ofstream f("/etc/MC/EncoderSys.log", std::ios::app);
-    if (!f.is_open()) return;
-    f << "[" << timestamp() << "] [Encoder-" << m_idx << "] " << msg << "\n";
+    LogPolicy policy = loadLogPolicyFromSystem();
+    appendLineWithPolicy(
+        "/etc/MC/EncoderSys.log",
+        "[" + timestamp() + "] [Encoder-" + std::to_string(m_idx) + "] " + msg,
+        policy
+    );
 }
 
 void Worker::log(const std::string& msg) {
     std::lock_guard<std::mutex> lk(m_logMutex);
+    LogPolicy policy = loadLogPolicyFromSystem();
     std::string line = "[" + timestamp() + "] [Encoder-" + std::to_string(m_idx) + "] " + msg;
     std::cout << line << "\n";
     if (m_logFile.is_open()) {
         m_logFile << line << "\n";
         m_logFile.flush();
-        // Rotation: check file size every write
-        auto pos = m_logFile.tellp();
-        if (pos > 10 * 1024 * 1024) {  // 10MB
-            m_logFile.close();
-            // Rename to .1 (simple rotation)
-            std::string rotPath = m_logPath + ".1";
-            fs::rename(m_logPath, rotPath);
-            m_logFile.open(m_logPath, std::ios::app);
-        }
+        applyLogRotationIfNeeded(m_logFile, m_logPath, policy);
+        pruneRotatedLogsByRetention(fs::path(m_logPath), policy.retentionDays);
     }
 }
 
@@ -2973,6 +3076,39 @@ static std::string resolveWinPath(const std::string& unixPath) {
     return unixPath;
 }
 
+static int cleanupHlsOutputFiles(const std::string& hlsDir, int& indexRemoved, int& segmentRemoved) {
+    std::error_code ec;
+    indexRemoved = 0;
+    segmentRemoved = 0;
+    int failed = 0;
+
+    if (!fs::exists(hlsDir, ec)) return 0;
+
+    for (const auto& entry : fs::recursive_directory_iterator(hlsDir, ec)) {
+        if (ec) {
+            ++failed;
+            ec.clear();
+            continue;
+        }
+        if (!entry.is_regular_file(ec)) continue;
+        const std::string ext = lowerCopy(entry.path().extension().string());
+
+        bool isIndex = (ext == ".m3u8");
+        bool isSegment = (ext == ".ts" || ext == ".aac" || ext == ".m4s" || ext == ".mp4");
+        if (!isIndex && !isSegment) continue;
+
+        if (fs::remove(entry.path(), ec)) {
+            if (isIndex) ++indexRemoved;
+            if (isSegment) ++segmentRemoved;
+        } else if (ec) {
+            ++failed;
+            ec.clear();
+        }
+    }
+
+    return failed;
+}
+
 void Worker::startHLS() {
     std::lock_guard<std::recursive_mutex> lk(m_streamMutex);
     if (m_hlsRunning.load() || m_hlsProc != nullptr) {
@@ -2995,25 +3131,14 @@ void Worker::startHLS() {
 #endif
     fs::create_directories(segDir);
 
-    // Remove stale m3u8 and old segment files so a fresh stream starts cleanly
+    // Remove stale indexes and segments before start to recover from prior crashes.
     {
-        auto m3u8Stale = hlsDir +
-#ifdef _WIN32
-            "\\index.m3u8";
-#else
-            "/index.m3u8";
-#endif
-        std::error_code ec;
-        if (fs::exists(m3u8Stale, ec)) {
-            fs::remove(m3u8Stale, ec);
-            log("HLS: removed stale playlist");
-        }
-        for (auto& entry : fs::recursive_directory_iterator(hlsDir, ec)) {
-            auto ext = entry.path().extension().string();
-            if (ext == ".ts" || ext == ".aac" || ext == ".m4s") {
-                fs::remove(entry.path(), ec);
-            }
-        }
+        int removedIndex = 0;
+        int removedSegments = 0;
+        int failed = cleanupHlsOutputFiles(hlsDir, removedIndex, removedSegments);
+        log("HLS startup cleanup: removed " + std::to_string(removedIndex)
+            + " index file(s), " + std::to_string(removedSegments)
+            + " segment file(s), failures=" + std::to_string(failed));
     }
 
     // Load per-encoder admin config for playback port and listen link
@@ -3043,6 +3168,9 @@ void Worker::startHLS() {
     auto cfg = readJsonFile(m_cfgDir + "/hls.json");
     int segSecs  = cfg.getInt("segmentSeconds", 5);
     int window   = cfg.getInt("window", 5);
+    if (segSecs <= 0) segSecs = 5;
+    if (window <= 0) window = 5;
+    int retainSegments = (std::max)(window * 3, window);
 
     auto inputArgs = buildFfmpegInputArgs();
     double gainDb = getInputGainDb();
@@ -3096,7 +3224,11 @@ void Worker::startHLS() {
         m_hlsSegMonThread.join();
     }
     m_hlsSegMonRunning = true;
-    m_hlsSegMonThread = std::thread([this, hlsDir]() { monitorHlsSegments(hlsDir); });
+    log("HLS segment retention limit: " + std::to_string(retainSegments)
+        + " files (3x window=" + std::to_string(window) + ")");
+    m_hlsSegMonThread = std::thread([this, hlsDir, retainSegments]() {
+        monitorHlsSegments(hlsDir, retainSegments);
+    });
 
     // Start dedicated HLS HTTP server on the configured playback port
     if (playbackPort > 0) {
@@ -3136,6 +3268,21 @@ void Worker::stopHLS() {
         if (m_hlsHttpThread.joinable()) m_hlsHttpThread.join();
     }
     killFfmpegProc(m_hlsProc);
+
+        // On stop, clear all HLS indexes and segment files per retention requirement.
+        {
+        std::string hlsDir = resolveWinPath(m_cfgDir + "/hls");
+    #ifdef _WIN32
+        for (char& c : hlsDir) if (c == '/') c = '\\';
+    #endif
+        int removedIndex = 0;
+        int removedSegments = 0;
+        int failed = cleanupHlsOutputFiles(hlsDir, removedIndex, removedSegments);
+        log("HLS stop cleanup: removed " + std::to_string(removedIndex)
+            + " index file(s), " + std::to_string(removedSegments)
+            + " segment file(s), failures=" + std::to_string(failed));
+        }
+
     m_hlsRunning = false;
     log("HLS stopped");
     publishStreamHealth();
@@ -3242,15 +3389,17 @@ void Worker::stopSRT() {
 // ---------- HLS segment monitor ----------
 // Polls the HLS output directory and logs each new .ts segment as it appears.
 
-void Worker::monitorHlsSegments(const std::string& hlsDir) {
+void Worker::monitorHlsSegments(const std::string& hlsDir, int retainSegments) {
+    const fs::path segmentRoot = fs::path(hlsDir) / "segments";
+    const fs::path scanRoot = fs::exists(segmentRoot) ? segmentRoot : fs::path(hlsDir);
     std::set<std::string> seen;
     int segCount = 0;
 
     // Pre-populate seen set so we only log NEW segments written after start
     std::error_code ec;
-    for (auto& e : fs::directory_iterator(hlsDir, ec)) {
+    for (auto& e : fs::directory_iterator(scanRoot, ec)) {
         auto ext = e.path().extension().string();
-        if (ext == ".ts" || ext == ".aac")
+        if (ext == ".ts" || ext == ".aac" || ext == ".m4s")
             seen.insert(e.path().filename().string());
     }
 
@@ -3258,9 +3407,9 @@ void Worker::monitorHlsSegments(const std::string& hlsDir) {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
         if (!m_hlsSegMonRunning.load()) break;
 
-        for (auto& entry : fs::directory_iterator(hlsDir, ec)) {
+        for (auto& entry : fs::directory_iterator(scanRoot, ec)) {
             auto ext = entry.path().extension().string();
-            if (ext != ".ts" && ext != ".aac") continue;
+            if (ext != ".ts" && ext != ".aac" && ext != ".m4s") continue;
             std::string fname = entry.path().filename().string();
             if (seen.count(fname)) continue;
             seen.insert(fname);
@@ -3271,11 +3420,49 @@ void Worker::monitorHlsSegments(const std::string& hlsDir) {
         }
 
         // Prune seen set to avoid unbounded growth â€” keep only files still on disk
+        if (retainSegments > 0) {
+            struct SegmentFile {
+                fs::path path;
+                std::string fileName;
+                fs::file_time_type modified;
+            };
+            std::vector<SegmentFile> files;
+            for (auto& e : fs::directory_iterator(scanRoot, ec)) {
+                auto ext = e.path().extension().string();
+                if (ext != ".ts" && ext != ".aac" && ext != ".m4s") continue;
+                files.push_back({
+                    e.path(),
+                    e.path().filename().string(),
+                    fs::last_write_time(e.path(), ec)
+                });
+            }
+
+            if (static_cast<int>(files.size()) > retainSegments) {
+                std::sort(files.begin(), files.end(), [](const SegmentFile& a, const SegmentFile& b) {
+                    if (a.modified == b.modified) return a.fileName < b.fileName;
+                    return a.modified < b.modified;
+                });
+                int removeCount = static_cast<int>(files.size()) - retainSegments;
+                int removed = 0;
+                for (int i = 0; i < removeCount; ++i) {
+                    std::error_code rmEc;
+                    if (fs::remove(files[i].path, rmEc)) {
+                        seen.erase(files[i].fileName);
+                        ++removed;
+                    }
+                }
+                if (removed > 0) {
+                    log("HLS cleanup removed " + std::to_string(removed)
+                        + " stale segment(s); retained " + std::to_string(retainSegments));
+                }
+            }
+        }
+
         if (segCount % 20 == 0 && segCount > 0) {
             std::set<std::string> stillPresent;
-            for (auto& e : fs::directory_iterator(hlsDir, ec)) {
+            for (auto& e : fs::directory_iterator(scanRoot, ec)) {
                 auto ext = e.path().extension().string();
-                if (ext == ".ts" || ext == ".aac")
+                if (ext == ".ts" || ext == ".aac" || ext == ".m4s")
                     stillPresent.insert(e.path().filename().string());
             }
             seen = stillPresent;

@@ -28,10 +28,11 @@ static std::string generatePlaylist(const std::vector<HlsSegment>& segments,
     return ss.str();
 }
 
-/// Apply purge policy: keep at most `windowSize` segments; return the ones to delete.
+/// Apply purge policy: keep at most 3x `windowSize` segments; return the ones to delete.
 static std::vector<HlsSegment> purgeOld(std::vector<HlsSegment>& segments, int windowSize) {
     std::vector<HlsSegment> removed;
-    while ((int)segments.size() > windowSize) {
+    int retain = std::max(1, windowSize * 3);
+    while ((int)segments.size() > retain) {
         removed.push_back(segments.front());
         segments.erase(segments.begin());
     }
@@ -57,12 +58,12 @@ TEST_CASE("HLS playlist generation — basic structure", "[hls]") {
 
 TEST_CASE("HLS purge policy — window 5, 3x back", "[hls]") {
     std::vector<HlsSegment> segs;
-    for (int i = 0; i < 8; ++i)
+    for (int i = 0; i < 18; ++i)
         segs.push_back({"seg" + std::to_string(i) + ".aac", 6.0, i});
 
-    // Window of 5 means we keep 5 segments
+    // Window of 5 means we keep 15 segments (3x buffer)
     auto removed = purgeOld(segs, 5);
-    CHECK(segs.size() == 5);
+    CHECK(segs.size() == 15);
     CHECK(removed.size() == 3);
     CHECK(removed[0].filename == "seg0.aac");
     CHECK(removed[1].filename == "seg1.aac");

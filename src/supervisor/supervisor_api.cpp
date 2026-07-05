@@ -161,20 +161,115 @@ static std::string errnoMessage(int err) {
 #endif
 }
 
+struct LogPolicy {
+    int maxSizeMb{10};
+    int retentionDays{14};
+};
+
+static LogPolicy loadLogPolicy() {
+    LogPolicy policy;
+    simplejson::Object cfg;
+    {
+        std::ifstream f("/etc/MC/system.json");
+        if (f.is_open()) {
+            std::string txt{std::istreambuf_iterator<char>(f), {}};
+            if (!txt.empty()) cfg.parse(txt);
+        }
+    }
+    int maxMb = cfg.getInt("logMaxSizeMb", cfg.getInt("logRotSize", 10));
+    int retention = cfg.getInt("logRetention", 14);
+    if (maxMb < 1) maxMb = 1;
+    if (maxMb > 10240) maxMb = 10240;
+    if (retention < 1) retention = 1;
+    if (retention > 3650) retention = 3650;
+    policy.maxSizeMb = maxMb;
+    policy.retentionDays = retention;
+    return policy;
+}
+
+static std::string makeUtcCompactStamp() {
+    auto now = std::chrono::system_clock::now();
+    auto t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm_utc{};
+#ifdef _WIN32
+    gmtime_s(&tm_utc, &t);
+#else
+    gmtime_r(&t, &tm_utc);
+#endif
+    char buf[32];
+    strftime(buf, sizeof(buf), "%Y%m%dT%H%M%SZ", &tm_utc);
+    return std::string(buf);
+}
+
+static fs::path makeRotatedLogPath(const fs::path& logPath) {
+    std::string base = logPath.string() + "." + makeUtcCompactStamp();
+    fs::path candidate(base);
+    std::error_code ec;
+    int suffix = 1;
+    while (fs::exists(candidate, ec)) {
+        candidate = fs::path(base + "." + std::to_string(suffix++));
+    }
+    return candidate;
+}
+
+static void pruneRotatedLogsByRetention(const fs::path& logPath, int retentionDays) {
+    std::error_code ec;
+    fs::path parent = logPath.parent_path();
+    if (parent.empty() || !fs::exists(parent, ec)) return;
+
+    const std::string rotatedPrefix = logPath.filename().string() + ".";
+    const auto cutoff = fs::file_time_type::clock::now() - std::chrono::hours(24 * retentionDays);
+    for (const auto& entry : fs::directory_iterator(parent, ec)) {
+        if (ec) break;
+        if (!entry.is_regular_file(ec)) continue;
+        const std::string name = entry.path().filename().string();
+        if (name.rfind(rotatedPrefix, 0) != 0) continue;
+        auto wt = fs::last_write_time(entry.path(), ec);
+        if (ec) continue;
+        if (wt < cutoff) {
+            fs::remove(entry.path(), ec);
+        }
+    }
+}
+
+static std::mutex g_logWriteMutex;
+
+static void appendLogWithPolicy(const std::string& path, const std::string& line) {
+    std::lock_guard<std::mutex> lk(g_logWriteMutex);
+    LogPolicy policy = loadLogPolicy();
+
+    fs::path logPath(path);
+    std::error_code ec;
+    fs::create_directories(logPath.parent_path(), ec);
+
+    std::ofstream out(path, std::ios::app);
+    if (!out.is_open()) return;
+    out << line << "\n";
+    out.flush();
+
+    auto pos = out.tellp();
+    if (pos >= 0) {
+        const std::streamoff maxBytes = static_cast<std::streamoff>(policy.maxSizeMb) * 1024 * 1024;
+        if (pos >= maxBytes) {
+            out.close();
+            fs::path rotatedPath = makeRotatedLogPath(logPath);
+            fs::rename(logPath, rotatedPath, ec);
+        }
+    }
+    pruneRotatedLogsByRetention(logPath, policy.retentionDays);
+}
+
 static void appendSysLog(int encoderOneBased, const std::string& message) {
-    fs::create_directories("/etc/MC");
-    std::ofstream f("/etc/MC/EncoderSys.log", std::ios::app);
-    if (!f.is_open()) return;
-    f << "[" << nowIsoUtc() << "] [Supervisor][Encoder-" << encoderOneBased << "] " << message << "\n";
+    appendLogWithPolicy(
+        "/etc/MC/EncoderSys.log",
+        "[" + nowIsoUtc() + "] [Supervisor][Encoder-" + std::to_string(encoderOneBased) + "] " + message
+    );
 }
 
 static void appendEncoderLog(int encoderOneBased, const std::string& message) {
     std::string dir = "/etc/encoder" + std::to_string(encoderOneBased) + "/logs";
-    fs::create_directories(dir);
     std::string path = dir + "/Encoder" + std::to_string(encoderOneBased) + ".log";
-    std::ofstream f(path, std::ios::app);
-    if (!f.is_open()) return;
-    f << "[" << nowIsoUtc() << "] [Supervisor] " << message << "\n";
+    appendLogWithPolicy(path, "[" + nowIsoUtc() + "] [Supervisor] " + message);
 }
 
 static bool testTcpConnect(const std::string& host, int port, std::string& err) {
@@ -1598,9 +1693,24 @@ static std::string handleReq(const std::string& raw, const std::string& clientIp
         return httpResp(200, "application/json", cfg);
     }
     if (method == "POST" && path == "/api/admin/config") {
-        fs::create_directories("/etc/MC");
-        std::ofstream f("/etc/MC/system.json");
-        f << body;
+        simplejson::Object cfg;
+        if (!body.empty()) cfg.parse(body);
+
+        int maxMb = cfg.getInt("logMaxSizeMb", cfg.getInt("logRotSize", 10));
+        if (maxMb < 1) maxMb = 1;
+        if (maxMb > 10240) maxMb = 10240;
+        cfg.setInt("logMaxSizeMb", maxMb);
+        cfg.setInt("logRotSize", maxMb); // legacy compatibility
+
+        int retention = cfg.getInt("logRetention", 14);
+        if (retention < 1) retention = 1;
+        if (retention > 3650) retention = 3650;
+        cfg.setInt("logRetention", retention);
+
+        std::string err;
+        if (!atomicWriteTextFile("/etc/MC/system.json", cfg.serialize(), &err)) {
+            return httpResp(500, "application/json", "{\"saved\":false,\"error\":\"failed to write system config\"}");
+        }
         return httpResp(200, "application/json", "{\"saved\":true}");
     }
 

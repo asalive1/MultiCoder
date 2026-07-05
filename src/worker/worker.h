@@ -115,7 +115,7 @@ private:
     // HLS segment monitoring — logs each new .ts segment as FFmpeg writes it
     std::atomic<bool>  m_hlsSegMonRunning{false};
     std::thread        m_hlsSegMonThread;
-    void monitorHlsSegments(const std::string& hlsDir);
+    void monitorHlsSegments(const std::string& hlsDir, int retainSegments);
 
     // Current HLS metadata payload — injected into playlist at serve time.
     std::mutex  m_hlsMetaMutex;

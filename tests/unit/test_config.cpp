@@ -13,6 +13,7 @@ TEST_CASE("system config defaults are present", "[config]") {
     const std::string systemJson = R"({
         "uiPort": 8050,
         "logLevel": "info",
+        "logMaxSizeMb": 10,
         "logRotSize": 10,
         "logRetention": 14,
         "encoderCount": 5,
@@ -22,6 +23,7 @@ TEST_CASE("system config defaults are present", "[config]") {
 
     CHECK(hasKey(systemJson, "uiPort"));
     CHECK(hasKey(systemJson, "logLevel"));
+    CHECK(hasKey(systemJson, "logMaxSizeMb"));
     CHECK(hasKey(systemJson, "encoderCount"));
 }
 
