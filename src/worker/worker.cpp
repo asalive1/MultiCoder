@@ -4801,6 +4801,7 @@ void Worker::monitorInputLevels() {
     std::string meterWarning;
     std::string activeSessionKey;
     auto lastDataAt = std::chrono::steady_clock::now();
+    auto lastPacketAt = std::chrono::steady_clock::now();
     auto lastNoDataLogAt = std::chrono::steady_clock::now() - std::chrono::seconds(10);
     auto lastMeterUpdateAt = std::chrono::steady_clock::now() - std::chrono::seconds(10);
     int lastMeterL = -60;
@@ -4879,6 +4880,7 @@ void Worker::monitorInputLevels() {
             lastMeterR = -60;
             lastMeterUpdateAt = std::chrono::steady_clock::now() - std::chrono::seconds(10);
             lastDataAt = std::chrono::steady_clock::now() - std::chrono::seconds(10);
+            lastPacketAt = std::chrono::steady_clock::now() - std::chrono::seconds(10);
             meterWarning = connected ? "Input session changed; waiting for fresh telemetry" : "Input disconnected";
             log("Input session changed: " + activeSessionKey + " -> " + sessionKey);
         }
@@ -5116,6 +5118,7 @@ void Worker::monitorInputLevels() {
             }
             lastFailure.clear();
             lastDataAt = std::chrono::steady_clock::now();
+            lastPacketAt = lastDataAt;
             inputLossActive = false;
             meterWarning.clear();
             log("Input meter attached to " + inType + " source " + rtpAddr + ":" + std::to_string(rtpPort)
@@ -5134,6 +5137,7 @@ void Worker::monitorInputLevels() {
             char pkt[4096];
             ssize_t n = recv(levelSocket, pkt, sizeof(pkt), 0);
             if (n > 0) {
+                lastPacketAt = std::chrono::steady_clock::now();
                 int rawL = -60;
                 int rawR = -60;
                 bool parsed = false;
@@ -5156,6 +5160,18 @@ void Worker::monitorInputLevels() {
                         inputLossActive = false;
                     }
                     meterWarning.clear();
+                } else {
+                    auto now = std::chrono::steady_clock::now();
+                    if ((now - lastNoDataLogAt) > std::chrono::seconds(5)) {
+                        log("Input payload parse mismatch: packets received from " + activeAddr + ":" + std::to_string(activePort) +
+                            " but audio parser could not decode payload (bitDepth=" + std::to_string(bitDepth) +
+                            ", bytes=" + std::to_string(static_cast<int>(n)) + ")");
+                        lastNoDataLogAt = now;
+                    }
+                    if ((now - lastDataAt) > std::chrono::seconds(3)) {
+                        inputLossActive = true;
+                        meterWarning = "Packets received but payload format could not be parsed (check RTP bit depth/channel format)";
+                    }
                 }
             }
         } else {
@@ -5164,13 +5180,13 @@ void Worker::monitorInputLevels() {
                 left = lastMeterL;
                 right = lastMeterR;
             }
-            if (connected && (now - lastDataAt) > std::chrono::seconds(3) && (now - lastNoDataLogAt) > std::chrono::seconds(5)) {
+            if (connected && (now - lastPacketAt) > std::chrono::seconds(3) && (now - lastNoDataLogAt) > std::chrono::seconds(5)) {
                 log("Input lost: no packets from " + activeAddr + ":" + std::to_string(activePort) +
                     (activeIface.empty() ? "" : (" iface=" + activeIface)) +
                     " type=" + inType);
                 lastNoDataLogAt = now;
             }
-            if (connected && (now - lastDataAt) > std::chrono::seconds(3)) {
+            if (connected && (now - lastPacketAt) > std::chrono::seconds(3)) {
                 inputLossActive = true;
                 meterWarning = "No packets received from active input";
             }

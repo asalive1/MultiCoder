@@ -1508,6 +1508,7 @@ async function renderHLSSection(cl, cr) {
   await ensureInterfacesLoaded(false);
     const cfg = await loadEncoderConfig(selectedEncoder);
     const hls = cfg.hls || {};
+    const startOffset = Number.isFinite(Number(hls.startTimeOffset)) ? Number(hls.startTimeOffset) : -25;
     const enc = encoders.find(e => e.id === selectedEncoder) || {};
     let adminCfg = {};
     try { adminCfg = await apiGet(`/api/encoder/${selectedEncoder}/admin-config`); } catch {}
@@ -1524,8 +1525,12 @@ async function renderHLSSection(cl, cr) {
     </div>
     <div class="form-row">
       <label>Data Offset Time (seconds):</label>
-      <input type="number" id="hlsStartOffset" value="${hls.startTimeOffset||-25}"/>
+      <input type="number" id="hlsStartOffset" value="${startOffset}"/>
+      <span class="unit" style="min-width:150px">Recommended: -60 to 0</span>
     </div>
+    <p style="font-size:11px;color:var(--muted);margin-top:-2px;margin-bottom:8px;line-height:1.4">
+      Data Offset Time controls playback delay relative to real-time. Negative values add delay for a larger client buffer window (example: <strong>-25</strong> means audio plays about 25 seconds behind live). Use <strong>0</strong> for near-live playback with minimal buffer.
+    </p>
     <div class="form-row">
       <label>Low Latency Stream:</label>
       <input type="checkbox" id="hlsLowLat" ${hls.lowLatency?'checked':''}/>
@@ -1562,12 +1567,6 @@ async function renderHLSSection(cl, cr) {
         ? `<a href="${escapeHtml(adminCfg.hlsListenLink)}" target="_blank" style="font-size:11px">${escapeHtml(adminCfg.hlsListenLink)}</a>`
         : `<span style="font-size:11px;color:var(--muted)">Not configured — set in Admin &rsaquo; Encoder Configuration</span>`}
     </div>
-    <div class="form-row">
-      <label>Live Stream Link:</label>
-      ${adminCfg.hlsPlaybackPort
-        ? `<a href="http://${window.location.hostname}:${adminCfg.hlsPlaybackPort}/hls/index.m3u8" target="_blank" style="font-size:11px">http://${window.location.hostname}:${adminCfg.hlsPlaybackPort}/hls/index.m3u8</a>`
-        : `<span style="font-size:11px;color:var(--muted)">No playback port set — configure HLS Playback Port in Admin &rsaquo; Encoder Configuration</span>`}
-    </div>
     <div class="action-row" style="margin-top:16px">
       <button class="btn btn-success" id="hlsStartBtn">${enc.hls ? '⬤ Running' : 'Start HLS'}</button>
       <button class="btn btn-danger"  id="hlsStopBtn">Stop HLS</button>
@@ -1595,7 +1594,9 @@ async function renderHLSSection(cl, cr) {
                 ...existingHls,
                 segmentSeconds: parseInt(document.getElementById('hlsSegSec').value),
                 window: parseInt(document.getElementById('hlsWindow').value),
-                startTimeOffset: parseInt(document.getElementById('hlsStartOffset').value),
+                startTimeOffset: Number.isFinite(Number(document.getElementById('hlsStartOffset').value))
+                  ? parseInt(document.getElementById('hlsStartOffset').value)
+                  : -25,
                 lowLatency: document.getElementById('hlsLowLat').checked,
                 metaEnabled: document.getElementById('hlsMeta').checked,
                 scteEnabled: document.getElementById('hlsScteEnabled').value === 'true',
