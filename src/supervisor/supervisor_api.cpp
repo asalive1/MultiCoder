@@ -98,6 +98,8 @@ static HANDLE getOrCreateJobObject() {
 static std::string readFile(const std::string& path);
 static bool atomicWriteTextFile(const std::string& path, const std::string& content, std::string* errOut);
 static std::string trimCopy(const std::string& s);
+static std::string lowerCopy(const std::string& s);
+static std::string jsonEscape(const std::string& in);
 static std::string tailSysLog(int lines);
 static std::string tailLog(int encoderIdx, int lines);
 
@@ -338,6 +340,248 @@ static bool testTcpConnect(const std::string& host, int port, std::string& err) 
     freeaddrinfo(res);
     if (!ok && err.empty()) err = "connect timeout";
     return ok;
+}
+
+struct OutboundTarget {
+    std::string host;
+    int port{0};
+    std::string path{"/"};
+};
+
+static std::string xmlEscape(const std::string& in) {
+    std::string out;
+    out.reserve(in.size() + 16);
+    for (char c : in) {
+        if (c == '&') out += "&amp;";
+        else if (c == '<') out += "&lt;";
+        else if (c == '>') out += "&gt;";
+        else if (c == '"') out += "&quot;";
+        else if (c == '\'') out += "&apos;";
+        else out.push_back(c);
+    }
+    return out;
+}
+
+static bool parseOptionalPort(const std::string& text, int* outPort) {
+    if (!outPort) return false;
+    std::string t = trimCopy(text);
+    if (t.empty()) {
+        *outPort = 0;
+        return true;
+    }
+    for (char c : t) {
+        if (!std::isdigit(static_cast<unsigned char>(c))) return false;
+    }
+    int p = 0;
+    try { p = std::stoi(t); } catch (...) { return false; }
+    if (p < 1 || p > 65535) return false;
+    *outPort = p;
+    return true;
+}
+
+static bool parseTargetHostPort(const std::string& rawHost,
+                                const std::string& rawPort,
+                                const std::string& protocol,
+                                OutboundTarget& target,
+                                std::string& err) {
+    target = OutboundTarget{};
+    std::string hostInput = trimCopy(rawHost);
+    std::string path = "/";
+    bool isHttps = false;
+    if (hostInput.empty()) {
+        err = "destination host/url is required";
+        return false;
+    }
+
+    int explicitPort = 0;
+    if (!parseOptionalPort(rawPort, &explicitPort)) {
+        err = "invalid port";
+        return false;
+    }
+
+    std::string lowerHost = lowerCopy(hostInput);
+    if (lowerHost.rfind("http://", 0) == 0 || lowerHost.rfind("https://", 0) == 0) {
+        isHttps = (lowerHost.rfind("https://", 0) == 0);
+        size_t schemeLen = isHttps ? 8 : 7;
+        hostInput = hostInput.substr(schemeLen);
+        size_t slash = hostInput.find('/');
+        if (slash != std::string::npos) {
+            path = hostInput.substr(slash);
+            hostInput = hostInput.substr(0, slash);
+        }
+    } else {
+        size_t slash = hostInput.find('/');
+        if (slash != std::string::npos) {
+            path = hostInput.substr(slash);
+            hostInput = hostInput.substr(0, slash);
+        }
+    }
+
+    int hostPort = 0;
+    size_t colon = hostInput.rfind(':');
+    if (colon != std::string::npos && colon + 1 < hostInput.size()) {
+        bool allDigits = true;
+        for (size_t i = colon + 1; i < hostInput.size(); ++i) {
+            if (!std::isdigit(static_cast<unsigned char>(hostInput[i]))) {
+                allDigits = false;
+                break;
+            }
+        }
+        if (allDigits) {
+            std::string portPart = hostInput.substr(colon + 1);
+            int parsedPort = 0;
+            if (!parseOptionalPort(portPart, &parsedPort)) {
+                err = "invalid destination port in host/url";
+                return false;
+            }
+            hostPort = parsedPort;
+            hostInput = hostInput.substr(0, colon);
+        }
+    }
+
+    hostInput = trimCopy(hostInput);
+    if (hostInput.empty()) {
+        err = "destination host is empty";
+        return false;
+    }
+
+    int finalPort = explicitPort > 0 ? explicitPort : hostPort;
+    if (finalPort <= 0) {
+        if (protocol == "http") finalPort = isHttps ? 443 : 80;
+        else {
+            err = "destination port is required";
+            return false;
+        }
+    }
+
+    if (path.empty()) path = "/";
+    target.host = hostInput;
+    target.port = finalPort;
+    target.path = path;
+    return true;
+}
+
+static bool connectTcpHost(const std::string& host, int port, int& outSocket, std::string& err) {
+    outSocket = -1;
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    addrinfo* res = nullptr;
+    int gai = getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &res);
+    if (gai != 0 || !res) {
+        err = "DNS/resolve failed";
+        return false;
+    }
+
+    bool connected = false;
+    for (addrinfo* p = res; p; p = p->ai_next) {
+        int s = static_cast<int>(socket(p->ai_family, p->ai_socktype, p->ai_protocol));
+        if (s < 0) continue;
+        if (connect(s, p->ai_addr, static_cast<int>(p->ai_addrlen)) == 0) {
+            outSocket = s;
+            connected = true;
+            break;
+        }
+        close_socket(s);
+    }
+
+    freeaddrinfo(res);
+    if (!connected) {
+        err = "connect failed";
+        return false;
+    }
+    return true;
+}
+
+static bool dispatchTcpLine(const std::string& host, int port, const std::string& payload, std::string& err) {
+    int s = -1;
+    if (!connectTcpHost(host, port, s, err)) return false;
+    std::string wire = payload + "\n";
+    int sent = send(s, wire.c_str(), static_cast<int>(wire.size()), MSG_NOSIGNAL);
+    close_socket(s);
+    if (sent <= 0) {
+        err = "send failed";
+        return false;
+    }
+    return true;
+}
+
+static bool dispatchUdpLine(const std::string& host, int port, const std::string& payload, std::string& err) {
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_protocol = IPPROTO_UDP;
+    addrinfo* res = nullptr;
+    int gai = getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &res);
+    if (gai != 0 || !res) {
+        err = "DNS/resolve failed";
+        return false;
+    }
+
+    bool ok = false;
+    for (addrinfo* p = res; p; p = p->ai_next) {
+        int s = static_cast<int>(socket(p->ai_family, p->ai_socktype, p->ai_protocol));
+        if (s < 0) continue;
+        int sent = sendto(s,
+                          payload.c_str(),
+                          static_cast<int>(payload.size()),
+                          MSG_NOSIGNAL,
+                          p->ai_addr,
+                          static_cast<int>(p->ai_addrlen));
+        close_socket(s);
+        if (sent > 0) {
+            ok = true;
+            break;
+        }
+    }
+    freeaddrinfo(res);
+
+    if (!ok) {
+        err = "UDP send failed";
+        return false;
+    }
+    return true;
+}
+
+static bool dispatchHttpPost(const std::string& host,
+                             int port,
+                             const std::string& path,
+                             const std::string& contentType,
+                             const std::string& payload,
+                             std::string& err) {
+    int s = -1;
+    if (!connectTcpHost(host, port, s, err)) return false;
+
+    std::string reqPath = path.empty() ? "/" : path;
+    std::string req = "POST " + reqPath + " HTTP/1.1\r\n"
+                      "Host: " + host + "\r\n"
+                      "Content-Type: " + contentType + "\r\n"
+                      "Content-Length: " + std::to_string(payload.size()) + "\r\n"
+                      "Connection: close\r\n\r\n" + payload;
+    int sent = send(s, req.c_str(), static_cast<int>(req.size()), MSG_NOSIGNAL);
+    close_socket(s);
+    if (sent <= 0) {
+        err = "HTTP POST send failed";
+        return false;
+    }
+    return true;
+}
+
+static std::string buildSctePayload(const std::string& command,
+                                    const std::string& format,
+                                    std::string& contentType) {
+    std::string fmt = lowerCopy(format);
+    if (fmt == "plain") {
+        contentType = "text/plain";
+        return command;
+    }
+    if (fmt == "xml") {
+        contentType = "application/xml";
+        return "<cue><command>" + xmlEscape(command) + "</command></cue>";
+    }
+    contentType = "application/json";
+    return std::string("{\"command\":\"") + jsonEscape(command) + "\"}";
 }
 
 static std::string runCommandCapture(const std::string& cmd) {
@@ -2879,6 +3123,78 @@ static std::string handleReq(const std::string& raw, const std::string& clientIp
             appendEncoderLog(idx + 1, "Metadata test connect FAILED to " + host + ":" + std::to_string(port) + " (" + err + ")");
             appendSysLog(idx + 1, "Metadata test connect FAILED to " + host + ":" + std::to_string(port) + " (" + err + ")");
             return httpResp(200, "application/json", "{\"ok\":false,\"status\":\"failed\",\"error\":\"" + jsonEscape(err) + "\"}");
+        }
+
+        if (method == "POST" && sub == "test-command") {
+            const int enc = idx + 1;
+            simplejson::Object req;
+            req.parse(body);
+
+            std::string kind = lowerCopy(req.getString("kind", "encoder-control"));
+            std::string command = trimCopy(req.getString("command", ""));
+            std::string targetHost = trimCopy(req.getString("host", ""));
+            std::string targetPort = trimCopy(req.getString("port", ""));
+            std::string protocol = lowerCopy(req.getString("protocol", "tcp"));
+            std::string format = lowerCopy(req.getString("format", "plain"));
+            if (kind != "encoder-control" && kind != "scte-35") kind = "encoder-control";
+            if (protocol != "tcp" && protocol != "udp" && protocol != "http") protocol = "tcp";
+
+            if (command.empty()) {
+                appendEncoderLog(enc, "[Test Command] rejected: empty command payload");
+                return httpResp(400, "application/json", "{\"ok\":false,\"error\":\"command is required\"}");
+            }
+
+            OutboundTarget target;
+            std::string parseErr;
+            if (!parseTargetHostPort(targetHost, targetPort, protocol, target, parseErr)) {
+                appendEncoderLog(enc,
+                    "[Test Command] [" + (kind == "scte-35" ? std::string("SCTE-35 Command") : std::string("Encoder Control")) +
+                    "] dispatch=failed reason=" + parseErr);
+                return httpResp(400, "application/json", "{\"ok\":false,\"error\":\"" + jsonEscape(parseErr) + "\"}");
+            }
+
+            std::string contentType = "text/plain";
+            std::string payload = command;
+            if (kind == "scte-35") {
+                payload = buildSctePayload(command, format, contentType);
+                if (format != "plain" && format != "json" && format != "xml") format = "json";
+            } else {
+                format = "plain";
+            }
+
+            std::string sendErr;
+            bool dispatched = false;
+            if (protocol == "tcp") {
+                dispatched = dispatchTcpLine(target.host, target.port, payload, sendErr);
+            } else if (protocol == "udp") {
+                dispatched = dispatchUdpLine(target.host, target.port, payload, sendErr);
+            } else {
+                dispatched = dispatchHttpPost(target.host, target.port, target.path, contentType, payload, sendErr);
+            }
+
+            std::string payloadForLog = payload;
+            for (char& c : payloadForLog) {
+                if (c == '\r' || c == '\n') c = ' ';
+            }
+            std::string destination = target.host + ":" + std::to_string(target.port) + (protocol == "http" ? target.path : "");
+            std::string tag = kind == "scte-35" ? "[SCTE-35 Command]" : "[Encoder Control]";
+            std::string line = std::string("[Test Command] ") + tag +
+                               " protocol=" + protocol +
+                               " destination=" + destination +
+                               " format=" + format +
+                               " payload=" + payloadForLog;
+            appendEncoderLog(enc, line);
+            appendSysLog(enc, line);
+
+            if (dispatched) {
+                appendEncoderLog(enc, std::string("[Test Command] ") + tag + " dispatch=success destination=" + destination);
+                appendSysLog(enc, std::string("[Test Command] ") + tag + " dispatch=success destination=" + destination);
+                return httpResp(200, "application/json", "{\"ok\":true,\"dispatched\":true}");
+            }
+
+            appendEncoderLog(enc, std::string("[Test Command] ") + tag + " dispatch=failed destination=" + destination + " reason=" + sendErr);
+            appendSysLog(enc, std::string("[Test Command] ") + tag + " dispatch=failed destination=" + destination + " reason=" + sendErr);
+            return httpResp(200, "application/json", "{\"ok\":false,\"dispatched\":false,\"error\":\"" + jsonEscape(sendErr) + "\"}");
         }
 
         if (method == "GET" && sub == "metadata/status") {

@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>MultiCoder v2.3.4</title>
+  <title>MultiCoder v2.4.1</title>
   <link rel="icon" type="image/x-icon" href="/favicon.ico"/>
   <link rel="stylesheet" href="/styles.css"/>
 </head>
@@ -13,7 +13,7 @@
 <header>
   <div class="banner-top">
     <h1>Multi&#8209;Coder</h1>
-    <span class="version" id="versionBadge">v2.3.4</span>
+    <span class="version" id="versionBadge">v2.4.1</span>
     <nav id="sysMsg"><span class="banner-msg" id="bannerMsg"></span></nav>
   </div>
   <div class="top-links">
@@ -25,12 +25,19 @@
 
 <!-- ======================== ENCODER STATUS BAR ======================== -->
 <div id="status-bar">
-  <div class="status-bar-row">
-    <h2>Available Streams</h2>
-    <button class="btn add-encoder-btn" id="addEncoderBtn" style="display:none">+ Add New Encoder</button>
-  </div>
-  <div class="status-bar-row" id="encoderCards">
-    <!-- Encoder cards injected by JS -->
+  <div id="status-bar-content">
+    <div class="status-streams">
+      <div class="status-bar-row">
+        <h2>Available Streams</h2>
+        <button class="btn add-encoder-btn" id="addEncoderBtn" style="display:none">+ Add New Encoder</button>
+      </div>
+      <div class="status-bar-row" id="encoderCards">
+        <!-- Encoder cards injected by JS -->
+      </div>
+    </div>
+    <div id="commandGeneratorPanel" aria-live="polite">
+      <!-- Command generator injected by JS -->
+    </div>
   </div>
 </div>
 

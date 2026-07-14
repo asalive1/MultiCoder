@@ -28,6 +28,8 @@ let inputDiagTimer = null;
 let metadataStatusTimer = null;
 let metaPanelTimer = null;
 let metaLastEventCount = 0;
+let commandGeneratorByEncoder = {};
+let commandSaveTimers = {};
 // Per-stream history: each entry is { ts, text } for that stream only.
 let metaStreamHistory = { metadata: [], aac: [], mp3: [], hls: [], srt: [] };
 const STREAM_SECTIONS = ['aac', 'mp3', 'hls', 'srt'];
@@ -37,6 +39,252 @@ const SRT_INPUT_LATENCY_MAX_MS = 90000;
 
 function listFromCsv(text) {
   return String(text || '').split(',').map(s => s.trim()).filter(Boolean);
+}
+
+function defaultCommandGeneratorState() {
+  return {
+    encoder: {
+      command: '',
+      host: '',
+      port: '',
+      protocol: 'tcp',
+    },
+    scte: {
+      command: '',
+      host: '',
+      port: '',
+      protocol: 'http',
+      format: 'json',
+    },
+  };
+}
+
+function normalizeCommandGeneratorState(raw) {
+  const defaults = defaultCommandGeneratorState();
+  const source = raw && typeof raw === 'object' ? raw : {};
+  const enc = source.encoder && typeof source.encoder === 'object' ? source.encoder : {};
+  const scte = source.scte && typeof source.scte === 'object' ? source.scte : {};
+  const normalizeProtocol = (v, fallback) => {
+    const p = String(v || '').toLowerCase();
+    return ['tcp', 'udp', 'http'].includes(p) ? p : fallback;
+  };
+  const normalizeFormat = (v) => {
+    const f = String(v || '').toLowerCase();
+    return ['plain', 'json', 'xml'].includes(f) ? f : 'json';
+  };
+  return {
+    encoder: {
+      command: String(enc.command || ''),
+      host: String(enc.host || ''),
+      port: String(enc.port || ''),
+      protocol: normalizeProtocol(enc.protocol, defaults.encoder.protocol),
+    },
+    scte: {
+      command: String(scte.command || ''),
+      host: String(scte.host || ''),
+      port: String(scte.port || ''),
+      protocol: normalizeProtocol(scte.protocol, defaults.scte.protocol),
+      format: normalizeFormat(scte.format),
+    },
+  };
+}
+
+function deriveCommandGeneratorDefaults(cfg) {
+  const defaults = defaultCommandGeneratorState();
+  const metadata = cfg && cfg.metadata ? cfg.metadata : {};
+  const scte = metadata && metadata.scte ? metadata.scte : {};
+  const listenTransport = String(scte.listenTransport || '').toLowerCase();
+  const cueDeliveryType = String(scte.cueDeliveryType || '').toLowerCase();
+
+  const derivedScteProtocol = listenTransport === 'tcp'
+    ? 'tcp'
+    : listenTransport === 'both'
+      ? 'http'
+      : 'http';
+
+  const derivedScteFormat = cueDeliveryType === 'xml'
+    ? 'xml'
+    : cueDeliveryType === 'both'
+      ? 'json'
+      : 'json';
+
+  return {
+    encoder: {
+      command: '',
+      host: '',
+      port: '',
+      protocol: defaults.encoder.protocol,
+    },
+    scte: {
+      command: '',
+      host: '',
+      port: '',
+      protocol: derivedScteProtocol,
+      format: derivedScteFormat,
+    },
+  };
+}
+
+function collectCommandGeneratorStateFromDom() {
+  return normalizeCommandGeneratorState({
+    encoder: {
+      command: (document.getElementById('cgEncoderCmd') || {}).value || '',
+      host: (document.getElementById('cgEncoderHost') || {}).value || '',
+      port: (document.getElementById('cgEncoderPort') || {}).value || '',
+      protocol: ((document.getElementById('cgEncoderProtocol') || {}).value || 'tcp').toLowerCase(),
+    },
+    scte: {
+      command: (document.getElementById('cgScteCmd') || {}).value || '',
+      host: (document.getElementById('cgScteHost') || {}).value || '',
+      port: (document.getElementById('cgSctePort') || {}).value || '',
+      protocol: ((document.getElementById('cgScteProtocol') || {}).value || 'http').toLowerCase(),
+      format: ((document.getElementById('cgScteFormat') || {}).value || 'json').toLowerCase(),
+    },
+  });
+}
+
+async function persistCommandGeneratorStateForEncoder(encoderId, state) {
+  if (!encoderId) return;
+  const current = await loadEncoderConfig(encoderId);
+  const control = (current && current.control) ? current.control : {};
+  control.commandGenerator = normalizeCommandGeneratorState(state);
+  await apiPost(`/api/encoder/${encoderId}/config/control`, JSON.stringify(control));
+}
+
+function scheduleCommandGeneratorSave() {
+  const encoderId = selectedEncoder;
+  if (!encoderId) return;
+  commandGeneratorByEncoder[encoderId] = collectCommandGeneratorStateFromDom();
+  if (commandSaveTimers[encoderId]) clearTimeout(commandSaveTimers[encoderId]);
+  commandSaveTimers[encoderId] = setTimeout(async () => {
+    try {
+      await persistCommandGeneratorStateForEncoder(encoderId, commandGeneratorByEncoder[encoderId]);
+    } catch {
+      // Intentionally silent: save retries on next field change or send.
+    }
+  }, 300);
+}
+
+async function ensureCommandGeneratorLoaded(encoderId) {
+  if (!encoderId) return defaultCommandGeneratorState();
+  if (commandGeneratorByEncoder[encoderId]) return commandGeneratorByEncoder[encoderId];
+  const cfg = await loadEncoderConfig(encoderId);
+  const ctl = (cfg && cfg.control) ? cfg.control : {};
+  const loaded = normalizeCommandGeneratorState({
+    ...deriveCommandGeneratorDefaults(cfg),
+    ...(ctl.commandGenerator || {}),
+  });
+  commandGeneratorByEncoder[encoderId] = loaded;
+  return loaded;
+}
+
+async function sendCommandGenerator(kind) {
+  const encoderId = selectedEncoder;
+  if (!encoderId) {
+    showBanner('Select an encoder before sending a test command', 'warn');
+    return;
+  }
+
+  const state = collectCommandGeneratorStateFromDom();
+  commandGeneratorByEncoder[encoderId] = state;
+  try {
+    await persistCommandGeneratorStateForEncoder(encoderId, state);
+  } catch {
+    // Non-fatal for command dispatch.
+  }
+
+  const payload = kind === 'encoder'
+    ? {
+        kind: 'encoder-control',
+        command: state.encoder.command,
+        host: state.encoder.host,
+        port: state.encoder.port,
+        protocol: state.encoder.protocol,
+        format: 'plain',
+      }
+    : {
+        kind: 'scte-35',
+        command: state.scte.command,
+        host: state.scte.host,
+        port: state.scte.port,
+        protocol: state.scte.protocol,
+        format: state.scte.format,
+      };
+
+  try {
+    const res = await apiPost(`/api/encoder/${encoderId}/test-command`, payload);
+    if (res && res.ok) {
+      showBanner(`${kind === 'encoder' ? 'Encoder control' : 'SCTE-35'} test command dispatched`, 'ok');
+    } else {
+      showBanner(`${kind === 'encoder' ? 'Encoder control' : 'SCTE-35'} send failed: ${(res && res.error) || 'unknown error'}`, 'error');
+    }
+  } catch (e) {
+    showBanner(`Test command send failed: ${e.message}`, 'error');
+  }
+}
+
+async function renderCommandGeneratorPanel() {
+  const panel = document.getElementById('commandGeneratorPanel');
+  if (!panel) return;
+
+  if (!selectedEncoder) {
+    panel.innerHTML = `
+      <div class="command-generator">
+        <h3>Command Generator</h3>
+        <div class="cg-help">Select an encoder to generate and send test commands.</div>
+      </div>`;
+    return;
+  }
+
+  const state = await ensureCommandGeneratorLoaded(selectedEncoder);
+  panel.innerHTML = `
+    <div class="command-generator">
+      <h3>Command Generator</h3>
+      <div class="cg-row">
+        <label>Encoder Command:</label>
+        <input id="cgEncoderCmd" class="cg-input-command" type="text" value="${escapeHtml(state.encoder.command)}" placeholder="command"/>
+        <input id="cgEncoderHost" class="cg-input-host" type="text" value="${escapeHtml(state.encoder.host)}" placeholder="ip or url for encoder"/>
+        <input id="cgEncoderPort" class="cg-input-port" type="text" value="${escapeHtml(state.encoder.port)}" placeholder="port"/>
+        <select id="cgEncoderProtocol" class="cg-input-protocol" title="Send protocol">
+          <option value="tcp" ${state.encoder.protocol === 'tcp' ? 'selected' : ''}>TCP</option>
+          <option value="udp" ${state.encoder.protocol === 'udp' ? 'selected' : ''}>UDP</option>
+          <option value="http" ${state.encoder.protocol === 'http' ? 'selected' : ''}>HTTP</option>
+        </select>
+        <button id="cgEncoderSend" class="btn cg-send-btn" type="button">SEND</button>
+      </div>
+      <div class="cg-row">
+        <label>SCTE-35 Cues:</label>
+        <input id="cgScteCmd" class="cg-input-command" type="text" value="${escapeHtml(state.scte.command)}" placeholder="command"/>
+        <input id="cgScteHost" class="cg-input-host" type="text" value="${escapeHtml(state.scte.host)}" placeholder="ip or url for encoder"/>
+        <input id="cgSctePort" class="cg-input-port" type="text" value="${escapeHtml(state.scte.port)}" placeholder="port"/>
+        <select id="cgScteProtocol" class="cg-input-protocol" title="Send protocol">
+          <option value="tcp" ${state.scte.protocol === 'tcp' ? 'selected' : ''}>TCP</option>
+          <option value="udp" ${state.scte.protocol === 'udp' ? 'selected' : ''}>UDP</option>
+          <option value="http" ${state.scte.protocol === 'http' ? 'selected' : ''}>HTTP</option>
+        </select>
+        <select id="cgScteFormat" class="cg-input-format" title="SCTE payload format">
+          <option value="plain" ${state.scte.format === 'plain' ? 'selected' : ''}>PLAIN</option>
+          <option value="json" ${state.scte.format === 'json' ? 'selected' : ''}>JSON</option>
+          <option value="xml" ${state.scte.format === 'xml' ? 'selected' : ''}>XML</option>
+        </select>
+        <button id="cgScteSend" class="btn cg-send-btn" type="button">SEND</button>
+      </div>
+      <div class="cg-help">Commands are generated for Encoder ${selectedEncoder}. Values are saved per encoder.</div>
+    </div>`;
+
+  const persistIds = [
+    'cgEncoderCmd', 'cgEncoderHost', 'cgEncoderPort', 'cgEncoderProtocol',
+    'cgScteCmd', 'cgScteHost', 'cgSctePort', 'cgScteProtocol', 'cgScteFormat',
+  ];
+  persistIds.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.addEventListener('change', scheduleCommandGeneratorSave);
+    el.addEventListener('blur', scheduleCommandGeneratorSave);
+  });
+
+  document.getElementById('cgEncoderSend').addEventListener('click', () => sendCommandGenerator('encoder'));
+  document.getElementById('cgScteSend').addEventListener('click', () => sendCommandGenerator('scte'));
 }
 
 function renderCommandRows(rows) {
@@ -303,6 +551,10 @@ function interfaceOptions(selected) {
 function renderEncoderCards() {
     const container = document.getElementById('encoderCards');
     container.innerHTML = '';
+    // Keep horizontal scrolling to scrollbar drag only (disable Shift+Wheel shortcut).
+    container.onwheel = (e) => {
+      if (e.shiftKey) e.preventDefault();
+    };
     encoders.forEach(enc => {
         const div = document.createElement('div');
         div.className = 'encoder-card' + (enc.id === selectedEncoder ? ' selected' : '');
@@ -351,6 +603,7 @@ function selectEncoder(id) {
     metaLastEventCount = 0;
   metaStreamHistory = { metadata: [], aac: [], mp3: [], hls: [], srt: [] };
     renderEncoderCards();
+    renderCommandGeneratorPanel();
     renderLeftNav();
     loadSection('input');
 }
@@ -2592,6 +2845,7 @@ window.selectEncoder = function(id) {
 // BOOT
 // ===========================================================
 async function init() {
+  await renderCommandGeneratorPanel();
     await refreshStatus();
     // Periodic status refresh every 3 seconds
     statusTimer = setInterval(refreshStatus, 3000);

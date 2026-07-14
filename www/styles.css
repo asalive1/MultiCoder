@@ -69,16 +69,92 @@ header .top-links a:hover { color: #fff; }
 #status-bar {
   background: #f0f4f8;
   border-bottom: 1px solid var(--border);
-  padding: 6px 16px;
+  padding: 6px 16px 10px;
   display: flex;
   flex-direction: column;
   gap: 4px;
   flex-shrink: 0;
 }
 
+#status-bar-content {
+  display: flex;
+  align-items: stretch;
+  gap: 14px;
+}
+
+.status-streams {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
 .status-bar-row { display: flex; gap: 32px; align-items: flex-start; flex-wrap: wrap; }
 .status-bar-row h2 { font-size: 14px; font-weight: 700; text-decoration: underline; margin-right: 8px; }
 #status-bar .add-encoder-btn { font-size: 11px; margin-left: 8px; }
+
+#encoderCards {
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  overflow-y: hidden;
+  gap: 24px;
+  padding-bottom: 6px;
+  scrollbar-gutter: stable both-edges;
+}
+
+#commandGeneratorPanel {
+  width: clamp(330px, 29vw, 430px);
+  flex: 0 0 auto;
+  border-left: 1px solid var(--border);
+  padding-left: 14px;
+}
+
+.command-generator h3 {
+  font-size: 18px;
+  margin-bottom: 8px;
+}
+
+.cg-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.cg-row label {
+  min-width: 118px;
+  font-weight: 600;
+}
+
+.cg-row input,
+.cg-row select {
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  padding: 2px 5px;
+  font-size: 12px;
+}
+
+.cg-input-command { width: 140px; }
+.cg-input-host { width: 140px; }
+.cg-input-port { width: 62px; }
+.cg-input-format { width: 74px; }
+.cg-input-protocol { width: 76px; }
+
+.cg-send-btn {
+  min-width: 52px;
+  padding: 3px 10px;
+}
+
+.cg-help {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.35;
+}
+
+.command-generator input::placeholder {
+  color: #9aa3ad;
+}
 
 .encoder-card {
   cursor: pointer;
@@ -96,7 +172,7 @@ main {
   display: grid;
   grid-template-columns: 190px 1fr 1fr 1fr;
   overflow: hidden;
-  border-top: 2px solid var(--border);
+  border-top: 1px solid var(--border);
 }
 
 main.log-expanded {
@@ -275,6 +351,16 @@ main.log-expanded #rightPanel {
 
 /* ---- Responsive: single column on small screens ---- */
 @media (max-width: 900px) {
+  #status-bar-content {
+    flex-direction: column;
+  }
+  #commandGeneratorPanel {
+    width: 100%;
+    border-left: none;
+    border-top: 1px solid var(--border);
+    padding-left: 0;
+    padding-top: 8px;
+  }
   main { grid-template-columns: 1fr; grid-template-rows: auto; }
   .panel { border-right: none; border-bottom: 1px solid var(--border); }
 }
