@@ -77,8 +77,9 @@ header .top-links a:hover { color: #fff; }
 }
 
 #status-bar-content {
-  display: flex;
-  align-items: stretch;
+  display: grid;
+  grid-template-columns: minmax(360px, 540px) minmax(0, 1fr);
+  align-items: start;
   gap: 14px;
 }
 
@@ -104,10 +105,9 @@ header .top-links a:hover { color: #fff; }
 }
 
 #commandGeneratorPanel {
-  width: clamp(330px, 29vw, 430px);
-  flex: 0 0 auto;
-  border-left: 1px solid var(--border);
-  padding-left: 14px;
+  width: 100%;
+  border-right: 1px solid var(--border);
+  padding-right: 14px;
 }
 
 .command-generator h3 {
@@ -120,10 +120,11 @@ header .top-links a:hover { color: #fff; }
   align-items: center;
   gap: 6px;
   margin-bottom: 8px;
+  flex-wrap: wrap;
 }
 
 .cg-row label {
-  min-width: 118px;
+  min-width: 100%;
   font-weight: 600;
 }
 
@@ -135,8 +136,8 @@ header .top-links a:hover { color: #fff; }
   font-size: 12px;
 }
 
-.cg-input-command { width: 140px; }
-.cg-input-host { width: 140px; }
+.cg-input-command { width: 138px; }
+.cg-input-host { flex: 1 1 160px; min-width: 160px; }
 .cg-input-port { width: 62px; }
 .cg-input-format { width: 74px; }
 .cg-input-protocol { width: 76px; }
@@ -353,12 +354,13 @@ main.log-expanded #rightPanel {
 @media (max-width: 900px) {
   #status-bar-content {
     flex-direction: column;
+    display: flex;
   }
   #commandGeneratorPanel {
     width: 100%;
-    border-left: none;
+    border-right: none;
     border-top: 1px solid var(--border);
-    padding-left: 0;
+    padding-right: 0;
     padding-top: 8px;
   }
   main { grid-template-columns: 1fr; grid-template-rows: auto; }
