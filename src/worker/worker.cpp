@@ -504,11 +504,44 @@ static int be24ToSigned(const unsigned char* p) {
 // bitDepth: 16 = L16 (4 bytes/stereo frame), 24 = L24 (6 bytes/stereo frame)
 static bool parseRtpStereoLevels(const char* data, size_t len, int& leftDb, int& rightDb, int bitDepth = 24) {
     if (!data || len < 16) return false;
-    if (len <= 12) return false;
-    const unsigned char* p = reinterpret_cast<const unsigned char*>(data) + 12;
-    size_t payloadLen = len - 12;
+
+    const unsigned char* b = reinterpret_cast<const unsigned char*>(data);
+
+    // RFC3550 RTP fixed header validation.
+    const int version = (b[0] >> 6) & 0x03;
+    if (version != 2) return false;
+
+    const bool hasPadding = (b[0] & 0x20) != 0;
+    const bool hasExt     = (b[0] & 0x10) != 0;
+    const int csrcCount   = b[0] & 0x0F;
+
+    // MultiCoder writes SDP with dynamic payload type 96 for L16/L24 RTP input.
+    const int payloadType = b[1] & 0x7F;
+    if (payloadType != 96) return false;
+
+    size_t hdrLen = 12 + static_cast<size_t>(csrcCount) * 4;
+    if (len <= hdrLen) return false;
+
+    if (hasExt) {
+        // RTP extension header: 16-bit profile + 16-bit length (32-bit words)
+        if (len < hdrLen + 4) return false;
+        const size_t extWords = (static_cast<size_t>(b[hdrLen + 2]) << 8)
+                              | static_cast<size_t>(b[hdrLen + 3]);
+        hdrLen += 4 + extWords * 4;
+        if (len <= hdrLen) return false;
+    }
+
+    size_t payloadLen = len - hdrLen;
+    if (hasPadding) {
+        const size_t pad = static_cast<size_t>(b[len - 1]);
+        if (pad == 0 || pad > payloadLen) return false;
+        payloadLen -= pad;
+    }
+
+    const unsigned char* p = b + hdrLen;
     const size_t bytesPerFrame = static_cast<size_t>(bitDepth / 8) * 2; // 2 channels
-    size_t frames = payloadLen / bytesPerFrame;
+    if (bytesPerFrame == 0) return false;
+    const size_t frames = payloadLen / bytesPerFrame;
     if (frames < 1) return false;
 
     double lsum = 0.0;
@@ -537,6 +570,34 @@ static bool parseRtpStereoLevels(const char* data, size_t len, int& leftDb, int&
     if (rrms <= 1e-9) rightDb = -60;
     else rightDb = clampDb(static_cast<int>(std::lround(20.0 * std::log10(rrms))));
     return true;
+}
+
+// Parse RTP PCM levels while tolerating bit-depth config mismatches.
+// Tries the configured depth first, then falls back to the alternate depth.
+static bool parseRtpStereoLevelsWithFallback(const char* data,
+                                             size_t len,
+                                             int& leftDb,
+                                             int& rightDb,
+                                             int configuredBitDepth,
+                                             int& detectedBitDepth) {
+    std::vector<int> candidates;
+    if (configuredBitDepth == 16 || configuredBitDepth == 24) {
+        candidates.push_back(configuredBitDepth);
+    } else {
+        candidates.push_back(24);
+    }
+    if (candidates.front() != 24) candidates.push_back(24);
+    if (candidates.front() != 16) candidates.push_back(16);
+
+    for (int depth : candidates) {
+        if (parseRtpStereoLevels(data, len, leftDb, rightDb, depth)) {
+            detectedBitDepth = depth;
+            return true;
+        }
+    }
+
+    detectedBitDepth = configuredBitDepth;
+    return false;
 }
 
 // Parse raw PCM s16le interleaved stereo (from SRT relay UDP) and return dB levels.
@@ -2126,53 +2187,28 @@ void Worker::publishStreamHealth() {
         return s;
     };
 
-    auto hasFreshHlsOutput = [&](int maxAgeSec) {
-        std::error_code ec;
-        fs::path hlsDir = fs::path(m_cfgDir) / "hls";
-        fs::path playlist = hlsDir / "index.m3u8";
-        if (!fs::exists(playlist, ec) || ec) return false;
-        auto sz = fs::file_size(playlist, ec);
-        if (ec || sz == 0) return false;
-
-        auto now = fs::file_time_type::clock::now();
-        auto plTime = fs::last_write_time(playlist, ec);
-        if (ec || (now - plTime) > std::chrono::seconds(maxAgeSec)) return false;
-
-        fs::path segDir = hlsDir / "segments";
-        if (!fs::exists(segDir, ec) || ec) return false;
-
-        for (const auto& e : fs::directory_iterator(segDir, ec)) {
-            if (ec) break;
-            std::string ext = lower(e.path().extension().string());
-            if (ext != ".aac" && ext != ".ts" && ext != ".m4s") continue;
-            auto t = fs::last_write_time(e.path(), ec);
-            if (!ec && (now - t) <= std::chrono::seconds(maxAgeSec)) return true;
-        }
-        return false;
-    };
-
     simplejson::Object rt = readRuntimeState(m_cfgDir);
     std::string inputWarning = lower(rt.getString("inputWarning", ""));
     bool inputConnected = rt.getBool("inputConnected", false);
-    bool inputLikelyFlowing = true;
-    if (inputConnected) {
-        if (inputWarning.find("no packets") != std::string::npos ||
-            inputWarning.find("unavailable") != std::string::npos ||
-            inputWarning.find("disconnected") != std::string::npos) {
-            inputLikelyFlowing = false;
-        }
-    }
+    bool inputSourceUnavailable = inputConnected &&
+        (inputWarning.find("unavailable") != std::string::npos ||
+         inputWarning.find("disconnected") != std::string::npos);
+    bool inputPacketsMissing = inputConnected && (inputWarning.find("no packets") != std::string::npos);
 
-    bool aacLive = m_aacRunning.load() && (!inputConnected || inputLikelyFlowing);
-    bool mp3Live = m_mp3Running.load() && (!inputConnected || inputLikelyFlowing);
-    bool hlsLive = m_hlsRunning.load() && hasFreshHlsOutput(25) && (!inputConnected || inputLikelyFlowing);
-    bool srtLive = m_srtRunning.load() && (!inputConnected || inputLikelyFlowing);
+    // Running state reflects process lifecycle, not momentary input audio activity.
+    // This keeps encoders reported as running when the source is connected but silent.
+    bool aacLive = m_aacRunning.load();
+    bool mp3Live = m_mp3Running.load();
+    bool hlsLive = m_hlsRunning.load();
+    bool srtLive = m_srtRunning.load();
 
     rt.setInt("workerHeartbeatEpoch", static_cast<int>(std::time(nullptr)));
     rt.setBool("workerAacRunning", aacLive);
     rt.setBool("workerMp3Running", mp3Live);
     rt.setBool("workerHlsRunning", hlsLive);
     rt.setBool("workerSrtRunning", srtLive);
+    rt.setBool("inputSourceUnavailable", inputSourceUnavailable);
+    rt.setBool("inputPacketsMissing", inputPacketsMissing);
     rt.setBool("controlListenerRunning", m_controlListenerRunning.load());
     rt.setBool("cueListenerRunning", m_cueListenerRunning.load());
     writeRuntimeState(m_cfgDir, rt);
@@ -4800,6 +4836,7 @@ void Worker::monitorInputLevels() {
     std::string lastUnsupportedMode;
     std::string meterWarning;
     std::string activeSessionKey;
+    int activeRtpMeterBitDepth = 0;
     auto lastDataAt = std::chrono::steady_clock::now();
     auto lastPacketAt = std::chrono::steady_clock::now();
     auto lastNoDataLogAt = std::chrono::steady_clock::now() - std::chrono::seconds(10);
@@ -4878,6 +4915,7 @@ void Worker::monitorInputLevels() {
 #endif
             lastMeterL = -60;
             lastMeterR = -60;
+            activeRtpMeterBitDepth = 0;
             lastMeterUpdateAt = std::chrono::steady_clock::now() - std::chrono::seconds(10);
             lastDataAt = std::chrono::steady_clock::now() - std::chrono::seconds(10);
             lastPacketAt = std::chrono::steady_clock::now() - std::chrono::seconds(10);
@@ -5119,6 +5157,7 @@ void Worker::monitorInputLevels() {
             lastFailure.clear();
             lastDataAt = std::chrono::steady_clock::now();
             lastPacketAt = lastDataAt;
+            activeRtpMeterBitDepth = 0;
             inputLossActive = false;
             meterWarning.clear();
             log("Input meter attached to " + inType + " source " + rtpAddr + ":" + std::to_string(rtpPort)
@@ -5141,13 +5180,26 @@ void Worker::monitorInputLevels() {
                 int rawL = -60;
                 int rawR = -60;
                 bool parsed = false;
+                int parsedBitDepth = bitDepth;
                 if (srtRelayActive) {
                     // Raw PCM s16le interleaved stereo from relay UDP
                     parsed = parsePcmS16leStereoLevels(pkt, static_cast<size_t>(n), rawL, rawR);
                 } else {
-                    parsed = parseRtpStereoLevels(pkt, static_cast<size_t>(n), rawL, rawR, bitDepth);
+                    parsed = parseRtpStereoLevelsWithFallback(
+                        pkt,
+                        static_cast<size_t>(n),
+                        rawL,
+                        rawR,
+                        bitDepth,
+                        parsedBitDepth);
                 }
                 if (parsed) {
+                    if (!srtRelayActive && parsedBitDepth != bitDepth && parsedBitDepth != activeRtpMeterBitDepth) {
+                        log("Input meter RTP parser auto-adjusted bit depth from " + std::to_string(bitDepth) +
+                            " to " + std::to_string(parsedBitDepth) + " for source " + activeAddr +
+                            ":" + std::to_string(activePort));
+                    }
+                    if (!srtRelayActive) activeRtpMeterBitDepth = parsedBitDepth;
                     left = calibrateMeterDb(rawL, gainDb);
                     right = calibrateMeterDb(rawR, gainDb);
                     lastDataAt = std::chrono::steady_clock::now();
@@ -5163,9 +5215,12 @@ void Worker::monitorInputLevels() {
                 } else {
                     auto now = std::chrono::steady_clock::now();
                     if ((now - lastNoDataLogAt) > std::chrono::seconds(5)) {
+                        std::string depthInfo = (activeRtpMeterBitDepth == 16 || activeRtpMeterBitDepth == 24)
+                            ? (", lastDetectedBitDepth=" + std::to_string(activeRtpMeterBitDepth))
+                            : "";
                         log("Input payload parse mismatch: packets received from " + activeAddr + ":" + std::to_string(activePort) +
                             " but audio parser could not decode payload (bitDepth=" + std::to_string(bitDepth) +
-                            ", bytes=" + std::to_string(static_cast<int>(n)) + ")");
+                            ", bytes=" + std::to_string(static_cast<int>(n)) + depthInfo + ")");
                         lastNoDataLogAt = now;
                     }
                     if ((now - lastDataAt) > std::chrono::seconds(3)) {

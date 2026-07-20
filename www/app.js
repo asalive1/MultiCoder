@@ -679,6 +679,7 @@ async function renderInputSection(cl, cr) {
         <div class="vu-channel"><span class="vu-label">L</span><div class="vu-track"><div class="vu-fill" id="vuL"></div></div></div>
         <div class="vu-channel"><span class="vu-label">R</span><div class="vu-track"><div class="vu-fill" id="vuR"></div></div></div>
       </div>
+      <div id="inputHintLine" style="display:none;margin-top:6px;font-size:11px;color:var(--muted);"></div>
       <div id="inputWarningLine" style="display:none;margin-top:6px;font-size:11px;color:#ff8a80;"></div>
     </div>
 
@@ -1041,16 +1042,58 @@ function updateInputWarning(levels) {
   el.textContent = t ? `[${t}] ${warning}` : warning;
 }
 
+function updateInputHint(levels) {
+  const el = document.getElementById('inputHintLine');
+  if (!el) return;
+
+  const connected = !!(levels && levels.connected);
+  const left = Number(levels && levels.leftDb);
+  const right = Number(levels && levels.rightDb);
+  const warning = String((levels && levels.warning) || '').toLowerCase();
+
+  if (!connected) {
+    el.style.display = '';
+    el.textContent = 'Hint: input is disconnected.';
+    return;
+  }
+
+  if (warning.includes('no packets')) {
+    el.style.display = '';
+    el.textContent = 'Hint: input connected, waiting for RTP/Axia packets.';
+    return;
+  }
+
+  if (warning.includes('payload format')) {
+    el.style.display = '';
+    el.textContent = 'Hint: packets are arriving, but payload format does not match expected bit depth/channels.';
+    return;
+  }
+
+  if (warning.includes('unavailable') || warning.includes('disconnected')) {
+    el.style.display = '';
+    el.textContent = 'Hint: selected source is unavailable.';
+    return;
+  }
+
+  const likelySilent = Number.isFinite(left) && Number.isFinite(right) && left <= -58 && right <= -58;
+  el.style.display = '';
+  el.textContent = likelySilent
+    ? 'Hint: input connected and valid, currently silent.'
+    : 'Hint: input connected with active audio.';
+}
+
 async function refreshInputLevels() {
   if (!selectedEncoder || selectedSection !== 'input') return;
   try {
     const levels = await apiGet(`/api/encoder/${selectedEncoder}/input/levels`);
     updateVUFromLevels(levels);
     updateInputVuTitle(levels);
+    updateInputHint(levels);
     updateInputWarning(levels);
   } catch {
     updateVUFromLevels({ connected: false, leftDb: -60, rightDb: -60 });
     updateInputVuTitle({ connected: false });
+    updateInputHint({ connected: false });
     updateInputWarning({ connected: false, warning: 'Input telemetry unavailable' });
   }
 }
