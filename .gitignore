@@ -2,6 +2,7 @@
 build/
 build-debug/
 build-linux-debug/
+build-linux-asan/
 dist/
 cmake-build-*/
 

@@ -390,6 +390,23 @@ Unit tests cover:
 - `LivewireMapping` — 13 test cases (formula, reverse, roundtrip, error cases)
 - `HLS` — playlist generation, segment purge policy, media sequence
 
+### Reliability Hardening Build Modes
+
+Enable sanitizers (Linux, GCC/Clang, Debug):
+
+```bash
+cmake -B build-asan -S . -DCMAKE_BUILD_TYPE=Debug -GNinja -DMULTICODER_ENABLE_SANITIZERS=ON
+cmake --build build-asan
+ctest --test-dir build-asan --output-on-failure
+```
+
+Enable clang-tidy (when installed):
+
+```bash
+cmake -B build-tidy -S . -DCMAKE_BUILD_TYPE=Debug -GNinja -DMULTICODER_ENABLE_CLANG_TIDY=ON
+cmake --build build-tidy
+```
+
 ---
 
 ## CI Workflows
