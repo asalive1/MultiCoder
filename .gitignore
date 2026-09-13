@@ -1,6 +1,7 @@
 # Build output
 build/
 build-debug/
+build-linux-debug/
 dist/
 cmake-build-*/
 

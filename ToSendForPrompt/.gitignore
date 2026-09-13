@@ -1,0 +1,7 @@
+*
+!.gitignore
+!Axia Multicast CODEC-USE 1.xlsx
+!config-sample.json.txt
+!icecast_parse-example.json.txt
+!OriginalEncoder.Main.cpp.txt
+!styles.css.txt
