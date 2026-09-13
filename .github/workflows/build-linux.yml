@@ -25,7 +25,8 @@ jobs:
             libmp3lame-dev \
             libssl-dev \
             libcurl4-openssl-dev \
-            libxml2-dev
+            libxml2-dev \
+            clang-tidy
 
             # Ubuntu 24.04 runners may not provide this package in default repos.
             # Keep CI green when unavailable; code paths requiring it are optional.
@@ -45,7 +46,30 @@ jobs:
         run: cmake --build build --parallel
 
       - name: Run unit tests
-        run: ctest --test-dir build --output-on-failure --no-tests=ignore -R "LivewireMapping|HLS"
+        run: ctest --test-dir build --output-on-failure --no-tests=ignore
+
+      - name: Configure sanitizer build
+        run: |
+          cmake -B build-asan -S . \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -GNinja \
+            -DMULTICODER_ENABLE_SANITIZERS=ON
+
+      - name: Build sanitizer configuration
+        run: cmake --build build-asan --parallel
+
+      - name: Run sanitizer unit tests
+        run: ctest --test-dir build-asan --output-on-failure --no-tests=ignore
+
+      - name: Configure clang-tidy build
+        run: |
+          cmake -B build-tidy -S . \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -GNinja \
+            -DMULTICODER_ENABLE_CLANG_TIDY=ON
+
+      - name: Build with clang-tidy
+        run: cmake --build build-tidy --parallel
 
       - name: Check test artifact directory
         id: test_artifacts

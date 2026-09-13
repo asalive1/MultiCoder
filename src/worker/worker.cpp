@@ -19,6 +19,7 @@
 #include <iomanip>
 #include <vector>
 #include <deque>
+#include <functional>
 #include <unordered_map>
 
 #ifdef _WIN32
@@ -49,6 +50,8 @@ typedef int ssize_t;
 #endif
 
 namespace fs = std::filesystem;
+
+static void close_socket(int fd);
 
 namespace {
 constexpr int kIcecastFailureTimeoutUs = 60 * 1000 * 1000;
@@ -352,6 +355,120 @@ bool sidecarIdRecentlySent(const std::string& idempotencyKey, int dedupeSec) {
     g_sidecarRecentIds[idempotencyKey] = nowMs;
     return false;
 }
+
+const char* streamStateToString(StreamLifecycleState state) {
+    switch (state) {
+        case StreamLifecycleState::Stopped: return "stopped";
+        case StreamLifecycleState::Starting: return "starting";
+        case StreamLifecycleState::Running: return "running";
+        case StreamLifecycleState::Stopping: return "stopping";
+        case StreamLifecycleState::Failed: return "failed";
+    }
+    return "stopped";
+}
+
+bool postScteSidecarJson(const std::string& targetUrl,
+                        const std::string& body,
+                        const std::string& idemKey,
+                        int& statusCode,
+                        std::string& err) {
+    statusCode = 0;
+    err.clear();
+
+    std::string u = trimCopy(targetUrl);
+    std::string proto = "http://";
+    if (u.rfind(proto, 0) != 0) {
+        err = "only http:// URLs supported";
+        return false;
+    }
+    std::string rest = u.substr(proto.size());
+    size_t slash = rest.find('/');
+    std::string hostPort = (slash == std::string::npos) ? rest : rest.substr(0, slash);
+    std::string path = (slash == std::string::npos) ? "/" : rest.substr(slash);
+    std::string host = hostPort;
+    int port = 80;
+    size_t colon = hostPort.rfind(':');
+    if (colon != std::string::npos) {
+        host = hostPort.substr(0, colon);
+        try { port = std::stoi(hostPort.substr(colon + 1)); }
+        catch (...) { err = "invalid sidecar port"; return false; }
+    }
+    if (host.empty()) { err = "sidecar host empty"; return false; }
+
+    std::string req =
+        "POST " + path + " HTTP/1.1\r\n" +
+        "Host: " + host + "\r\n" +
+        "Content-Type: application/json\r\n" +
+        "X-Idempotency-Key: " + idemKey + "\r\n" +
+        "Connection: close\r\n" +
+        "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" +
+        body;
+
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    addrinfo* res = nullptr;
+    std::string portStr = std::to_string(port);
+    if (getaddrinfo(host.c_str(), portStr.c_str(), &hints, &res) != 0 || !res) {
+        err = "sidecar resolve failed";
+        return false;
+    }
+
+    bool ok = false;
+    for (addrinfo* p = res; p; p = p->ai_next) {
+        int sock = static_cast<int>(::socket(p->ai_family, p->ai_socktype, p->ai_protocol));
+        if (sock < 0) continue;
+#ifdef _WIN32
+        DWORD tv = 2500;
+        setsockopt((SOCKET)sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
+        setsockopt((SOCKET)sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+#else
+        struct timeval tv{2, 500000};
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+        if (::connect(sock, p->ai_addr, static_cast<int>(p->ai_addrlen)) != 0) {
+            close_socket(sock);
+            continue;
+        }
+#ifdef _WIN32
+        int sendFlags = 0;
+#else
+        int sendFlags = MSG_NOSIGNAL;
+#endif
+        ssize_t sent = ::send(sock, req.c_str(), static_cast<int>(req.size()), sendFlags);
+        if (sent <= 0) {
+            close_socket(sock);
+            continue;
+        }
+        char resp[512] = {};
+        ssize_t n = ::recv(sock, resp, sizeof(resp) - 1, 0);
+        close_socket(sock);
+        if (n <= 0) continue;
+        std::string line(resp, static_cast<size_t>(n));
+        size_t eol = line.find('\n');
+        if (eol != std::string::npos) line = line.substr(0, eol);
+        auto p1 = line.find(' ');
+        if (p1 != std::string::npos) {
+            auto p2 = line.find(' ', p1 + 1);
+            try {
+                statusCode = std::stoi(line.substr(p1 + 1, p2 == std::string::npos ? std::string::npos : p2 - p1 - 1));
+            } catch (...) {
+                statusCode = 0;
+            }
+        }
+        ok = statusCode >= 200 && statusCode < 300;
+        if (!ok && statusCode > 0) {
+            err = "HTTP " + std::to_string(statusCode);
+        }
+        break;
+    }
+
+    freeaddrinfo(res);
+    if (!ok && err.empty()) err = "connect/send failed";
+    return ok;
+}
 }
 
 #ifdef _WIN32
@@ -371,6 +488,7 @@ static void initSocketsOnce() {}
 
 static std::atomic<bool> g_workerShutdown{false};
 static std::mutex g_runtimeStateFileMutex;
+static std::mutex g_metadataRuntimeFileMutex;
 
 static void sigHandler(int) { g_workerShutdown = true; }
 
@@ -441,6 +559,64 @@ static std::string toWindowsPath(const std::string& p) {
 #else
     return p;
 #endif
+}
+
+static bool atomicWriteTextFile(const std::string& path, const std::string& content) {
+    fs::path dst(path);
+    std::error_code ec;
+    fs::create_directories(dst.parent_path(), ec);
+
+    fs::path tmp = dst;
+    tmp += ".wk.tmp";
+    {
+        std::ofstream f(tmp.string(), std::ios::binary | std::ios::trunc);
+        if (!f.is_open()) return false;
+        f << content;
+        f.close();
+        if (f.fail()) {
+            fs::remove(tmp, ec);
+            return false;
+        }
+    }
+
+#ifdef _WIN32
+    std::string winTmp = toWindowsPath(tmp.string());
+    std::string winDst = toWindowsPath(dst.string());
+    std::wstring wTmp(winTmp.begin(), winTmp.end());
+    std::wstring wDst(winDst.begin(), winDst.end());
+    if (!::MoveFileExW(wTmp.c_str(), wDst.c_str(),
+                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        if (!fs::copy_file(tmp, dst, fs::copy_options::overwrite_existing, ec) || ec) {
+            fs::remove(tmp, ec);
+            return false;
+        }
+        fs::remove(tmp, ec);
+    }
+#else
+    fs::rename(tmp, dst, ec);
+    if (ec) {
+        ec.clear();
+        if (!fs::copy_file(tmp, dst, fs::copy_options::overwrite_existing, ec) || ec) {
+            fs::remove(tmp, ec);
+            return false;
+        }
+        fs::remove(tmp, ec);
+    }
+#endif
+    return true;
+}
+
+static std::string metadataRuntimePath(const std::string& cfgDir) {
+    return cfgDir + "/metadata_runtime.json";
+}
+
+static void mutateMetadataRuntimeState(const std::string& cfgDir,
+                                       const std::function<void(simplejson::Object&)>& mutator) {
+    std::lock_guard<std::mutex> lk(g_metadataRuntimeFileMutex);
+    std::string path = metadataRuntimePath(cfgDir);
+    simplejson::Object metaRt = readJsonFile(path);
+    mutator(metaRt);
+    atomicWriteTextFile(path, metaRt.serialize());
 }
 
 static void writeRuntimeState(const std::string& cfgDir, const simplejson::Object& state) {
@@ -789,7 +965,6 @@ static bool injectHlsMetadataIntoPlaylist(const std::string& cfgDir, const simpl
         err = "hls meta disabled";
         return false;
     }
-
     simplejson::Object parser = hlsCfg.getSubObject("metaParser");
     const std::string scope = parser.getString("scope", "current");
     const bool includeFuture = (scope == "currentFuture");
@@ -2029,6 +2204,11 @@ Worker::Worker(int idx, const std::string& cfgDir)
 
 Worker::~Worker() {
     m_running = false;
+    {
+        std::lock_guard<std::mutex> lk(m_dispatchMutex);
+        m_dispatchStop = true;
+    }
+    m_dispatchCv.notify_all();
     // Kill any running FFmpeg processes before joining threads
     killFfmpegProc(m_aacProc);
     killFfmpegProc(m_mp3Proc);
@@ -2048,6 +2228,7 @@ Worker::~Worker() {
     if (m_cueThread.joinable())     m_cueThread.join();
     if (m_inputLevelThread.joinable()) m_inputLevelThread.join();
     if (m_gainMonitorThread.joinable()) m_gainMonitorThread.join();
+    if (m_dispatchThread.joinable()) m_dispatchThread.join();
 }
 
 void Worker::logSys(const std::string& msg) {
@@ -2072,6 +2253,148 @@ void Worker::log(const std::string& msg) {
     }
 }
 
+void Worker::setStreamState(StreamKind stream, StreamLifecycleState state) {
+    switch (stream) {
+        case StreamKind::Aac: m_aacState = state; break;
+        case StreamKind::Mp3: m_mp3State = state; break;
+        case StreamKind::Hls: m_hlsState = state; break;
+        case StreamKind::Srt: m_srtState = state; break;
+    }
+}
+
+StreamLifecycleState Worker::getStreamState(StreamKind stream) const {
+    switch (stream) {
+        case StreamKind::Aac: return m_aacState.load();
+        case StreamKind::Mp3: return m_mp3State.load();
+        case StreamKind::Hls: return m_hlsState.load();
+        case StreamKind::Srt: return m_srtState.load();
+    }
+    return StreamLifecycleState::Stopped;
+}
+
+void Worker::updateDispatchRuntimeMetrics() {
+    int metadataDepth = 0;
+    int sidecarDepth = 0;
+    int metadataDropped = 0;
+    int sidecarDropped = 0;
+    {
+        std::lock_guard<std::mutex> lk(m_dispatchMutex);
+        metadataDepth = m_metadataQueueDepth;
+        sidecarDepth = m_sidecarQueueDepth;
+        metadataDropped = m_metadataDispatchDropped;
+        sidecarDropped = m_sidecarDispatchDropped;
+    }
+
+    mutateMetadataRuntimeState(m_cfgDir, [&](simplejson::Object& metaRt) {
+        metaRt.setInt("dispatchQueueDepth", metadataDepth + sidecarDepth);
+        metaRt.setInt("metadataDispatchQueueDepth", metadataDepth);
+        metaRt.setInt("sidecarDispatchQueueDepth", sidecarDepth);
+        metaRt.setInt("metadataDispatchDropped", metadataDropped);
+        metaRt.setInt("sidecarDispatchDropped", sidecarDropped);
+    });
+}
+
+void Worker::enqueueAsyncTask(AsyncDispatchTask task, int queueCapacity) {
+    if (queueCapacity < 1) queueCapacity = 1;
+    bool queued = false;
+    bool metadataTask = task.kind == AsyncDispatchKind::IcecastMetadata;
+    int droppedCount = 0;
+
+    {
+        std::lock_guard<std::mutex> lk(m_dispatchMutex);
+        int& queueDepth = metadataTask ? m_metadataQueueDepth : m_sidecarQueueDepth;
+        int& dropped = metadataTask ? m_metadataDispatchDropped : m_sidecarDispatchDropped;
+        if (queueDepth >= queueCapacity) {
+            ++dropped;
+            droppedCount = dropped;
+        } else {
+            m_dispatchQueue.push_back(std::move(task));
+            ++queueDepth;
+            queued = true;
+        }
+    }
+
+    updateDispatchRuntimeMetrics();
+
+    if (queued) {
+        m_dispatchCv.notify_one();
+        return;
+    }
+
+    if (metadataTask) {
+        if (droppedCount == 1 || (droppedCount % 25) == 0) {
+            log("Metadata dispatch queue full; dropping outbound metadata update count=" + std::to_string(droppedCount));
+            logSys("Metadata dispatch queue full; dropping outbound metadata update count=" + std::to_string(droppedCount));
+        }
+    } else {
+        if (droppedCount == 1 || (droppedCount % 25) == 0) {
+            log("SCTE sidecar queue full; dropping outbound sidecar event count=" + std::to_string(droppedCount));
+            logSys("SCTE sidecar queue full; dropping outbound sidecar event count=" + std::to_string(droppedCount));
+        }
+    }
+}
+
+void Worker::enqueueIcecastMetadataUpdate(const std::string& streamTag,
+                                          const std::string& url,
+                                          const std::string& user,
+                                          const std::string& pass,
+                                          const std::string& payload,
+                                          int queueCapacity) {
+    AsyncDispatchTask task;
+    task.kind = AsyncDispatchKind::IcecastMetadata;
+    task.streamTag = streamTag;
+    task.url = url;
+    task.user = user;
+    task.pass = pass;
+    task.payload = payload;
+    enqueueAsyncTask(std::move(task), queueCapacity);
+}
+
+void Worker::dispatchAsyncEvents() {
+    while (true) {
+        AsyncDispatchTask task;
+        {
+            std::unique_lock<std::mutex> lk(m_dispatchMutex);
+            m_dispatchCv.wait(lk, [&]() { return m_dispatchStop || !m_dispatchQueue.empty(); });
+            if (m_dispatchStop && m_dispatchQueue.empty()) break;
+            task = std::move(m_dispatchQueue.front());
+            m_dispatchQueue.pop_front();
+            if (task.kind == AsyncDispatchKind::IcecastMetadata) {
+                if (m_metadataQueueDepth > 0) --m_metadataQueueDepth;
+            } else {
+                if (m_sidecarQueueDepth > 0) --m_sidecarQueueDepth;
+            }
+        }
+
+        updateDispatchRuntimeMetrics();
+
+        if (task.kind == AsyncDispatchKind::IcecastMetadata) {
+            sendIcecastMetaUpdate(task.url, task.user, task.pass, task.payload);
+            continue;
+        }
+
+        bool delivered = false;
+        int status = 0;
+        std::string err;
+        for (int attempt = 0; attempt <= task.retries; ++attempt) {
+            if (postScteSidecarJson(task.url, task.payload, task.idempotencyKey, status, err)) {
+                delivered = true;
+                log("SCTE sidecar POST success action=" + task.action + " status=" + std::to_string(status)
+                    + " attempt=" + std::to_string(attempt + 1));
+                break;
+            }
+            log("SCTE sidecar POST failed action=" + task.action + " attempt=" + std::to_string(attempt + 1)
+                + " err=" + err);
+            if (attempt < task.retries) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(250 * (attempt + 1)));
+            }
+        }
+        if (!delivered) {
+            logSys("SCTE sidecar POST giving up action=" + task.action + " after " + std::to_string(task.retries + 1) + " attempts");
+        }
+    }
+}
+
 void Worker::run() {
     signal(SIGTERM, sigHandler);
     signal(SIGINT,  sigHandler);
@@ -2086,6 +2409,7 @@ void Worker::run() {
     m_cueThread     = std::thread([this]() { listenCueTcpPort();  });
     m_inputLevelThread = std::thread([this]() { monitorInputLevels(); });
     m_gainMonitorThread = std::thread([this]() { monitorGainChanges(); });
+    m_dispatchThread = std::thread([this]() { dispatchAsyncEvents(); });
 
     log("Worker running. Waiting for start commands.");
     publishStreamHealth();
@@ -2207,6 +2531,10 @@ void Worker::publishStreamHealth() {
     rt.setBool("workerMp3Running", mp3Live);
     rt.setBool("workerHlsRunning", hlsLive);
     rt.setBool("workerSrtRunning", srtLive);
+    rt.setString("workerAacState", streamStateToString(m_aacState.load()));
+    rt.setString("workerMp3State", streamStateToString(m_mp3State.load()));
+    rt.setString("workerHlsState", streamStateToString(m_hlsState.load()));
+    rt.setString("workerSrtState", streamStateToString(m_srtState.load()));
     rt.setBool("inputSourceUnavailable", inputSourceUnavailable);
     rt.setBool("inputPacketsMissing", inputPacketsMissing);
     rt.setBool("controlListenerRunning", m_controlListenerRunning.load());
@@ -2220,32 +2548,36 @@ void Worker::pollSinkProcesses() {
     if (m_aacRunning.load() && !ffmpegProcAlive(m_aacProc)) {
         m_aacProc = nullptr;
         m_aacRunning = false;
-        log("AAC Icecast process exited; marking stream stopped");
-        logSys("AAC Icecast process exited; marking stream stopped");
+        setStreamState(StreamKind::Aac, StreamLifecycleState::Failed);
+        log("AAC Icecast process exited unexpectedly; marking stream failed");
+        logSys("AAC Icecast process exited unexpectedly; marking stream failed");
         changed = true;
     }
 
     if (m_mp3Running.load() && !ffmpegProcAlive(m_mp3Proc)) {
         m_mp3Proc = nullptr;
         m_mp3Running = false;
-        log("MP3 Icecast process exited; marking stream stopped");
-        logSys("MP3 Icecast process exited; marking stream stopped");
+        setStreamState(StreamKind::Mp3, StreamLifecycleState::Failed);
+        log("MP3 Icecast process exited unexpectedly; marking stream failed");
+        logSys("MP3 Icecast process exited unexpectedly; marking stream failed");
         changed = true;
     }
 
     if (m_hlsRunning.load() && !ffmpegProcAlive(m_hlsProc)) {
         m_hlsProc = nullptr;
         m_hlsRunning = false;
-        log("HLS process exited; marking stream stopped");
-        logSys("HLS process exited; marking stream stopped");
+        setStreamState(StreamKind::Hls, StreamLifecycleState::Failed);
+        log("HLS process exited unexpectedly; marking stream failed");
+        logSys("HLS process exited unexpectedly; marking stream failed");
         changed = true;
     }
 
     if (m_srtRunning.load() && !ffmpegProcAlive(m_srtProc)) {
         m_srtProc = nullptr;
         m_srtRunning = false;
-        log("SRT process exited; marking stream stopped");
-        logSys("SRT process exited; marking stream stopped");
+        setStreamState(StreamKind::Srt, StreamLifecycleState::Failed);
+        log("SRT process exited unexpectedly; marking stream failed");
+        logSys("SRT process exited unexpectedly; marking stream failed");
         changed = true;
     }
 
@@ -2927,9 +3259,13 @@ static void parseIcecastUrl(const std::string& url,
 void Worker::startAAC() {
     std::lock_guard<std::recursive_mutex> lk(m_streamMutex);
     if (m_aacRunning.load() || m_aacProc != nullptr) {
+        setStreamState(StreamKind::Aac, StreamLifecycleState::Running);
         log("AAC already running; StartAAC ignored");
+        publishStreamHealth();
         return;
     }
+    setStreamState(StreamKind::Aac, StreamLifecycleState::Starting);
+    publishStreamHealth();
     auto cfg = readJsonFile(m_cfgDir + "/aac.json");
     std::string url  = cfg.getString("url",  "");
     std::string user = cfg.getString("user", "source");
@@ -2947,7 +3283,9 @@ void Worker::startAAC() {
     }
 
     if (url.empty()) {
+        setStreamState(StreamKind::Aac, StreamLifecycleState::Failed);
         log("AAC: no URL configured in aac.json â€” cannot start");
+        publishStreamHealth();
         return;
     }
 
@@ -3008,19 +3346,25 @@ void Worker::startAAC() {
     void* h = launchFfmpeg(args, "AAC");
     m_aacProc = h;
     if (!m_aacProc) {
+        setStreamState(StreamKind::Aac, StreamLifecycleState::Failed);
         log("AAC Icecast FAILED â€” could not start FFmpeg for " + url);
+        publishStreamHealth();
         return;
     }
     log("AAC Icecast stream started successfully â€” " + url);
 
     m_aacRunning = true;
+    setStreamState(StreamKind::Aac, StreamLifecycleState::Running);
     publishStreamHealth();
 }
 
 void Worker::stopAAC() {
     std::lock_guard<std::recursive_mutex> lk(m_streamMutex);
+    setStreamState(StreamKind::Aac, StreamLifecycleState::Stopping);
+    publishStreamHealth();
     killFfmpegProc(m_aacProc);
     m_aacRunning = false;
+    setStreamState(StreamKind::Aac, StreamLifecycleState::Stopped);
     log("AAC Icecast stopped");
     publishStreamHealth();
 }
@@ -3028,9 +3372,13 @@ void Worker::stopAAC() {
 void Worker::startMP3() {
     std::lock_guard<std::recursive_mutex> lk(m_streamMutex);
     if (m_mp3Running.load() || m_mp3Proc != nullptr) {
+        setStreamState(StreamKind::Mp3, StreamLifecycleState::Running);
         log("MP3 already running; StartMP3 ignored");
+        publishStreamHealth();
         return;
     }
+    setStreamState(StreamKind::Mp3, StreamLifecycleState::Starting);
+    publishStreamHealth();
     auto cfg = readJsonFile(m_cfgDir + "/mp3.json");
     std::string url  = cfg.getString("url",  "");
     std::string user = cfg.getString("user", "source");
@@ -3044,7 +3392,9 @@ void Worker::startMP3() {
     int vbrQuality = clampInt(cfg.getInt("vbrQuality", 4), 0, 9);
 
     if (url.empty()) {
+        setStreamState(StreamKind::Mp3, StreamLifecycleState::Failed);
         log("MP3: no URL configured in mp3.json â€” cannot start");
+        publishStreamHealth();
         return;
     }
 
@@ -3103,19 +3453,25 @@ void Worker::startMP3() {
     void* h = launchFfmpeg(args, "MP3");
     m_mp3Proc = h;
     if (!m_mp3Proc) {
+        setStreamState(StreamKind::Mp3, StreamLifecycleState::Failed);
         log("MP3 Icecast FAILED â€” could not start FFmpeg for " + url);
+        publishStreamHealth();
         return;
     }
     log("MP3 Icecast stream started successfully â€” " + url);
 
     m_mp3Running = true;
+    setStreamState(StreamKind::Mp3, StreamLifecycleState::Running);
     publishStreamHealth();
 }
 
 void Worker::stopMP3() {
     std::lock_guard<std::recursive_mutex> lk(m_streamMutex);
+    setStreamState(StreamKind::Mp3, StreamLifecycleState::Stopping);
+    publishStreamHealth();
     killFfmpegProc(m_mp3Proc);
     m_mp3Running = false;
+    setStreamState(StreamKind::Mp3, StreamLifecycleState::Stopped);
     log("MP3 Icecast stopped");
     publishStreamHealth();
 }
@@ -3167,9 +3523,13 @@ static int cleanupHlsOutputFiles(const std::string& hlsDir, int& indexRemoved, i
 void Worker::startHLS() {
     std::lock_guard<std::recursive_mutex> lk(m_streamMutex);
     if (m_hlsRunning.load() || m_hlsProc != nullptr) {
+        setStreamState(StreamKind::Hls, StreamLifecycleState::Running);
         log("HLS already running; StartHLS ignored");
+        publishStreamHealth();
         return;
     }
+    setStreamState(StreamKind::Hls, StreamLifecycleState::Starting);
+    publishStreamHealth();
 
     auto cfg = readJsonFile(m_cfgDir + "/hls.json");
     std::string storageBackend = lowerCopy(trimCopy(cfg.getString("storageBackend", "local")));
@@ -3276,7 +3636,9 @@ void Worker::startHLS() {
     void* h = launchFfmpeg(args, "HLS");
     m_hlsProc = h;
     if (!m_hlsProc) {
+        setStreamState(StreamKind::Hls, StreamLifecycleState::Failed);
         log("HLS FAILED â€” could not start FFmpeg");
+        publishStreamHealth();
         return;
     }
     log("HLS FFmpeg encoding started");
@@ -3313,11 +3675,14 @@ void Worker::startHLS() {
     }
 
     m_hlsRunning = true;
+    setStreamState(StreamKind::Hls, StreamLifecycleState::Running);
     publishStreamHealth();
 }
 
 void Worker::stopHLS() {
     std::lock_guard<std::recursive_mutex> lk(m_streamMutex);
+    setStreamState(StreamKind::Hls, StreamLifecycleState::Stopping);
+    publishStreamHealth();
     auto cfg = readJsonFile(m_cfgDir + "/hls.json");
     std::string storageBackend = lowerCopy(trimCopy(cfg.getString("storageBackend", "local")));
     if (storageBackend != "local" && storageBackend != "nfs" && storageBackend != "efs" && storageBackend != "s3") {
@@ -3356,6 +3721,7 @@ void Worker::stopHLS() {
     }
 
     m_hlsRunning = false;
+    setStreamState(StreamKind::Hls, StreamLifecycleState::Stopped);
     log("HLS stopped");
     publishStreamHealth();
 }
@@ -3363,9 +3729,13 @@ void Worker::stopHLS() {
 void Worker::startSRT() {
     std::lock_guard<std::recursive_mutex> lk(m_streamMutex);
     if (m_srtRunning.load() || m_srtProc != nullptr) {
+        setStreamState(StreamKind::Srt, StreamLifecycleState::Running);
         log("SRT already running; StartSRT ignored");
+        publishStreamHealth();
         return;
     }
+    setStreamState(StreamKind::Srt, StreamLifecycleState::Starting);
+    publishStreamHealth();
 
     auto cfg = readJsonFile(m_cfgDir + "/srt.json");
     std::string transport = lowerCopy(trimCopy(cfg.getString("transport", "mpeg-ts")));
@@ -3380,18 +3750,24 @@ void Worker::startSRT() {
     int pbkeylen = cfg.getInt("pbkeylen", 16);
 
     if (host.empty()) {
+        setStreamState(StreamKind::Srt, StreamLifecycleState::Failed);
         log("SRT FAILED â€” host is empty in srt.json");
+        publishStreamHealth();
         return;
     }
     if (port <= 0 || port > 65535) {
+        setStreamState(StreamKind::Srt, StreamLifecycleState::Failed);
         log("SRT FAILED â€” invalid port in srt.json: " + std::to_string(port));
+        publishStreamHealth();
         return;
     }
     if (mode.empty()) mode = "caller";
     if (transport.empty()) transport = "mpeg-ts";
 
     if (transport != "mpeg-ts" && transport != "mpegts") {
+        setStreamState(StreamKind::Srt, StreamLifecycleState::Failed);
         log("SRT FAILED â€” unsupported transport '" + transport + "'. Only MPEG-TS is currently implemented.");
+        publishStreamHealth();
         return;
     }
 
@@ -3439,19 +3815,25 @@ void Worker::startSRT() {
     void* h = launchFfmpeg(args, "SRT");
     m_srtProc = h;
     if (!m_srtProc) {
+        setStreamState(StreamKind::Srt, StreamLifecycleState::Failed);
         log("SRT FAILED â€” could not start FFmpeg for " + host + ":" + std::to_string(port));
+        publishStreamHealth();
         return;
     }
 
     log("SRT FFmpeg stream started â€” waiting for connection/handshake details in encoder log");
     m_srtRunning = true;
+    setStreamState(StreamKind::Srt, StreamLifecycleState::Running);
     publishStreamHealth();
 }
 
 void Worker::stopSRT() {
     std::lock_guard<std::recursive_mutex> lk(m_streamMutex);
+    setStreamState(StreamKind::Srt, StreamLifecycleState::Stopping);
+    publishStreamHealth();
     killFfmpegProc(m_srtProc);
     m_srtRunning = false;
+    setStreamState(StreamKind::Srt, StreamLifecycleState::Stopped);
     log("SRT stopped");
     publishStreamHealth();
 }
@@ -3775,74 +4157,62 @@ static void persistHlsScteRangeState(const std::string& cfgDir,
                                      std::mutex* inMemoryMutex) {
     const int64_t nowMs = nowMsEpoch();
     const std::string nowIso = formatUtcIso8601(std::chrono::system_clock::now());
+    HlsScteRangeState nextState;
+    mutateMetadataRuntimeState(cfgDir, [&](simplejson::Object& metaRt) {
+        HlsScteRangeState state = readHlsScteRangeState(metaRt);
 
-    std::string runtimePath = cfgDir + "/metadata_runtime.json";
-#ifdef _WIN32
-    char resolvedBuf[MAX_PATH] = {};
-    if (_fullpath(resolvedBuf, runtimePath.c_str(), MAX_PATH)) {
-        runtimePath = resolvedBuf;
-    }
-#endif
-
-    simplejson::Object metaRt = readJsonFile(runtimePath);
-    HlsScteRangeState state = readHlsScteRangeState(metaRt);
-
-    if (inMemoryState != nullptr && inMemoryMutex != nullptr) {
-        std::lock_guard<std::mutex> lk(*inMemoryMutex);
-        if (!inMemoryState->id.empty()) state = *inMemoryState;
-    }
-
-    if (action == "START_BREAK") {
-        state.active = true;
-        state.id = "scte-enc" + std::to_string(encoderIdx) + "-" + eventId;
-        state.eventId = eventId;
-        state.actionOut = action;
-        state.actionIn.clear();
-        state.cueOut = cueValue;
-        state.cueIn.clear();
-        state.startDateUtc = nowIso;
-        state.endDateUtc.clear();
-        state.startEpochMs = nowMs;
-        state.endEpochMs = 0;
-    } else if (action == "END_BREAK" || action == "END_BREAK_NOW") {
-        if (state.id.empty()) state.id = "scte-enc" + std::to_string(encoderIdx) + "-" + eventId;
-        if (state.startDateUtc.empty()) {
-            state.startDateUtc = nowIso;
-            state.startEpochMs = nowMs;
+        if (inMemoryState != nullptr && inMemoryMutex != nullptr) {
+            std::lock_guard<std::mutex> lk(*inMemoryMutex);
+            if (!inMemoryState->id.empty()) state = *inMemoryState;
         }
-        if (state.eventId.empty()) state.eventId = eventId;
-        if (state.actionOut.empty()) state.actionOut = "START_BREAK";
-        state.active = false;
-        state.actionIn = action;
-        if (!cueValue.empty()) state.cueIn = cueValue;
-        state.endDateUtc = nowIso;
-        state.endEpochMs = nowMs;
-    } else {
-        return;
-    }
 
-    metaRt.setBool("hlsScteActive", state.active);
-    metaRt.setString("hlsScteId", state.id);
-    metaRt.setString("hlsScteEventId", state.eventId);
-    metaRt.setString("hlsScteActionOut", state.actionOut);
-    metaRt.setString("hlsScteActionIn", state.actionIn);
-    metaRt.setString("hlsScteCueOut", state.cueOut);
-    metaRt.setString("hlsScteCueIn", state.cueIn);
-    metaRt.setString("hlsScteStartDate", state.startDateUtc);
-    metaRt.setString("hlsScteEndDate", state.endDateUtc);
-    metaRt.setString("hlsScteStartEpochMs", std::to_string(state.startEpochMs));
-    metaRt.setString("hlsScteEndEpochMs", std::to_string(state.endEpochMs));
-    metaRt.setString("hlsScteUpdatedUtc", nowIso);
+        if (action == "START_BREAK") {
+            state.active = true;
+            state.id = "scte-enc" + std::to_string(encoderIdx) + "-" + eventId;
+            state.eventId = eventId;
+            state.actionOut = action;
+            state.actionIn.clear();
+            state.cueOut = cueValue;
+            state.cueIn.clear();
+            state.startDateUtc = nowIso;
+            state.endDateUtc.clear();
+            state.startEpochMs = nowMs;
+            state.endEpochMs = 0;
+        } else if (action == "END_BREAK" || action == "END_BREAK_NOW") {
+            if (state.id.empty()) state.id = "scte-enc" + std::to_string(encoderIdx) + "-" + eventId;
+            if (state.startDateUtc.empty()) {
+                state.startDateUtc = nowIso;
+                state.startEpochMs = nowMs;
+            }
+            if (state.eventId.empty()) state.eventId = eventId;
+            if (state.actionOut.empty()) state.actionOut = "START_BREAK";
+            state.active = false;
+            state.actionIn = action;
+            if (!cueValue.empty()) state.cueIn = cueValue;
+            state.endDateUtc = nowIso;
+            state.endEpochMs = nowMs;
+        } else {
+            return;
+        }
 
-    std::string serialized = metaRt.serialize();
-    std::ofstream metaRtFile(runtimePath, std::ios::trunc);
-    metaRtFile << serialized;
-    metaRtFile.flush();
-    metaRtFile.close();
+        metaRt.setBool("hlsScteActive", state.active);
+        metaRt.setString("hlsScteId", state.id);
+        metaRt.setString("hlsScteEventId", state.eventId);
+        metaRt.setString("hlsScteActionOut", state.actionOut);
+        metaRt.setString("hlsScteActionIn", state.actionIn);
+        metaRt.setString("hlsScteCueOut", state.cueOut);
+        metaRt.setString("hlsScteCueIn", state.cueIn);
+        metaRt.setString("hlsScteStartDate", state.startDateUtc);
+        metaRt.setString("hlsScteEndDate", state.endDateUtc);
+        metaRt.setString("hlsScteStartEpochMs", std::to_string(state.startEpochMs));
+        metaRt.setString("hlsScteEndEpochMs", std::to_string(state.endEpochMs));
+        metaRt.setString("hlsScteUpdatedUtc", nowIso);
+        nextState = state;
+    });
 
     if (inMemoryState != nullptr && inMemoryMutex != nullptr) {
         std::lock_guard<std::mutex> lk(*inMemoryMutex);
-        *inMemoryState = state;
+        *inMemoryState = nextState;
     }
 }
 
@@ -4320,130 +4690,15 @@ void Worker::emitScteSidecarEvent(const std::string& action,
         "\"encoderId\":" + std::to_string(m_idx) +
         "}";
 
-    std::thread([this, url, payload, idempotencyKey, retries, action]() {
-        auto sendOne = [this](const std::string& targetUrl,
-                              const std::string& body,
-                              const std::string& idemKey,
-                              int& statusCode,
-                              std::string& err) -> bool {
-            statusCode = 0;
-            err.clear();
-
-            std::string u = trimCopy(targetUrl);
-            std::string proto = "http://";
-            if (u.rfind(proto, 0) != 0) {
-                err = "only http:// URLs supported";
-                return false;
-            }
-            std::string rest = u.substr(proto.size());
-            size_t slash = rest.find('/');
-            std::string hostPort = (slash == std::string::npos) ? rest : rest.substr(0, slash);
-            std::string path = (slash == std::string::npos) ? "/" : rest.substr(slash);
-            std::string host = hostPort;
-            int port = 80;
-            size_t colon = hostPort.rfind(':');
-            if (colon != std::string::npos) {
-                host = hostPort.substr(0, colon);
-                try { port = std::stoi(hostPort.substr(colon + 1)); }
-                catch (...) { err = "invalid sidecar port"; return false; }
-            }
-            if (host.empty()) { err = "sidecar host empty"; return false; }
-
-            std::string req =
-                "POST " + path + " HTTP/1.1\r\n" +
-                "Host: " + host + "\r\n" +
-                "Content-Type: application/json\r\n" +
-                "X-Idempotency-Key: " + idemKey + "\r\n" +
-                "Connection: close\r\n" +
-                "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" +
-                body;
-
-            addrinfo hints{};
-            hints.ai_family = AF_UNSPEC;
-            hints.ai_socktype = SOCK_STREAM;
-            hints.ai_protocol = IPPROTO_TCP;
-            addrinfo* res = nullptr;
-            std::string portStr = std::to_string(port);
-            if (getaddrinfo(host.c_str(), portStr.c_str(), &hints, &res) != 0 || !res) {
-                err = "sidecar resolve failed";
-                return false;
-            }
-
-            bool ok = false;
-            for (addrinfo* p = res; p; p = p->ai_next) {
-                int sock = static_cast<int>(::socket(p->ai_family, p->ai_socktype, p->ai_protocol));
-                if (sock < 0) continue;
-#ifdef _WIN32
-                DWORD tv = 2500;
-                setsockopt((SOCKET)sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
-                setsockopt((SOCKET)sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
-#else
-                struct timeval tv{2, 500000};
-                setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-                setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-#endif
-                if (::connect(sock, p->ai_addr, static_cast<int>(p->ai_addrlen)) != 0) {
-                    close_socket(sock);
-                    continue;
-                }
-#ifdef _WIN32
-                int sendFlags = 0;
-#else
-                int sendFlags = MSG_NOSIGNAL;
-#endif
-                ssize_t sent = ::send(sock, req.c_str(), static_cast<int>(req.size()), sendFlags);
-                if (sent <= 0) {
-                    close_socket(sock);
-                    continue;
-                }
-                char resp[512] = {};
-                ssize_t n = ::recv(sock, resp, sizeof(resp) - 1, 0);
-                close_socket(sock);
-                if (n <= 0) continue;
-                std::string line(resp, static_cast<size_t>(n));
-                size_t eol = line.find('\n');
-                if (eol != std::string::npos) line = line.substr(0, eol);
-                auto p1 = line.find(' ');
-                if (p1 != std::string::npos) {
-                    auto p2 = line.find(' ', p1 + 1);
-                    try {
-                        statusCode = std::stoi(line.substr(p1 + 1, p2 == std::string::npos ? std::string::npos : p2 - p1 - 1));
-                    } catch (...) {
-                        statusCode = 0;
-                    }
-                }
-                ok = statusCode >= 200 && statusCode < 300;
-                if (!ok && statusCode > 0) {
-                    err = "HTTP " + std::to_string(statusCode);
-                }
-                break;
-            }
-
-            freeaddrinfo(res);
-            if (!ok && err.empty()) err = "connect/send failed";
-            return ok;
-        };
-
-        bool delivered = false;
-        int status = 0;
-        std::string err;
-        for (int attempt = 0; attempt <= retries; ++attempt) {
-            if (sendOne(url, payload, idempotencyKey, status, err)) {
-                delivered = true;
-                log("SCTE sidecar POST success action=" + action + " status=" + std::to_string(status)
-                    + " attempt=" + std::to_string(attempt + 1));
-                break;
-            }
-            log("SCTE sidecar POST failed action=" + action + " attempt=" + std::to_string(attempt + 1)
-                + " err=" + err);
-            if (attempt < retries) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(250 * (attempt + 1)));
-            }
-        }
-        if (!delivered) {
-            logSys("SCTE sidecar POST giving up action=" + action + " after " + std::to_string(retries + 1) + " attempts");
-        }
-    }).detach();
+    int queueCapacity = clampInt(sidecar.getInt("queueCapacity", 16), 1, 1024);
+    AsyncDispatchTask task;
+    task.kind = AsyncDispatchKind::ScteSidecar;
+    task.url = url;
+    task.payload = payload;
+    task.idempotencyKey = idempotencyKey;
+    task.action = action;
+    task.retries = retries;
+    enqueueAsyncTask(std::move(task), queueCapacity);
 }
 
 void Worker::listenControlPort() {
@@ -5323,19 +5578,11 @@ void Worker::listenMetaPort() {
         log("META_RAW: " + singleLine(xmlData));
         logSys("META_RAW: " + singleLine(xmlData));
 
-        std::string metaRtPath = m_cfgDir + "/metadata_runtime.json";
-        simplejson::Object metaRt = readJsonFile(metaRtPath);
-        int count = metaRt.getInt("eventCount", 0);
-        metaRt.setInt("eventCount", count + 1);
-        metaRt.setString("lastPayloadUtc", timestamp());
-
         std::string xmlSnippet = singleLine(xmlData);
         if (xmlSnippet.size() > 500) xmlSnippet = xmlSnippet.substr(0, 500) + "...";
-        metaRt.setString("lastRawXml", xmlSnippet);
 
         std::string cachePath = m_cfgDir + "/meta_current.xml";
-        std::ofstream mf(cachePath);
-        mf << xmlData;
+        atomicWriteTextFile(cachePath, xmlData);
 
         simplejson::Object aacCfg = readJsonFile(m_cfgDir + "/aac.json");
         simplejson::Object mp3Cfg = readJsonFile(m_cfgDir + "/mp3.json");
@@ -5364,20 +5611,25 @@ void Worker::listenMetaPort() {
             }
         }
 
-        metaRt.setString("lastFormattedAAC", aacFormatted);
-        metaRt.setString("lastFormattedMP3", mp3Formatted);
-        metaRt.setString("lastFormattedHLS", hlsFormatted);
-        metaRt.setString("lastFormattedSRT", srtFormatted);
-        std::ofstream metaRtFile(metaRtPath);
-        metaRtFile << metaRt.serialize();
+        mutateMetadataRuntimeState(m_cfgDir, [&](simplejson::Object& metaRt) {
+            int count = metaRt.getInt("eventCount", 0);
+            metaRt.setInt("eventCount", count + 1);
+            metaRt.setString("lastPayloadUtc", timestamp());
+            metaRt.setString("lastRawXml", xmlSnippet);
+            metaRt.setString("lastFormattedAAC", aacFormatted);
+            metaRt.setString("lastFormattedMP3", mp3Formatted);
+            metaRt.setString("lastFormattedHLS", hlsFormatted);
+            metaRt.setString("lastFormattedSRT", srtFormatted);
+        });
+
+        int metadataQueueCapacity = clampInt(readJsonFile(m_cfgDir + "/metadata.json").getInt("dispatchQueueCapacity", 64), 1, 1024);
 
         if (m_aacRunning && aacCfg.getBool("metaEnabled", true)) {
             std::string u = aacCfg.getString("url", "");
             std::string user = aacCfg.getString("user", "source");
             std::string pw = aacCfg.getString("pass", "");
             if (!u.empty()) {
-                std::string af = aacFormatted;
-                std::thread([u, user, pw, af]() { sendIcecastMetaUpdate(u, user, pw, af); }).detach();
+                enqueueIcecastMetadataUpdate("AAC", u, user, pw, aacFormatted, metadataQueueCapacity);
             }
         }
         if (m_mp3Running && mp3Cfg.getBool("metaEnabled", true)) {
@@ -5385,8 +5637,7 @@ void Worker::listenMetaPort() {
             std::string user = mp3Cfg.getString("user", "source");
             std::string pw = mp3Cfg.getString("pass", "");
             if (!u.empty()) {
-                std::string mf2 = mp3Formatted;
-                std::thread([u, user, pw, mf2]() { sendIcecastMetaUpdate(u, user, pw, mf2); }).detach();
+                enqueueIcecastMetadataUpdate("MP3", u, user, pw, mp3Formatted, metadataQueueCapacity);
             }
         }
 

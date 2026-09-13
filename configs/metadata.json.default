@@ -3,6 +3,7 @@
     "listenPort": 9000,
     "dataConnectHost": "",
     "dataConnectPort": null,
+    "dispatchQueueCapacity": 64,
     "scte": {
         "enabled": false,
         "listenEnabled": false,

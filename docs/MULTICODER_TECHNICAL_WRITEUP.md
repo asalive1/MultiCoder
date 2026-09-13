@@ -468,6 +468,7 @@ Supervisor currently maps stream actions to these canonical command strings.
 Typical keys used by supervisor/worker:
 - `workerHeartbeatEpoch`
 - `workerAacRunning`, `workerMp3Running`, `workerHlsRunning`, `workerSrtRunning`
+- `workerAacState`, `workerMp3State`, `workerHlsState`, `workerSrtState`
 - `controlListenerRunning`, `metadataListenerRunning`
 - `inputConnected`
 - Session overrides:
@@ -482,6 +483,9 @@ Typical keys used by supervisor/worker:
 
 Typical keys:
 - `eventCount`
+- `dispatchQueueDepth`
+- `metadataDispatchQueueDepth`, `sidecarDispatchQueueDepth`
+- `metadataDispatchDropped`, `sidecarDispatchDropped`
 - `lastPayloadUtc`
 - `lastRawXml`
 - `lastFormattedAAC`
@@ -503,6 +507,7 @@ Observed log categories:
 - FFmpeg command lines and start failures.
 - Input attach/no-data conditions.
 - Metadata raw and formatted payload events.
+- Async dispatch queue saturation and sidecar retry/failure events.
 - Supervisor command requests and ACK/failure traces.
 
 ## 10. Input Gain and SRT Input Improvements (2026-05-15 Update)

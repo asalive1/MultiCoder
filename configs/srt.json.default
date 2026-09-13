@@ -20,7 +20,8 @@
         "transport": "http-json",
         "mode": "mirror",
         "url": "",
-        "retries": 3
+        "retries": 3,
+        "queueCapacity": 16
     },
     "_note": "metadata: Now Playing embedded in MPEG-TS KLV/ID3 block (PID 0x0011). For RTP mode, best-effort RTCP APP packet. Receiving end must support the same convention."
 }

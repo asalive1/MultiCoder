@@ -1,6 +1,10 @@
 #include <catch2/catch_test_macros.hpp>
 #include <string>
 
+static bool hasKey(const std::string& j, const std::string& key) {
+    return j.find("\"" + key + "\"") != std::string::npos;
+}
+
 // Mirror of the production decodeXmlEntities in worker.cpp — kept in sync manually.
 static std::string decodeXmlEntities(const std::string& s) {
     std::string out;
@@ -119,4 +123,20 @@ TEST_CASE("entity decode unknown entities passed through unchanged", "[metadata]
     // &nbsp; is not a standard XML entity — must not be silently dropped
     const std::string xml = "<title>Hello&nbsp;World</title>";
     CHECK(extractTag(xml, "title") == "Hello&nbsp;World");
+}
+
+TEST_CASE("metadata runtime payload can expose dispatch metrics", "[metadata]") {
+    const std::string runtimeJson = R"({
+        "dispatchQueueDepth": 3,
+        "metadataDispatchQueueDepth": 2,
+        "sidecarDispatchQueueDepth": 1,
+        "metadataDispatchDropped": 0,
+        "sidecarDispatchDropped": 4
+    })";
+
+    CHECK(hasKey(runtimeJson, "dispatchQueueDepth"));
+    CHECK(hasKey(runtimeJson, "metadataDispatchQueueDepth"));
+    CHECK(hasKey(runtimeJson, "sidecarDispatchQueueDepth"));
+    CHECK(hasKey(runtimeJson, "metadataDispatchDropped"));
+    CHECK(hasKey(runtimeJson, "sidecarDispatchDropped"));
 }

@@ -389,6 +389,8 @@ ctest --test-dir build --output-on-failure
 Unit tests cover:
 - `LivewireMapping` — 13 test cases (formula, reverse, roundtrip, error cases)
 - `HLS` — playlist generation, segment purge policy, media sequence
+- `ConfigValidation` — config key stability for queue/state hardening fields
+- `MetadataParsing` — metadata formatting plus runtime dispatch metric contract keys
 
 ### Reliability Hardening Build Modes
 

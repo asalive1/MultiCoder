@@ -3,6 +3,8 @@
 #include <atomic>
 #include <cstdint>
 #include <thread>
+#include <condition_variable>
+#include <deque>
 #include <mutex>
 #include <fstream>
 #include <vector>
@@ -25,6 +27,38 @@ struct HlsScteRangeState {
     std::string endDateUtc;
     int64_t startEpochMs{0};
     int64_t endEpochMs{0};
+};
+
+enum class StreamKind {
+    Aac,
+    Mp3,
+    Hls,
+    Srt,
+};
+
+enum class StreamLifecycleState {
+    Stopped,
+    Starting,
+    Running,
+    Stopping,
+    Failed,
+};
+
+enum class AsyncDispatchKind {
+    IcecastMetadata,
+    ScteSidecar,
+};
+
+struct AsyncDispatchTask {
+    AsyncDispatchKind kind{AsyncDispatchKind::IcecastMetadata};
+    std::string streamTag;
+    std::string url;
+    std::string user;
+    std::string pass;
+    std::string payload;
+    std::string idempotencyKey;
+    std::string action;
+    int retries{0};
 };
 
 /// Worker manages one encoder instance.
@@ -66,6 +100,17 @@ private:
                               const std::string& cueValue,
                               const std::string& source,
                               bool primaryPathLikelyAvailable);
+    void dispatchAsyncEvents();
+    void enqueueIcecastMetadataUpdate(const std::string& streamTag,
+                                      const std::string& url,
+                                      const std::string& user,
+                                      const std::string& pass,
+                                      const std::string& payload,
+                                      int queueCapacity);
+    void enqueueAsyncTask(AsyncDispatchTask task, int queueCapacity);
+    void updateDispatchRuntimeMetrics();
+    void setStreamState(StreamKind stream, StreamLifecycleState state);
+    StreamLifecycleState getStreamState(StreamKind stream) const;
 
     // Helper: retrieve input gain in dB (combines input.json rtpGain + session override)
     double getInputGainDb();
@@ -105,6 +150,21 @@ private:
     std::thread m_metaThread;
     std::thread m_cueThread;
     std::thread m_inputLevelThread;
+    std::thread m_dispatchThread;
+
+    std::mutex m_dispatchMutex;
+    std::condition_variable m_dispatchCv;
+    std::deque<AsyncDispatchTask> m_dispatchQueue;
+    bool m_dispatchStop{false};
+    int m_metadataQueueDepth{0};
+    int m_sidecarQueueDepth{0};
+    int m_metadataDispatchDropped{0};
+    int m_sidecarDispatchDropped{0};
+
+    std::atomic<StreamLifecycleState> m_aacState{StreamLifecycleState::Stopped};
+    std::atomic<StreamLifecycleState> m_mp3State{StreamLifecycleState::Stopped};
+    std::atomic<StreamLifecycleState> m_hlsState{StreamLifecycleState::Stopped};
+    std::atomic<StreamLifecycleState> m_srtState{StreamLifecycleState::Stopped};
 
     // Dedicated HLS HTTP playback server (serves /hls/* from the encoder's hls dir)
     std::atomic<bool>  m_hlsHttpRunning{false};

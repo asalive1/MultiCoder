@@ -8,14 +8,16 @@
 - Worker/supervisor lifecycle hardening merged (idempotent starts/stops, cleanup protections).
 - HLS failover-safe cleanup bypass groundwork merged (`failoverConfigured`, `storageBackend`).
 - Supervisor SCTE metadata runtime persistence hardened to atomic writes.
+- Bounded worker dispatch queue added for metadata and SCTE sidecar fan-out.
+- Deterministic per-stream lifecycle states exposed through runtime state and supervisor status.
+- Linux CI expanded with sanitizer and clang-tidy enforcement builds.
 
 ### In Progress
-- P1 reliability hardening slices focused on metadata integrity, bounded concurrency, and deterministic runtime state.
+- P1 reliability hardening is implemented; remaining follow-up is operational tuning based on test/field feedback.
 
 ### Not Started
-- Full bounded metadata and sidecar queue implementation.
-- Deterministic per-stream state machine persisted to runtime state.
-- Sanitizer/static-analysis CI enforcement gates.
+- Failover activation beyond current groundwork.
+- Stress-harness and soak-test automation.
 
 ## Next 3 Implementation Slices
 
@@ -41,9 +43,9 @@ Validation:
 Rollback:
 - Revert `CMakeLists.txt` and `README.md` changes from this slice.
 
-## Slice 2: Bounded Metadata + Sidecar Event Queue
+## Slice 2: Bounded Metadata + Sidecar Event Queue (Executed)
 
-Status: Next
+Status: Executed in this update.
 
 Primary files likely to change:
 - `src/worker/worker.cpp`
@@ -52,11 +54,11 @@ Primary files likely to change:
 - `configs/srt.json.default`
 - `tests/unit/test_metadata.cpp`
 
-Planned modifications:
+Implemented modifications:
 - Introduce bounded in-memory queue for accepted metadata/SCTE sidecar events.
 - Explicit backpressure policy:
-	- Metadata path: preserve ordering for accepted events.
-	- Sidecar path: bounded retry and deterministic drop accounting when queue full.
+  - Metadata path: preserve ordering for queued events.
+  - Sidecar path: bounded retry and deterministic drop accounting when queue full.
 - Add queue depth and dropped-event counters to runtime metadata status.
 
 Risk of regression:
@@ -70,9 +72,9 @@ Tests to add:
 Rollback:
 - Compile-time or config kill-switch to bypass queue layer and use prior direct dispatch path.
 
-## Slice 3: Deterministic Stream Lifecycle State Machine
+## Slice 3: Deterministic Stream Lifecycle State Machine (Executed)
 
-Status: Next
+Status: Executed in this update.
 
 Primary files likely to change:
 - `src/worker/worker.cpp`
@@ -80,7 +82,7 @@ Primary files likely to change:
 - `docs/MULTICODER_TECHNICAL_WRITEUP.md`
 - `tests/unit/test_config.cpp`
 
-Planned modifications:
+Implemented modifications:
 - Add explicit per-stream states: `stopped`, `starting`, `running`, `stopping`, `failed`.
 - Persist state transitions in runtime state and expose through status endpoints.
 - Tie state transitions to process checks and command ACK paths for consistency.
@@ -104,4 +106,5 @@ Rollback:
 
 ## Immediate Outcome Of This Update
 - Slice 1 has been executed immediately.
-- Slices 2 and 3 are queued for implementation pending your go-ahead.
+- Slices 2 and 3 are now implemented.
+- Remaining work is refinement, stress coverage, and eventual failover activation.

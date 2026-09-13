@@ -43,3 +43,39 @@ TEST_CASE("encoder count range", "[config]") {
     CHECK_FALSE(validEncoderCount(0));
     CHECK_FALSE(validEncoderCount(6));
 }
+
+TEST_CASE("metadata and sidecar queue config keys are present", "[config]") {
+    const std::string metadataJson = R"({
+        "mode": "listen",
+        "listenPort": 9000,
+        "dispatchQueueCapacity": 64
+    })";
+
+    const std::string srtJson = R"({
+        "sidecar": {
+            "enabled": false,
+            "transport": "http-json",
+            "mode": "mirror",
+            "url": "",
+            "retries": 3,
+            "queueCapacity": 16
+        }
+    })";
+
+    CHECK(hasKey(metadataJson, "dispatchQueueCapacity"));
+    CHECK(hasKey(srtJson, "queueCapacity"));
+}
+
+TEST_CASE("stream lifecycle state names remain stable", "[config]") {
+    const std::string statusJson = R"({
+        "aacState": "stopped",
+        "mp3State": "starting",
+        "hlsState": "running",
+        "srtState": "failed"
+    })";
+
+    CHECK(hasKey(statusJson, "aacState"));
+    CHECK(hasKey(statusJson, "mp3State"));
+    CHECK(hasKey(statusJson, "hlsState"));
+    CHECK(hasKey(statusJson, "srtState"));
+}

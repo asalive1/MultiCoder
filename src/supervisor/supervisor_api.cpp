@@ -1482,6 +1482,10 @@ static std::string encoderJsonNoLock(int i) {
     bool mp3 = workerFresh ? runtime.getBool("workerMp3Running", false) : false;
     bool hls = workerFresh ? runtime.getBool("workerHlsRunning", false) : false;
     bool srt = workerFresh ? runtime.getBool("workerSrtRunning", false) : false;
+    std::string aacState = workerFresh ? runtime.getString("workerAacState", aac ? "running" : "stopped") : "stopped";
+    std::string mp3State = workerFresh ? runtime.getString("workerMp3State", mp3 ? "running" : "stopped") : "stopped";
+    std::string hlsState = workerFresh ? runtime.getString("workerHlsState", hls ? "running" : "stopped") : "stopped";
+    std::string srtState = workerFresh ? runtime.getString("workerSrtState", srt ? "running" : "stopped") : "stopped";
 
     // Keep in-memory cache aligned with worker health so subsequent logic uses consistent state.
     e.aac_running = aac;
@@ -1489,14 +1493,18 @@ static std::string encoderJsonNoLock(int i) {
     e.hls_running = hls;
     e.srt_running = srt;
 
-    char buf[512];
+    char buf[768];
     snprintf(buf, sizeof(buf),
-             "{\"id\":%d,\"name\":\"Encoder-%d\",\"aac\":%s,\"mp3\":%s,\"hls\":%s,\"srt\":%s,\"controlListenerRunning\":%s,\"metadataListenerRunning\":%s}",
+             "{\"id\":%d,\"name\":\"Encoder-%d\",\"aac\":%s,\"mp3\":%s,\"hls\":%s,\"srt\":%s,\"aacState\":\"%s\",\"mp3State\":\"%s\",\"hlsState\":\"%s\",\"srtState\":\"%s\",\"controlListenerRunning\":%s,\"metadataListenerRunning\":%s}",
              i + 1, i + 1,
              aac ? "true" : "false",
              mp3 ? "true" : "false",
              hls ? "true" : "false",
              srt ? "true" : "false",
+             aacState.c_str(),
+             mp3State.c_str(),
+             hlsState.c_str(),
+             srtState.c_str(),
              ctl ? "true" : "false",
              meta ? "true" : "false");
     return buf;
@@ -3261,6 +3269,11 @@ static std::string handleReq(const std::string& raw, const std::string& clientIp
             std::string pullHost = metaCfg.getString("dataConnectHost", "");
             int pullPort = metaCfg.getInt("dataConnectPort", 0);
             int eventCount = metaRt.getInt("eventCount", 0);
+            int dispatchQueueDepth = metaRt.getInt("dispatchQueueDepth", 0);
+            int metadataDispatchQueueDepth = metaRt.getInt("metadataDispatchQueueDepth", 0);
+            int sidecarDispatchQueueDepth = metaRt.getInt("sidecarDispatchQueueDepth", 0);
+            int metadataDispatchDropped = metaRt.getInt("metadataDispatchDropped", 0);
+            int sidecarDispatchDropped = metaRt.getInt("sidecarDispatchDropped", 0);
             std::string lastPayloadUtc = metaRt.getString("lastPayloadUtc", "");
             std::string lastRawXml       = metaRt.getString("lastRawXml", "");
             std::string lastFmtAAC       = metaRt.getString("lastFormattedAAC", "");
@@ -3276,6 +3289,11 @@ static std::string handleReq(const std::string& raw, const std::string& clientIp
                                    ",\"dataConnectHost\":\"" + jsonEscape(pullHost) + "\"" +
                                    ",\"dataConnectPort\":" + std::to_string(pullPort) +
                                    ",\"eventCount\":" + std::to_string(eventCount) +
+                                   ",\"dispatchQueueDepth\":" + std::to_string(dispatchQueueDepth) +
+                                   ",\"metadataDispatchQueueDepth\":" + std::to_string(metadataDispatchQueueDepth) +
+                                   ",\"sidecarDispatchQueueDepth\":" + std::to_string(sidecarDispatchQueueDepth) +
+                                   ",\"metadataDispatchDropped\":" + std::to_string(metadataDispatchDropped) +
+                                   ",\"sidecarDispatchDropped\":" + std::to_string(sidecarDispatchDropped) +
                                    ",\"lastPayloadUtc\":\"" + jsonEscape(lastPayloadUtc) + "\"" +
                                    ",\"lastRawXml\":\"" + jsonEscape(lastRawXml) + "\"" +
                                    ",\"lastFormattedAAC\":\"" + jsonEscape(lastFmtAAC) + "\"" +
