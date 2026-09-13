@@ -23,6 +23,7 @@ target_include_directories(multicoder-supervisor PRIVATE
 )
 target_compile_definitions(multicoder-supervisor PRIVATE
     MULTICODER_SOURCE_ROOT="${CMAKE_SOURCE_DIR}"
+    MULTICODER_APP_VERSION="${PROJECT_VERSION}"
 )
 target_link_libraries(multicoder-supervisor PRIVATE multicoder_threads)
 if (WIN32)

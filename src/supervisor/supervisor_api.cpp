@@ -2217,6 +2217,13 @@ static std::string handleReq(const std::string& raw, const std::string& clientIp
         return ico.empty() ? httpResp(404, "text/plain", "favicon not found") : httpResp(200, "image/x-icon", ico);
     }
     if (method == "GET" && path == "/health") return httpResp(200, "application/json", "{\"status\":\"ok\",\"service\":\"multicoder-supervisor\"}");
+        if (method == "GET" && path == "/api/version") {
+    #ifdef MULTICODER_APP_VERSION
+        return httpResp(200, "application/json", "{\"version\":\"" MULTICODER_APP_VERSION "\"}");
+    #else
+        return httpResp(200, "application/json", "{\"version\":\"unknown\"}");
+    #endif
+        }
 
     if (method == "GET" && path == "/api/encoders") return httpResp(200, "application/json", allEncodersJson());
     if (method == "GET" && path == "/api/syslog") return httpResp(200, "text/plain", tailSysLog());

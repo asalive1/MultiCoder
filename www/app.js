@@ -454,6 +454,20 @@ async function apiText(path) {
     return r.text();
 }
 
+async function refreshAppVersion() {
+  try {
+    const data = await apiGet('/api/version');
+    const rawVersion = data && typeof data.version === 'string' ? data.version.trim() : '';
+    if (!rawVersion) return;
+    const displayVersion = rawVersion.startsWith('v') ? rawVersion : `v${rawVersion}`;
+    const badge = document.getElementById('versionBadge');
+    if (badge) badge.textContent = displayVersion;
+    document.title = `MultiCoder ${displayVersion}`;
+  } catch {
+    // Leave the static fallback in place if the version endpoint is unavailable.
+  }
+}
+
 // ---- Banner message ----
 function showBanner(msg, type) {
     const el = document.getElementById('bannerMsg');
@@ -2888,6 +2902,7 @@ window.selectEncoder = function(id) {
 // BOOT
 // ===========================================================
 async function init() {
+  await refreshAppVersion();
   await renderCommandGeneratorPanel();
     await refreshStatus();
     // Periodic status refresh every 3 seconds
