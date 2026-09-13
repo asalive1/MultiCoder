@@ -116,6 +116,7 @@ static void reapTrackedWorkerUnlocked(int encoderOneBased) {
 
 static std::string readFile(const std::string& path);
 static bool atomicWriteTextFile(const std::string& path, const std::string& content, std::string* errOut);
+static simplejson::Object readJsonFile(const std::string& path);
 static std::string trimCopy(const std::string& s);
 static std::string lowerCopy(const std::string& s);
 static std::string jsonEscape(const std::string& in);
@@ -940,6 +941,23 @@ static void setRuntimeInputConnected(int encoderOneBased, bool connected) {
 static void atomicWriteInputSessionState(int encoderOneBased, const simplejson::Object& o) {
     std::string err;
     atomicWriteTextFile(inputSessionPath(encoderOneBased), o.serialize(), &err);
+}
+
+static std::string metadataRuntimePath(int encoderOneBased) {
+    return "/etc/encoder" + std::to_string(encoderOneBased) + "/metadata_runtime.json";
+}
+
+static void atomicWriteMetadataRuntimeState(int encoderOneBased, const simplejson::Object& o) {
+    std::string err;
+    atomicWriteTextFile(metadataRuntimePath(encoderOneBased), o.serialize(), &err);
+}
+
+static void atomicWriteMetadataRuntimeField(int encoderOneBased,
+                                            const std::string& key,
+                                            const std::string& value) {
+    simplejson::Object metaRt = readJsonFile(metadataRuntimePath(encoderOneBased));
+    metaRt.setString(key, value);
+    atomicWriteMetadataRuntimeState(encoderOneBased, metaRt);
 }
 
 static bool atomicWriteTextFile(const std::string& path, const std::string& content, std::string* errOut = nullptr) {
@@ -3299,10 +3317,9 @@ static std::string handleReq(const std::string& raw, const std::string& clientIp
             std::vector<std::string> whitelistEntries = parseJsonStringArray(scte.getRawValue("whitelistEntries", "[]"));
             if (!isAllowedByWhitelist(clientIp, whitelistEnabled, whitelistEntries)) {
                 appendEncoderLog(enc, "SCTE cue rejected: source not allowlisted: " + (clientIp.empty() ? std::string("(unknown)") : clientIp));
-                simplejson::Object metaRt = readJsonFile("/etc/encoder" + std::to_string(enc) + "/metadata_runtime.json");
-                metaRt.setString("lastScteRejected", "allowlist:" + (clientIp.empty() ? std::string("unknown") : clientIp));
-                std::ofstream mf("/etc/encoder" + std::to_string(enc) + "/metadata_runtime.json", std::ios::trunc);
-                mf << metaRt.serialize();
+                atomicWriteMetadataRuntimeField(enc,
+                                                "lastScteRejected",
+                                                "allowlist:" + (clientIp.empty() ? std::string("unknown") : clientIp));
                 return httpResp(403, "application/json", "{\"ok\":false,\"error\":\"Source not allowlisted\"}");
             }
 
@@ -3370,10 +3387,9 @@ static std::string handleReq(const std::string& raw, const std::string& clientIp
             if (!rejectReason.empty()) {
                 appendEncoderLog(enc, "SCTE cue rejected: " + rejectReason);
                 appendSysLog(enc, "SCTE cue rejected: " + rejectReason);
-                simplejson::Object metaRt = readJsonFile("/etc/encoder" + std::to_string(enc) + "/metadata_runtime.json");
-                metaRt.setString("lastScteRejected", rejectReason + " | payload=" + cueValue);
-                std::ofstream mf("/etc/encoder" + std::to_string(enc) + "/metadata_runtime.json", std::ios::trunc);
-                mf << metaRt.serialize();
+                atomicWriteMetadataRuntimeField(enc,
+                                                "lastScteRejected",
+                                                rejectReason + " | payload=" + cueValue);
                 return httpResp(400, "application/json", "{\"ok\":false,\"error\":\"" + jsonEscape(rejectReason) + "\"}");
             }
 
@@ -3388,10 +3404,9 @@ static std::string handleReq(const std::string& raw, const std::string& clientIp
                 if (static_cast<int>(cs.recentCueTimesMs.size()) >= rateCount) {
                     appendEncoderLog(enc, "SCTE cue rejected: rate limit exceeded");
                     appendSysLog(enc, "SCTE cue rejected: rate limit exceeded");
-                    simplejson::Object metaRt = readJsonFile("/etc/encoder" + std::to_string(enc) + "/metadata_runtime.json");
-                    metaRt.setString("lastScteRejected", "rate-limit | payload=" + cueValue);
-                    std::ofstream mf("/etc/encoder" + std::to_string(enc) + "/metadata_runtime.json", std::ios::trunc);
-                    mf << metaRt.serialize();
+                    atomicWriteMetadataRuntimeField(enc,
+                                                    "lastScteRejected",
+                                                    "rate-limit | payload=" + cueValue);
                     return httpResp(429, "application/json", "{\"ok\":false,\"error\":\"Rate limit exceeded\"}");
                 }
 
@@ -3401,10 +3416,9 @@ static std::string handleReq(const std::string& raw, const std::string& clientIp
                     if (ageMs < static_cast<int64_t>(dedupeSec) * 1000) {
                         appendEncoderLog(enc, "SCTE cue deduped/replay-rejected: " + cueValue);
                         appendSysLog(enc, "SCTE cue deduped/replay-rejected: " + cueValue);
-                        simplejson::Object metaRt = readJsonFile("/etc/encoder" + std::to_string(enc) + "/metadata_runtime.json");
-                        metaRt.setString("lastScteRejected", "dedupe | payload=" + cueValue);
-                        std::ofstream mf("/etc/encoder" + std::to_string(enc) + "/metadata_runtime.json", std::ios::trunc);
-                        mf << metaRt.serialize();
+                        atomicWriteMetadataRuntimeField(enc,
+                                                        "lastScteRejected",
+                                                        "dedupe | payload=" + cueValue);
                         return httpResp(200, "application/json", "{\"ok\":true,\"deduped\":true}");
                     }
                 }
@@ -3434,15 +3448,14 @@ static std::string handleReq(const std::string& raw, const std::string& clientIp
             appendEncoderLog(enc, "SCTE cue received: " + cueValue + " source=" + (clientIp.empty() ? std::string("unknown") : clientIp));
             appendSysLog(enc, "SCTE cue received: " + cueValue + " source=" + (clientIp.empty() ? std::string("unknown") : clientIp));
 
-            simplejson::Object metaRt = readJsonFile("/etc/encoder" + std::to_string(enc) + "/metadata_runtime.json");
+            simplejson::Object metaRt = readJsonFile(metadataRuntimePath(enc));
             metaRt.setString("lastScteReceived", cueValue);
 
             if (matchedAction.empty()) {
                 appendEncoderLog(enc, "SCTE cue rejected: No Matching Command for '" + cueValue + "'");
                 appendSysLog(enc, "SCTE cue rejected: No Matching Command for '" + cueValue + "'");
                 metaRt.setString("lastScteRejected", "no-match | payload=" + cueValue);
-                std::ofstream mf("/etc/encoder" + std::to_string(enc) + "/metadata_runtime.json", std::ios::trunc);
-                mf << metaRt.serialize();
+                atomicWriteMetadataRuntimeState(enc, metaRt);
                 return httpResp(200, "application/json", "{\"ok\":true,\"matched\":false,\"message\":\"No Matching Command\"}");
             }
 
@@ -3457,7 +3470,7 @@ static std::string handleReq(const std::string& raw, const std::string& clientIp
             // Re-read metadata_runtime.json to pick up any changes the worker made (e.g., hlsSct* fields)
             if (sent) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));  // Give worker time to write
-                metaRt = readJsonFile("/etc/encoder" + std::to_string(enc) + "/metadata_runtime.json");
+                metaRt = readJsonFile(metadataRuntimePath(enc));
             }
 
             if (sent) {
@@ -3483,10 +3496,7 @@ static std::string handleReq(const std::string& raw, const std::string& clientIp
                 cs.lastByMatch[cueValue] = nowMs;
             }
 
-            {
-                std::ofstream mf("/etc/encoder" + std::to_string(enc) + "/metadata_runtime.json", std::ios::trunc);
-                mf << metaRt.serialize();
-            }
+            atomicWriteMetadataRuntimeState(enc, metaRt);
 
             std::ostringstream resp;
             resp << "{\"ok\":true,\"matched\":true,\"command\":\"" << jsonEscape(matchedAction)
