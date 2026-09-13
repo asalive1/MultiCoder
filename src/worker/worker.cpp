@@ -2519,6 +2519,12 @@ std::vector<std::string> Worker::buildFfmpegInputArgs() {
                 << "a=rtpmap:96 L" << bitDepth << "/" << sampleRate << "/" << channels << "\r\n";
         }
         std::vector<std::string> a;
+        // Improve tolerance to packet burst/jitter when multiple encoder instances
+        // subscribe to the same multicast input on one host.
+        a.push_back("-thread_queue_size"); a.push_back("8192");
+        a.push_back("-buffer_size");       a.push_back("4194304");
+        a.push_back("-reorder_queue_size");a.push_back("1024");
+        a.push_back("-max_delay");         a.push_back("1000000");
         a.push_back("-protocol_whitelist"); a.push_back("file,rtp,udp");
         std::string localIp = resolveLocalIp(iface);
         if (!iface.empty() && localIp.empty()) {
@@ -2873,14 +2879,19 @@ void Worker::killFfmpegProc(void*& h) {
     intptr_t pid = reinterpret_cast<intptr_t>(h);
     if (pid > 0) {
         ::kill(static_cast<pid_t>(pid), SIGTERM);
-        // Poll for up to 2 s, then SIGKILL
+        // Poll for up to 2 s, then SIGKILL if the process is still alive.
         for (int i = 0; i < 20; ++i) {
             int status = 0;
             if (waitpid(static_cast<pid_t>(pid), &status, WNOHANG) != 0) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
-        // Reap child (non-blocking â€” may already be reaped above)
-        waitpid(static_cast<pid_t>(pid), nullptr, WNOHANG);
+        int status = 0;
+        pid_t done = waitpid(static_cast<pid_t>(pid), &status, WNOHANG);
+        if (done == 0) {
+            ::kill(static_cast<pid_t>(pid), SIGKILL);
+            // Blocking wait is safe after SIGKILL and guarantees child reaping.
+            waitpid(static_cast<pid_t>(pid), &status, 0);
+        }
     }
     h = nullptr;
 #endif
@@ -2915,6 +2926,10 @@ static void parseIcecastUrl(const std::string& url,
 
 void Worker::startAAC() {
     std::lock_guard<std::recursive_mutex> lk(m_streamMutex);
+    if (m_aacRunning.load() || m_aacProc != nullptr) {
+        log("AAC already running; StartAAC ignored");
+        return;
+    }
     auto cfg = readJsonFile(m_cfgDir + "/aac.json");
     std::string url  = cfg.getString("url",  "");
     std::string user = cfg.getString("user", "source");
@@ -3012,6 +3027,10 @@ void Worker::stopAAC() {
 
 void Worker::startMP3() {
     std::lock_guard<std::recursive_mutex> lk(m_streamMutex);
+    if (m_mp3Running.load() || m_mp3Proc != nullptr) {
+        log("MP3 already running; StartMP3 ignored");
+        return;
+    }
     auto cfg = readJsonFile(m_cfgDir + "/mp3.json");
     std::string url  = cfg.getString("url",  "");
     std::string user = cfg.getString("user", "source");
@@ -3152,6 +3171,13 @@ void Worker::startHLS() {
         return;
     }
 
+    auto cfg = readJsonFile(m_cfgDir + "/hls.json");
+    std::string storageBackend = lowerCopy(trimCopy(cfg.getString("storageBackend", "local")));
+    if (storageBackend != "local" && storageBackend != "nfs" && storageBackend != "efs" && storageBackend != "s3") {
+        storageBackend = "local";
+    }
+    bool failoverConfigured = cfg.getBool("failoverConfigured", false);
+
     // Determine HLS output directory and resolve to absolute Windows path
     std::string hlsDir = resolveWinPath(m_cfgDir + "/hls");
     // Normalise separators: replace any forward slashes with backslashes on Win32
@@ -3167,8 +3193,10 @@ void Worker::startHLS() {
 #endif
     fs::create_directories(segDir);
 
-    // Remove stale indexes and segments before start to recover from prior crashes.
-    {
+    if (failoverConfigured) {
+        log("HLS failover mode enabled (backend=" + storageBackend + "); destructive startup cleanup bypassed");
+    } else {
+        // Remove stale indexes and segments before start to recover from prior crashes.
         int removedIndex = 0;
         int removedSegments = 0;
         int failed = cleanupHlsOutputFiles(hlsDir, removedIndex, removedSegments);
@@ -3201,7 +3229,6 @@ void Worker::startHLS() {
     log("HLS output directory: " + hlsDir);
     log("HLS stream URL:       " + hlsUrl);
 
-    auto cfg = readJsonFile(m_cfgDir + "/hls.json");
     int segSecs  = cfg.getInt("segmentSeconds", 5);
     int window   = cfg.getInt("window", 5);
     if (segSecs <= 0) segSecs = 5;
@@ -3291,6 +3318,13 @@ void Worker::startHLS() {
 
 void Worker::stopHLS() {
     std::lock_guard<std::recursive_mutex> lk(m_streamMutex);
+    auto cfg = readJsonFile(m_cfgDir + "/hls.json");
+    std::string storageBackend = lowerCopy(trimCopy(cfg.getString("storageBackend", "local")));
+    if (storageBackend != "local" && storageBackend != "nfs" && storageBackend != "efs" && storageBackend != "s3") {
+        storageBackend = "local";
+    }
+    bool failoverConfigured = cfg.getBool("failoverConfigured", false);
+
     // Stop segment monitor
     if (m_hlsSegMonRunning.load()) {
         m_hlsSegMonRunning = false;
@@ -3305,8 +3339,10 @@ void Worker::stopHLS() {
     }
     killFfmpegProc(m_hlsProc);
 
+    if (failoverConfigured) {
+        log("HLS failover mode enabled (backend=" + storageBackend + "); destructive stop cleanup bypassed");
+    } else {
         // On stop, clear all HLS indexes and segment files per retention requirement.
-        {
         std::string hlsDir = resolveWinPath(m_cfgDir + "/hls");
     #ifdef _WIN32
         for (char& c : hlsDir) if (c == '/') c = '\\';
@@ -3317,7 +3353,7 @@ void Worker::stopHLS() {
         log("HLS stop cleanup: removed " + std::to_string(removedIndex)
             + " index file(s), " + std::to_string(removedSegments)
             + " segment file(s), failures=" + std::to_string(failed));
-        }
+    }
 
     m_hlsRunning = false;
     log("HLS stopped");
@@ -3385,7 +3421,7 @@ void Worker::startSRT() {
     log("SRT passphrase configured: " + std::string(passphrase.empty() ? "no" : "yes"));
     log("SRT output URI: " + maskSrtUriPassphrase(uri));
 
-    std::vector<std::string> args = {"ffmpeg", "-y", "-loglevel", "debug"};
+    std::vector<std::string> args = {"ffmpeg", "-y", "-loglevel", "warning"};
     args.insert(args.end(), inputArgs.begin(), inputArgs.end());
     
     // Apply audio filter (gain/volume) if needed

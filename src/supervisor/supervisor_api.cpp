@@ -92,6 +92,25 @@ static HANDLE getOrCreateJobObject() {
     }
     return hJob;
 }
+#else
+static std::mutex g_workerPidsMutex;
+static std::map<int, pid_t> g_workerPids;  // keyed by 1-based encoder index
+
+static bool processAlive(pid_t pid) {
+    if (pid <= 0) return false;
+    if (::kill(pid, 0) == 0) return true;
+    return errno == EPERM;
+}
+
+static void reapTrackedWorkerUnlocked(int encoderOneBased) {
+    auto it = g_workerPids.find(encoderOneBased);
+    if (it == g_workerPids.end()) return;
+    int status = 0;
+    pid_t rc = waitpid(it->second, &status, WNOHANG);
+    if (rc == it->second || (rc < 0 && errno == ECHILD)) {
+        g_workerPids.erase(it);
+    }
+}
 #endif
 // ---------------------------------------------------------
 
@@ -1301,6 +1320,17 @@ static bool launchWorkerProcess(int encoderOneBased, std::string& err) {
         err = "worker binary not found: " + workerExe;
         return false;
     }
+
+    {
+        std::lock_guard<std::mutex> lk(g_workerPidsMutex);
+        reapTrackedWorkerUnlocked(encoderOneBased);
+        auto it = g_workerPids.find(encoderOneBased);
+        if (it != g_workerPids.end() && processAlive(it->second)) {
+            err = "worker process already running for encoder " + std::to_string(encoderOneBased);
+            return true;
+        }
+    }
+
     pid_t pid = fork();
     if (pid < 0) {
         err = "fork() failed";
@@ -1312,6 +1342,12 @@ static bool launchWorkerProcess(int encoderOneBased, std::string& err) {
         execl(workerExe.c_str(), workerExe.c_str(), idxStr.c_str(), nullptr);
         _exit(127);  // execl only returns on error
     }
+
+    {
+        std::lock_guard<std::mutex> lk(g_workerPidsMutex);
+        g_workerPids[encoderOneBased] = pid;
+    }
+
     // Parent: worker runs in background; do not wait.
     return true;
 #endif
@@ -3641,5 +3677,32 @@ void stop_supervisor_api() {
         CloseHandle(h);
     }
     g_workerHandles.clear();
+#else
+    std::lock_guard<std::mutex> lk(g_workerPidsMutex);
+    for (auto& [idx, pid] : g_workerPids) {
+        if (pid <= 0) continue;
+        if (!processAlive(pid)) {
+            waitpid(pid, nullptr, WNOHANG);
+            continue;
+        }
+
+        ::kill(pid, SIGTERM);
+        bool exited = false;
+        for (int i = 0; i < 30; ++i) {
+            int status = 0;
+            pid_t rc = waitpid(pid, &status, WNOHANG);
+            if (rc == pid || (rc < 0 && errno == ECHILD)) {
+                exited = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+
+        if (!exited && processAlive(pid)) {
+            ::kill(pid, SIGKILL);
+            waitpid(pid, nullptr, 0);
+        }
+    }
+    g_workerPids.clear();
 #endif
 }
