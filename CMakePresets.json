@@ -1,0 +1,75 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 20,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "linux-debug",
+      "displayName": "Linux Debug",
+      "description": "Workspace-local Debug configure preset for VS Code CMake Tools",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build-vscode",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "linux-asan",
+      "displayName": "Linux Debug ASan/UBSan",
+      "description": "Workspace-local sanitizer configure preset for VS Code CMake Tools",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build-vscode-asan",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "MULTICODER_ENABLE_SANITIZERS": "ON"
+      }
+    },
+    {
+      "name": "linux-tidy",
+      "displayName": "Linux Debug clang-tidy",
+      "description": "Workspace-local clang-tidy configure preset for VS Code CMake Tools",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build-vscode-tidy",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "MULTICODER_ENABLE_CLANG_TIDY": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "linux-debug",
+      "configurePreset": "linux-debug"
+    },
+    {
+      "name": "linux-asan",
+      "configurePreset": "linux-asan"
+    },
+    {
+      "name": "linux-tidy",
+      "configurePreset": "linux-tidy"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "linux-debug",
+      "configurePreset": "linux-debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "linux-asan",
+      "configurePreset": "linux-asan",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

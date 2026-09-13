@@ -3,6 +3,9 @@ build/
 build-debug/
 build-linux-debug/
 build-linux-asan/
+build-vscode/
+build-vscode-asan/
+build-vscode-tidy/
 dist/
 cmake-build-*/
 
