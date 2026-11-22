@@ -1,6 +1,6 @@
 # MultiCoder
 
-**v2.5.1 — Multi-channel audio encoder with Icecast AAC/MP3, HLS, SRT, and configurable SCTE cue ingest.**
+**v2.5.2 — Multi-channel audio encoder with Icecast AAC/MP3, HLS, SRT, and configurable SCTE cue ingest.**
 
 MultiCoder manages 1–5 independent encoding instances from a single web UI.
 Each encoder runs as its own worker process; restarting one encoder never disturbs the others.
@@ -224,7 +224,9 @@ Access via top-right "Admin Settings" link. Requires credentials.
 
 - Change admin password
 - Set log level / rotation / retention
-- Assign friendly names to network interfaces
+- Assign friendly names to network interfaces and select which appear in encoder
+  dropdowns. Newly detected interfaces are unselected; saved choices are retained
+  when an interface temporarily disappears.
 - Set default Icecast destination
 - Set number of active encoders (1–5)
 

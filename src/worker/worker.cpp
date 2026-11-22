@@ -2209,25 +2209,25 @@ Worker::~Worker() {
         m_dispatchStop = true;
     }
     m_dispatchCv.notify_all();
+    // Let command and gain handlers finish before releasing their processes.
+    if (m_controlThread.joinable()) m_controlThread.join();
+    if (m_gainMonitorThread.joinable()) m_gainMonitorThread.join();
     // Kill any running FFmpeg processes before joining threads
     killFfmpegProc(m_aacProc);
     killFfmpegProc(m_mp3Proc);
     killFfmpegProc(m_hlsProc);
+    killFfmpegProc(m_srtProc);
     killFfmpegProc(m_srtInputRelayProc);
     // Stop HLS HTTP server before joining threads
     if (m_hlsHttpRunning.load()) {
         m_hlsHttpRunning = false;
-        int s = m_hlsHttpSocket.load();
-        if (s != -1) close_socket(s);
     }
     if (m_hlsSegMonRunning.load()) m_hlsSegMonRunning = false;
     if (m_hlsHttpThread.joinable())   m_hlsHttpThread.join();
     if (m_hlsSegMonThread.joinable()) m_hlsSegMonThread.join();
-    if (m_controlThread.joinable()) m_controlThread.join();
     if (m_metaThread.joinable())    m_metaThread.join();
     if (m_cueThread.joinable())     m_cueThread.join();
     if (m_inputLevelThread.joinable()) m_inputLevelThread.join();
-    if (m_gainMonitorThread.joinable()) m_gainMonitorThread.join();
     if (m_dispatchThread.joinable()) m_dispatchThread.join();
 }
 
@@ -2543,6 +2543,7 @@ void Worker::publishStreamHealth() {
 }
 
 void Worker::pollSinkProcesses() {
+    std::lock_guard<std::recursive_mutex> lk(m_streamMutex);
     bool changed = false;
 
     if (m_aacRunning.load() && !ffmpegProcAlive(m_aacProc)) {
@@ -3660,8 +3661,6 @@ void Worker::startHLS() {
         if (m_hlsHttpThread.joinable()) {
             // A previous server thread is still alive â€” stop it first
             m_hlsHttpRunning = false;
-            int old = m_hlsHttpSocket.load();
-            if (old != -1) close_socket(old);
             m_hlsHttpThread.join();
         }
         m_hlsHttpRunning = true;
@@ -3691,17 +3690,11 @@ void Worker::stopHLS() {
     bool failoverConfigured = cfg.getBool("failoverConfigured", false);
 
     // Stop segment monitor
-    if (m_hlsSegMonRunning.load()) {
-        m_hlsSegMonRunning = false;
-        if (m_hlsSegMonThread.joinable()) m_hlsSegMonThread.join();
-    }
+    m_hlsSegMonRunning = false;
+    if (m_hlsSegMonThread.joinable()) m_hlsSegMonThread.join();
     // Stop HLS HTTP server
-    if (m_hlsHttpRunning.load()) {
-        m_hlsHttpRunning = false;
-        int s = m_hlsHttpSocket.load();
-        if (s != -1) close_socket(s);
-        if (m_hlsHttpThread.joinable()) m_hlsHttpThread.join();
-    }
+    m_hlsHttpRunning = false;
+    if (m_hlsHttpThread.joinable()) m_hlsHttpThread.join();
     killFfmpegProc(m_hlsProc);
 
     if (failoverConfigured) {
@@ -4261,6 +4254,15 @@ void Worker::serveHlsHttp(int port, const std::string& hlsDir) {
         int cfd = accept(sfd, (sockaddr*)&clientAddr, &clientLen);
         if (cfd < 0) continue;
 
+#ifdef _WIN32
+        DWORD timeoutMs = 1000;
+        setsockopt((SOCKET)cfd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeoutMs, sizeof(timeoutMs));
+        setsockopt((SOCKET)cfd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeoutMs, sizeof(timeoutMs));
+#else
+        timeval timeout{1, 0};
+        setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+#endif
         // Read the request line (we need only the path)
         char buf[2048] = {};
         recv(cfd, buf, sizeof(buf) - 1, 0);
@@ -4746,6 +4748,13 @@ void Worker::listenControlPort() {
         sockaddr_in cli{}; socklen_t len = sizeof(cli);
         int cfd = accept(sfd, (sockaddr*)&cli, &len);
         if (cfd < 0) continue;
+#ifdef _WIN32
+        DWORD timeoutMs = 1000;
+        setsockopt((SOCKET)cfd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeoutMs, sizeof(timeoutMs));
+#else
+        timeval timeout{1, 0};
+        setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+#endif
         char buf[256] = {};
         ssize_t n = recv(cfd, buf, sizeof(buf)-1, 0);
         if (n > 0) {

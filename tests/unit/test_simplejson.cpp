@@ -24,3 +24,17 @@ TEST_CASE("SimpleJson setters and serialize", "[simplejson]") {
     CHECK(re.getBool("firstLoginRequired", false));
     CHECK(re.getInt("uiPort", 0) == 8050);
 }
+
+TEST_CASE("Object arrays preserve escaped interface preferences", "[simplejson]") {
+    simplejson::Object root;
+    REQUIRE(root.parse(R"({"interfaces":[{"name":"eth0","friendlyName":"Studio \\","enabled":true},{"enabled":false,"friendlyName":"Aux \"B\"","name":"eth1"}]})"));
+    std::vector<simplejson::Object> entries;
+    REQUIRE(simplejson::parseObjectArray(root.getRawValue("interfaces"), entries));
+    REQUIRE(entries.size() == 2);
+    CHECK(entries[0].getString("friendlyName") == "Studio \\");
+    CHECK(entries[0].getBool("enabled"));
+    CHECK(entries[1].getString("friendlyName") == "Aux \"B\"");
+    CHECK_FALSE(entries[1].getBool("enabled", true));
+    CHECK_FALSE(simplejson::parseObjectArray(R"([{"name":"eth0"},])", entries));
+    CHECK(entries.empty());
+}

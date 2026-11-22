@@ -1979,76 +1979,38 @@ static std::string wideToUtf8(const wchar_t* w) {
     if (!w) return "";
     int len = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
     if (len <= 0) return "";
-    std::string out(static_cast<size_t>(len - 1), '\0');
+    std::string out(static_cast<size_t>(len), '\0');
     WideCharToMultiByte(CP_UTF8, 0, w, -1, out.data(), len, nullptr, nullptr);
+    out.pop_back();
     return out;
 }
 #endif
 
-// Read stored interface preferences: { "interfaces": [ {"name","friendlyName","enabled"} ] }
-static simplejson::Object readInterfacePrefs() {
-    std::string raw = readFile("/etc/MC/interfaces.json");
-    simplejson::Object o;
-    if (!raw.empty()) o.parse(raw);
-    return o;
+struct IfacePref { std::string friendlyName; bool enabled; };
+static std::mutex g_interfacePrefsMutex;
+
+static bool parseInterfacePrefs(const std::string& raw, std::map<std::string, IfacePref>& prefs) {
+    simplejson::Object root;
+    std::vector<simplejson::Object> entries;
+    if (!root.parse(raw) || !root.has("interfaces") ||
+        !simplejson::parseObjectArray(root.getRawValue("interfaces"), entries)) return false;
+    std::map<std::string, IfacePref> parsed;
+    for (const auto& entry : entries) {
+        std::string name = entry.getString("name");
+        std::string enabled = entry.getRawValue("enabled");
+        if (name.empty() || (enabled != "true" && enabled != "false")) return false;
+        parsed[name] = {entry.getString("friendlyName", name), enabled == "true"};
+    }
+    prefs = std::move(parsed);
+    return true;
 }
 
 static std::string interfacesJson() {
-    simplejson::Object prefs = readInterfacePrefs();
-    // Build a lookup map: adapterName -> {friendlyName, enabled}
-    struct IfacePref { std::string friendlyName; bool enabled; };
+    std::lock_guard<std::mutex> lock(g_interfacePrefsMutex);
     std::map<std::string, IfacePref> prefMap;
-    // The prefs object stores the array as a serialised string — iterate manually.
-    // We stored it as { "interfaces": [ ... ] }; SimpleJson stores arrays as children.
-    // Walk prefs by serialising and re-parsing into a flat list.
-    {
-        std::string raw = readFile("/etc/MC/interfaces.json");
-        // Simple line scan for stored prefs (avoid dependency on array parsing)
-        // Format: [{"name":"X","friendlyName":"Y","enabled":true/false}, ...]
-        // We look for "name":"...", "friendlyName":"...", "enabled":... triples.
-        std::string pName, pFriendly;
-        bool pEnabled = true;
-        size_t pos = 0;
-        auto skipWs = [&]() { while (pos < raw.size() && std::isspace((unsigned char)raw[pos])) ++pos; };
-        auto readStr = [&]() -> std::string {
-            if (pos >= raw.size() || raw[pos] != '"') return "";
-            ++pos;
-            std::string out;
-            while (pos < raw.size() && raw[pos] != '"') {
-                if (raw[pos] == '\\' && pos+1 < raw.size()) { ++pos; out += raw[pos++]; }
-                else out += raw[pos++];
-            }
-            if (pos < raw.size()) ++pos;
-            return out;
-        };
-        while (pos < raw.size()) {
-            skipWs();
-            if (pos >= raw.size()) break;
-            if (raw[pos] == '{') { ++pos; pName.clear(); pFriendly.clear(); pEnabled = true; continue; }
-            if (raw[pos] == '}') {
-                ++pos;
-                if (!pName.empty()) prefMap[pName] = { pFriendly.empty() ? pName : pFriendly, pEnabled };
-                continue;
-            }
-            if (raw[pos] == '"') {
-                std::string key = readStr();
-                skipWs();
-                if (pos < raw.size() && raw[pos] == ':') ++pos;
-                skipWs();
-                if (raw[pos] == '"') {
-                    std::string val = readStr();
-                    if (key == "name") pName = val;
-                    else if (key == "friendlyName") pFriendly = val;
-                } else {
-                    // boolean/number
-                    std::string tok;
-                    while (pos < raw.size() && raw[pos] != ',' && raw[pos] != '}') tok += raw[pos++];
-                    if (key == "enabled") pEnabled = (tok.find("true") != std::string::npos);
-                }
-            } else {
-                ++pos;
-            }
-        }
+    std::string raw = readFile("/etc/MC/interfaces.json");
+    if (!raw.empty() && !parseInterfacePrefs(raw, prefMap)) {
+        std::cerr << "Invalid network interface preferences\n";
     }
 
     std::ostringstream ss;
@@ -2075,7 +2037,7 @@ static std::string interfacesJson() {
             auto it = prefMap.find(name);
             std::string friendly = (it != prefMap.end() && !it->second.friendlyName.empty())
                                    ? it->second.friendlyName : (osFriendly.empty() ? name : osFriendly);
-            bool enabled = (it != prefMap.end()) ? it->second.enabled : true;
+            bool enabled = (it != prefMap.end()) ? it->second.enabled : false;
             if (!first) ss << ",";
             first = false;
             ss << "{\"name\":\"" << jsonEscape(name)
@@ -2089,7 +2051,7 @@ static std::string interfacesJson() {
             std::string n = e.path().filename().string();
             auto it = prefMap.find(n);
             std::string friendly = (it != prefMap.end() && !it->second.friendlyName.empty()) ? it->second.friendlyName : n;
-            bool enabled = (it != prefMap.end()) ? it->second.enabled : true;
+            bool enabled = (it != prefMap.end()) ? it->second.enabled : false;
             if (!first) ss << ",";
             first = false;
             ss << "{\"name\":\"" << jsonEscape(n)
@@ -2249,9 +2211,29 @@ static std::string handleReq(const std::string& raw, const std::string& clientIp
 
     if (method == "GET" && path == "/api/admin/interfaces") return httpResp(200, "application/json", interfacesJson());
     if (method == "POST" && path == "/api/admin/interfaces") {
-        fs::create_directories("/etc/MC");
-        std::ofstream f("/etc/MC/interfaces.json");
-        f << body;
+        std::lock_guard<std::mutex> lock(g_interfacePrefsMutex);
+        std::map<std::string, IfacePref> updates, prefs;
+        if (!parseInterfacePrefs(body, updates))
+            return httpResp(400, "application/json", "{\"error\":\"invalid interface preferences\"}");
+        std::string previous = readFile("/etc/MC/interfaces.json");
+        if (!previous.empty() && !parseInterfacePrefs(previous, prefs))
+            return httpResp(500, "application/json", "{\"error\":\"invalid saved interface preferences\"}");
+        for (const auto& entry : updates) prefs[entry.first] = entry.second;
+        std::string array = "[";
+        for (const auto& entry : prefs) {
+            if (array.size() > 1) array += ",";
+            simplejson::Object item;
+            item.setString("name", entry.first);
+            item.setString("friendlyName", entry.second.friendlyName);
+            item.setBool("enabled", entry.second.enabled);
+            array += item.serialize();
+        }
+        array += "]";
+        simplejson::Object saved;
+        saved.setRaw("interfaces", array);
+        std::string err;
+        if (!atomicWriteTextFile("/etc/MC/interfaces.json", saved.serialize(), &err))
+            return httpResp(500, "application/json", "{\"error\":\"" + jsonEscape(err) + "\"}");
         return httpResp(200, "application/json", "{\"saved\":true}");
     }
     if (method == "GET" && path == "/api/admin/audio-inputs") return httpResp(200, "application/json", audioInputsJson());

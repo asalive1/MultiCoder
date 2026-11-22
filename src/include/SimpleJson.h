@@ -2,6 +2,7 @@
 
 #include <map>
 #include <string>
+#include <vector>
 
 namespace simplejson {
 
@@ -35,5 +36,8 @@ private:
     };
     std::map<std::string, Entry> values_;
 };
+
+// Parse an array of JSON objects. Returns false for malformed arrays.
+bool parseObjectArray(const std::string& jsonText, std::vector<Object>& objects);
 
 }  // namespace simplejson

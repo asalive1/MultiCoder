@@ -2505,7 +2505,10 @@ async function renderAdminInterfaces(cl) {
     try {
         ifaces = await apiGet('/api/admin/interfaces');
         if (!Array.isArray(ifaces)) ifaces = [];
-    } catch {}
+    } catch (e) {
+        cl.innerHTML = `<h2>Network Interfaces</h2><p class="error">Unable to load network interfaces: ${escapeHtml(e.message)}</p>`;
+        return;
+    }
 
     cl.innerHTML = `
     <h2>Network Interfaces</h2>
@@ -2521,7 +2524,7 @@ async function renderAdminInterfaces(cl) {
         const row = document.createElement('div');
         row.className = 'form-row';
         row.style.cssText = 'align-items:center;gap:8px;';
-        const checked = iface.enabled !== false ? 'checked' : '';
+        const checked = iface.enabled === true ? 'checked' : '';
         const safeName = escapeHtml(iface.name);
         const safeFriendly = escapeHtml(iface.friendlyName || iface.name);
         row.innerHTML =
@@ -2537,11 +2540,16 @@ async function renderAdminInterfaces(cl) {
             friendlyName: document.getElementById('iface_fn_' + iface.name)?.value || iface.name,
             enabled:      !!(document.getElementById('iface_en_' + iface.name)?.checked),
         }));
-        await apiPost('/api/admin/interfaces', JSON.stringify({ interfaces: prefs }));
-        await ensureInterfacesLoaded(true);
         const st = document.getElementById('adminIfaceSaveStatus');
-        st.textContent = 'Network interfaces saved.';
-        st.style.color = 'var(--success)';
+        try {
+            await apiPost('/api/admin/interfaces', JSON.stringify({ interfaces: prefs }));
+            await ensureInterfacesLoaded(true);
+            st.textContent = 'Network interfaces saved.';
+            st.style.color = 'var(--success)';
+        } catch (e) {
+            st.textContent = 'Unable to save network interfaces: ' + e.message;
+            st.style.color = 'var(--danger)';
+        }
     });
 }
 
